@@ -1,187 +1,191 @@
-# 记忆沙箱（Memory Sandbox）
+# Memory Sandbox
 
-模拟人类**感觉记忆 → 工作记忆 → 长时记忆**三级架构的本地分层内存系统。
+English | [中文](./README_zh.md)
 
-**优先走沙箱检索/推理，沙箱无有效信息时才调用大模型**，适合日常切换开发环境后复用本地经验、降低 token 消耗。
+A local layered memory system that mirrors human **sensory → working → long-term** memory.
 
-## 架构
+**Prefer sandbox retrieval/reasoning first; call a large model only when the sandbox has no useful answer.** Useful when switching dev environments daily: reuse local experience and cut token spend.
+
+## Architecture
 
 ```
-用户输入
-  → 感觉记忆（TTL 瞬时缓冲、降噪）
-  → 工作记忆（滑动窗口 + 规则/上下文推理）──命中──→ 直接输出
-  → 长时记忆（向量库 + 程序性规则）────────命中──→ 直接输出
-  → 大模型（仅沙箱无解）
-  → 结果回写三层（记忆巩固）
+User input
+  → Sensory memory (TTL buffer, noise filtering)
+  → Working memory (sliding window + rules/context) ──hit──→ direct output
+  → Long-term memory (vector store + procedural rules) ──hit──→ direct output
+  → LLM (only when sandbox has no answer)
+  → Write results back to all three layers (consolidation)
 ```
 
-| 层级 | 实现 | 时效 | 作用 |
+| Layer | Implementation | Lifetime | Role |
 |------|------|------|------|
-| 感觉记忆 | 内存字典 | 2~5s TTL | 接收原文、过滤无效输入 |
-| 工作记忆 | 滑动窗口（默认 7） | 会话内 / 空闲清空 | 短时上下文、本地规则推理 |
-| 长时记忆 | JSON 向量库 + 规则表 | 持久化 | 历史问答、开发知识、模板 |
+| Sensory | In-memory dict | 2–5s TTL | Accept raw input, filter noise |
+| Working | Sliding window (default 7) | Session / idle clear | Short context, local rule inference |
+| Long-term | JSON vector store + rules | Persistent | History Q&A, dev knowledge, templates |
 
-## 接入 Cursor（推荐）
+## Cursor Integration (recommended)
 
-通过 **MCP** 让 Cursor Agent 优先查本地记忆沙箱，再决定是否深入推理，减少重复问题 token。
+Use **MCP** so the Cursor Agent checks the local Memory Sandbox first, then decides whether to dig deeper—fewer repeated questions and tokens.
 
-### 1. 一键写入全局配置（任意项目可用）
+### 1. One-click global config (any project)
 
 ```bash
 cd memory_sandbox
 ./scripts/install_cursor_mcp.sh
 ```
 
-会写入 `~/.cursor/mcp.json`。
+Writes `~/.cursor/mcp.json`.
 
-本仓库也已自带项目级配置：`.cursor/mcp.json`。
+This repo also ships a project-level config: `.cursor/mcp.json`.
 
-### 2. 重启 Cursor
+### 2. Restart Cursor
 
-打开 **Settings → MCP**，确认 `memory-sandbox` 为已连接（绿点）。
+Open **Settings → MCP** and confirm `memory-sandbox` is connected (green).
 
-### 3. 在对话里怎么用
+### 3. How to use in chat
 
-直接说例如：
+Examples:
 
-- 「用记忆沙箱查一下 agency 怎么启动」
-- 「把这个结论记住：本地 mock 端口是 3001」
+- “Use Memory Sandbox to check how to start agency”
+- “Remember this: local mock port is 3001”
 
-Agent 会调用这些工具：
+The Agent will call these tools:
 
-| 工具 | 作用 |
+| Tool | Role |
 |------|------|
-| `memory_ask` | 先查本地三级记忆 |
-| `memory_remember` | 固化可复用结论 |
-| `memory_forget` | 主动遗忘 |
-| `memory_status` | 查看记忆统计 |
-| `memory_set_scene` | 切换场景（如 `dev`） |
+| `memory_ask` | Query local three-layer memory |
+| `memory_remember` | Persist reusable conclusions |
+| `memory_forget` | Active forgetting |
+| `memory_status` | Memory stats |
+| `memory_set_scene` | Switch scene (e.g. `dev`) |
 
-项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_ask`，命中则直接用；未命中再推理，并把稳定结论 `memory_remember`。**
+Project rule `.cursor/rules/memory-sandbox.mdc` guides the Agent: **`memory_ask` first; use the hit directly; on miss, reason then `memory_remember` stable conclusions.**
 
-记忆数据与桌面 App 共用：
+Memory data is shared with the desktop app:
 
 `~/Library/Application Support/MemorySandbox/`
 
-## Mac 安装包（.dmg）
+## Mac Installer (.dmg)
 
-已提供可双击安装的本地 App：
+A double-clickable local app is available:
 
 ```text
 dist/MemorySandbox-0.1.1-mac.dmg
 ```
 
-**安装：**
+**Install:**
 
-1. 双击打开 DMG  
-2. 把 `MemorySandbox` 拖到 `Applications`  
-3. 打开「记忆沙箱」后，会自动用浏览器打开本地界面（`http://127.0.0.1:8765`）
+1. Open the DMG  
+2. Drag `MemorySandbox` to `Applications`  
+3. Launch “Memory Sandbox”; it opens the local UI in the browser (`http://127.0.0.1:8765`)
 
-说明：macOS 26 上系统自带 tkinter/Tcl 会崩溃，因此 App 使用本地 Web UI（不依赖 tkinter）。
+Note: On macOS 26, system tkinter/Tcl can crash, so the app uses a local Web UI (no tkinter).
 
-若提示无法验证开发者：右键 App → 打开 → 仍要打开。
+If macOS blocks an unidentified developer: right-click the app → Open → Open anyway.
 
-记忆数据目录：`~/Library/Application Support/MemorySandbox/`
+Memory data directory: `~/Library/Application Support/MemorySandbox/`
 
-**重新打包：**
+**Rebuild:**
 
 ```bash
 ./scripts/build_dmg.sh
 ```
 
-当前构建为 Apple Silicon（arm64）。
+Current build targets Apple Silicon (arm64).
 
-## 快速开始（源码）
+## Quick Start (from source)
 
 ```bash
 cd memory_sandbox
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
 
-# 本地 Web UI（推荐，兼容 macOS 26）
+# Local Web UI (recommended; macOS 26 compatible)
 python3 app_web.py
-# 旧版 tkinter GUI（macOS 26 系统 Python 可能崩溃）
+# Legacy tkinter GUI (may crash on macOS 26 system Python)
 # python3 app_gui.py
 
-# CLI（与 MCP/Web 共用用户记忆目录）
-./scripts/memory ask "revenue 怎么本地启动"
-./scripts/memory ask --local "PK组件"          # 只查本地，不调沙箱 LLM
-./scripts/memory prepare "revenue怎么启动"     # 拼接「记录到长期记忆」后查本地
-./scripts/memory remember "问" "答" --scene dev
+# CLI (shares user memory dir with MCP/Web)
+./scripts/memory ask "how to start revenue locally"
+./scripts/memory ask --local "PK component"   # local only, no sandbox LLM
+./scripts/memory prepare "how to start revenue"  # append long-term suffix, local only
+./scripts/memory remember "Q" "A" --scene dev
 ./scripts/memory list --layer long_term
 ./scripts/memory status
 ./scripts/memory backup
-./scripts/memory                           # 交互模式
+./scripts/memory                           # interactive mode
 
-# 等价：
-python3 main.py ask "如何启动本地前端"
+# Equivalent:
+python3 main.py ask "how to start the local frontend"
 
-# 写入开发种子 / 跑演示
+# Seed / demo
 python3 main.py seed
 python3 examples/demo.py
 ```
 
-可选：把 `scripts/memory` 链到 PATH：
+Optional: link `scripts/memory` onto PATH:
 
 ```bash
 ln -sf "$(pwd)/scripts/memory" /usr/local/bin/memory-sandbox
 ```
 
-### CLI 子命令
+### CLI subcommands
 
-| 命令 | 说明 |
+| Command | Description |
 |------|------|
-| `ask QUERY` | 提问（未命中可走沙箱 LLM）；加 `--local` 则只查本地 |
-| `prepare QUERY` | 对齐 MCP：拼接后缀后只查本地 |
-| `remember Q A` | 写入长时记忆 |
-| `list` | 列出记忆（`--layer working\|long_term\|all`） |
-| `status` | 各层统计 |
-| `backup` / `restore` | 备份 / 恢复长时记忆 |
-| `delete --id\|--question` | 删单条 |
-| `forget [关键词]` | 按关键词遗忘或清空层（清空需 `--yes`） |
-| `clear-long --yes` | 清空长时（可选 `--backup-first`） |
-| `scene NAME` | 切换场景 |
-| `seed` / `reoptimize` | 种子记忆 / 刷新索引 |
-| `interactive` | 交互模式 |
+| `ask QUERY` | Ask (may fall back to sandbox LLM); `--local` = local only |
+| `prepare QUERY` | MCP-aligned: append suffix, query local only |
+| `remember Q A` | Write long-term memory |
+| `list` | List memories (`--layer working\|long_term\|all`) |
+| `status` | Per-layer stats |
+| `backup` / `restore` | Backup / restore long-term memory |
+| `delete --id\|--question` | Delete one entry |
+| `forget [keyword]` | Forget by keyword or clear a layer (`--yes` to clear) |
+| `clear-long --yes` | Clear long-term (optional `--backup-first`) |
+| `scene NAME` | Switch scene |
+| `agent-mode [ask\|plan\|agent]` | View/switch local Cursor Agent mode |
+| `seed` / `reoptimize` | Seed memory / refresh index |
+| `interactive` | Interactive mode |
 
-默认记忆目录：`~/Library/Application Support/MemorySandbox/memory`  
-若要用项目内 `data/memory`，加 `--project-memory`。
+Default memory dir: `~/Library/Application Support/MemorySandbox/memory`  
+For in-project `data/memory`, add `--project-memory`.
 
-### 交互模式内指令
+### Interactive commands
 
-| 指令 | 说明 |
+| Command | Description |
 |------|------|
-| `记住：问题 => 答案` | 写入长时记忆 |
-| `记住：某条知识` | 按知识片段固化 |
-| `忘记刚才内容` | 清空工作/感觉记忆 |
-| `忘记：关键词` | 按关键词清理各层 |
-| `清空工作记忆` | 仅清空滑动窗口 |
-| `切换场景：dev` | 情境依赖检索加权 |
-| `查看记忆状态` | 打印各层统计 |
-| `帮助` | 规则引擎内置帮助 |
+| `记住：问题 => 答案` | Write long-term memory |
+| `记住：某条知识` | Persist a knowledge snippet |
+| `忘记刚才内容` | Clear working/sensory memory |
+| `忘记：关键词` | Clear layers by keyword |
+| `清空工作记忆` | Clear sliding window only |
+| `切换场景：dev` | Context-weighted retrieval |
+| `切换Agent模式：ask\|plan\|agent` | Local LLM read-only / plan / writable |
+| `查看记忆状态` | Print per-layer stats |
+| `帮助` | Built-in rule-engine help |
 
-交互模式会在 stderr 显示着色阶段进度与旋转指示（检索 → 回退 LLM → Local Agent / Cloud）；答案在 stdout。遵循常见 CLI 约定：进度走 stderr、结果走 stdout；`NO_COLOR=1` 可关色；`--json` 不启用人机排版。
+Interactive mode shows colored stage progress and a spinner on stderr (retrieve → LLM fallback → Local Agent / Cloud); answers go to stdout. Progress on stderr, results on stdout; `NO_COLOR=1` disables color; `--json` skips human formatting.
 
-## 配置
+## Configuration
 
-见 `config.yaml`：
+See `config.yaml`:
 
-- `sensory.ttl`：感觉记忆过期秒数
-- `working.chunk_size`：工作记忆窗口大小
-- `long_term.similarity_threshold`：长时命中阈值（建议 0.65~0.75）
-- `long_term.persist_dir`：持久化目录（默认 `data/memory`）
-- `llm.provider`：`mock`（离线占位）| `cursor` | `openai_compatible`
-- `llm.runtime`（仅 cursor）：`local`（本机 `agent` CLI，可读盘）| `cloud`（Cloud 无仓库，不能扫本机源码）
+- `sensory.ttl`: sensory expiry in seconds
+- `working.chunk_size`: working-memory window size
+- `long_term.similarity_threshold`: long-term hit threshold (suggest 0.65–0.75)
+- `long_term.persist_dir`: persistence dir (default `data/memory`)
+- `llm.provider`: `mock` (offline stub) | `cursor` | `openai_compatible`
+- `llm.runtime` (cursor only): `local` (local `agent` CLI, can read disk) | `cloud` (no repo; cannot scan local source)
 
-### 接入 Cursor 模型（记忆未命中时）
+### Cursor model (when memory misses)
 
-感觉 / 工作 / 长时均未命中时，CLI/Web 会回退 Cursor。
+If sensory / working / long-term all miss, CLI/Web fall back to Cursor.
 
-**默认 `runtime: local`**：调用本机 `agent` / `cursor-agent`，`--workspace` 指向 `llm.cwd`（空则用启动时的当前目录），默认 `--mode ask` 只读，可扫描/解释本地源码。
+**Default `runtime: local`**: calls local `agent` / `cursor-agent`, `--workspace` = `llm.cwd` (empty = cwd at launch), default `--mode ask` (read-only), can scan/explain local source.
 
-**`runtime: cloud`**：Cursor Cloud 无仓库 Agent，**看不到本机磁盘**。
+**`runtime: cloud`**: Cursor Cloud agent with no repo — **cannot see local disk**.
 
-推荐把密钥写到用户配置（不要提交仓库）：
+Prefer putting secrets in user config (do not commit):
 
 `~/Library/Application Support/MemorySandbox/config.yaml`
 
@@ -189,19 +193,30 @@ ln -sf "$(pwd)/scripts/memory" /usr/local/bin/memory-sandbox
 llm:
   enabled: true
   provider: cursor
-  runtime: local          # local=读本机盘 | cloud=无仓库
+  runtime: local          # local=read disk | cloud=no repo
   api_key: "crsr_..."
-  model: ""               # 可空
+  model: ""               # optional
   timeout: 600
-  cwd: ""                 # 空 = 在哪个目录启动 CLI 就读哪个项目
-  agent_mode: ask         # ask 只读；可写则 agent_mode: "" 且 agent_force: true（慎用）
+  cwd: ""                 # empty = project where CLI was started
+  agent_mode: ask         # ask=read-only; plan=plan; writable via CLI/Web → agent
 ```
 
-也可用环境变量：`CURSOR_API_KEY` / `CURSOR_MODEL` / `CURSOR_CWD`。
+Env vars also work: `CURSOR_API_KEY` / `CURSOR_MODEL` / `CURSOR_CWD`.
 
-需已安装 Cursor Agent CLI（`agent` 在 PATH）。找不到时会明确报错，不会静默改走 Cloud。
+Requires Cursor Agent CLI (`agent` on PATH). If missing, it errors clearly and does not silently switch to Cloud.
 
-### 接入 OpenAI 兼容网关
+**Switch Agent mode (Ask / Plan / Agent)**
+
+| Entry | Usage |
+|------|------|
+| CLI | `memory-sandbox agent-mode` to view; `memory-sandbox agent-mode agent` to switch & persist |
+| CLI interactive | `切换Agent模式：ask` / `plan` / `agent` |
+| CLI one-shot | `memory-sandbox ask --agent-mode agent "…"` (not persisted) |
+| Web | Toolbar “Agent mode” dropdown |
+
+`agent` = full tools writable (uses `--force`; use with care); `ask`/`plan` = read-only. Settings go to `~/Library/Application Support/MemorySandbox/config.yaml`.
+
+### OpenAI-compatible gateway
 
 ```yaml
 llm:
@@ -212,39 +227,39 @@ llm:
   model: "gpt-4o-mini"
 ```
 
-环境变量：`OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`。
+Env vars: `OPENAI_BASE_URL` / `OPENAI_API_KEY` / `OPENAI_MODEL`.
 
-## 代码入口
+## Code entry
 
 ```python
 from core import MemorySandbox
 
-sb = MemorySandbox()                 # 读取 config.yaml
-result = sb.chat("本地 mock 端口是多少")
+sb = MemorySandbox()                 # loads config.yaml
+result = sb.chat("what is the local mock port")
 print(result.answer, result.source)  # source: working | long_term | llm | ...
 ```
 
-## 目录结构
+## Layout
 
 ```
 memory_sandbox/
-├── config.yaml          # 阈值与 LLM 配置
+├── config.yaml          # thresholds & LLM config
 ├── main.py              # CLI
 ├── core/
-│   ├── sensory.py       # 感觉记忆
-│   ├── working.py       # 工作记忆
-│   ├── long_term.py     # 长时记忆
-│   ├── embedding.py     # 本地哈希向量（无模型下载）
-│   ├── rules.py         # 轻量规则引擎
-│   ├── llm.py           # 大模型适配
-│   └── sandbox.py       # 主编排 chat()
+│   ├── sensory.py       # sensory memory
+│   ├── working.py       # working memory
+│   ├── long_term.py     # long-term memory
+│   ├── embedding.py     # local hash vectors (no model download)
+│   ├── rules.py         # lightweight rule engine
+│   ├── llm.py           # LLM adapters
+│   └── sandbox.py       # main chat() orchestration
 ├── examples/demo.py
-└── data/memory/         # 运行后生成的持久化数据
+└── data/memory/         # persistence after runs
 ```
 
-## 设计取舍（本地落地）
+## Design trade-offs (local-first)
 
-1. **Embedding**：默认本地特征哈希向量，免下载模型，保证同库可复现匹配。
-2. **向量库**：默认 JSON 持久化，零外部服务；数据量变大时可再换 Chroma/FAISS。
-3. **LLM**：可插拔；未配置时用 MockLLM，保证离线链路完整可跑。
-4. **记忆强化**：命中提升 `weight`；高频短问答可沉淀进工作记忆 FAQ。
+1. **Embedding**: default local feature-hash vectors—no model download; reproducible matches in the same store.
+2. **Vector store**: default JSON persistence, zero external services; swap to Chroma/FAISS later if needed.
+3. **LLM**: pluggable; MockLLM when unset so the offline path still runs.
+4. **Reinforcement**: hits raise `weight`; frequent short Q&A can settle into working-memory FAQ.

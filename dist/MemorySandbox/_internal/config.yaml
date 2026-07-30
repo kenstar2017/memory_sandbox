@@ -19,14 +19,17 @@ embedding:
 llm:
   enabled: true               # 沙箱无解时是否调用大模型
   provider: mock              # mock | cursor | openai_compatible
-  # cursor：用 CURSOR_API_KEY（crsr_...）走 Cloud Agents；密钥请写到
-  # ~/Library/Application Support/MemorySandbox/config.yaml 或环境变量，勿提交仓库
+  # cursor：密钥请写到 ~/Library/Application Support/MemorySandbox/config.yaml 或环境变量
   # openai_compatible：OpenAI 兼容网关
-  base_url: ""                # cursor 默认 https://api.cursor.com；openai 填网关 /v1
+  base_url: ""                # cursor cloud 默认 https://api.cursor.com；openai 填网关 /v1
   api_key: ""
   model: ""                   # cursor 可空（用账号默认）；或 composer-2 / composer-2.5 等
-  timeout: 300                # cursor 云端 Agent 建议 180~300
-  cwd: ""                     # 可选：cursor-sdk 本地 Agent 工作目录
+  timeout: 600                # 本地 agent / cloud 建议 300~600
+  cwd: ""                     # 空 = 启动时的 cwd；可填项目绝对路径
+  runtime: local              # local=本机 agent 可读盘 | cloud=Cloud 无仓库
+  agent_bin: ""               # 空则 PATH 找 agent / cursor-agent
+  agent_mode: ask             # ask=只读 | plan=规划 | 空=Agent 全工具（建议用 CLI/网页切换）
+  agent_force: false          # Agent 可写时是否 --force（CLI/网页切到 agent 会自动打开）
 
 sandbox:
   # 开发场景标签，用于情境依赖回忆

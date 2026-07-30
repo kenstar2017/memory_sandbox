@@ -142,6 +142,23 @@ HTML_PAGE = r"""<!DOCTYPE html>
     word-break: break-word;
     white-space: pre-wrap;
   }
+  .qa-a.md {
+    white-space: normal;
+    max-height: 160px;
+    overflow-y: auto;
+    line-height: 1.55;
+    color: #3d4a42;
+  }
+  .qa-a.md p { margin: 0 0 6px; }
+  .qa-a.md ul, .qa-a.md ol { margin: 4px 0 8px; padding-left: 1.2em; }
+  .qa-a.md li { margin: 2px 0; }
+  .qa-a.md code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 11px;
+    background: #eef3f0;
+    padding: 1px 4px;
+    border-radius: 4px;
+  }
   .qa-badge {
     display: inline-block;
     font-size: 11px;
@@ -170,6 +187,27 @@ HTML_PAGE = r"""<!DOCTYPE html>
     flex-wrap: wrap;
     gap: 8px;
     margin-bottom: 12px;
+    align-items: center;
+  }
+  .agent-mode-label {
+    display: inline-flex;
+    align-items: center;
+    gap: 6px;
+    font-size: 12px;
+    color: var(--muted);
+    border: 1px solid var(--line);
+    background: #fff;
+    border-radius: 10px;
+    padding: 4px 8px 4px 10px;
+  }
+  .agent-mode-label select {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 4px 8px;
+    font-size: 12px;
+    background: #f7f8f6;
+    color: var(--ink);
+    cursor: pointer;
   }
   button {
     border: 1px solid var(--line);
@@ -193,8 +231,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
     min-height: 280px;
   }
   .msg { margin: 0 0 14px; line-height: 1.55; white-space: pre-wrap; word-break: break-word; }
+  .msg.md {
+    white-space: normal;
+    line-height: 1.65;
+  }
+  .msg.md p { margin: 0 0 10px; }
+  .msg.md p:last-child { margin-bottom: 0; }
+  .msg.md ul, .msg.md ol { margin: 6px 0 12px; padding-left: 1.35em; }
+  .msg.md li { margin: 4px 0; }
+  .msg.md strong { font-weight: 700; color: #16352a; }
+  .msg.md code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    background: #eef3f0;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .msg.md pre {
+    background: #f3f6f4;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 8px 0 12px;
+  }
+  .msg.md pre code { background: none; padding: 0; font-size: 12.5px; }
+  .msg.md h1, .msg.md h2, .msg.md h3 {
+    margin: 12px 0 8px;
+    font-size: 15px;
+    font-weight: 700;
+    color: #16352a;
+  }
   .user { color: #0f4c3a; font-weight: 600; }
   .bot { color: var(--ink); }
+  .bot-label {
+    display: inline-block;
+    font-size: 11px;
+    font-weight: 700;
+    color: var(--accent);
+    background: #e8f2ec;
+    border-radius: 6px;
+    padding: 1px 7px;
+    margin-bottom: 8px;
+  }
   .meta { color: var(--muted); font-size: 12px; margin-top: -8px; margin-bottom: 14px; }
   .sys { color: #7a6a4f; }
   .composer-wrap { position: relative; margin-top: 12px; }
@@ -277,48 +356,190 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .modal-mask {
     display: none;
     position: fixed; inset: 0;
-    background: rgba(31,42,36,.35);
+    background: rgba(31,42,36,.42);
+    backdrop-filter: blur(3px);
     z-index: 50;
     align-items: center;
     justify-content: center;
-    padding: 20px;
+    padding: 28px 20px;
   }
   .modal-mask.show { display: flex; }
   .modal {
-    width: min(520px, 100%);
+    width: min(560px, 96vw);
     background: #fff;
-    border-radius: 16px;
+    border-radius: 18px;
     border: 1px solid var(--line);
-    box-shadow: 0 20px 60px rgba(0,0,0,.15);
-    padding: 18px 18px 16px;
+    box-shadow: 0 24px 64px rgba(20,40,30,.18);
+    padding: 22px 24px 18px;
   }
-  .modal h3 { margin: 0 0 8px; font-size: 18px; }
-  .modal .qbox {
-    background: var(--side);
-    border-radius: 10px;
-    padding: 10px 12px;
+  .modal.modal-answer {
+    width: min(860px, 96vw);
+    max-height: min(90vh, 920px);
+    display: flex;
+    flex-direction: column;
+    padding: 26px 28px 20px;
+  }
+  .modal h3 {
+    margin: 0 0 6px;
+    font-size: 20px;
+    font-weight: 700;
+    letter-spacing: 0.01em;
+    color: var(--ink);
+  }
+  .modal .modal-hint {
+    margin: 0 0 14px;
     font-size: 13px;
-    margin-bottom: 12px;
+    line-height: 1.45;
+    color: var(--muted);
+  }
+  .modal .qbox {
+    background: #f4f7f5;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 12px 14px;
+    font-size: 14px;
+    line-height: 1.55;
+    margin-bottom: 14px;
     white-space: pre-wrap;
     word-break: break-word;
+    max-height: 22vh;
+    overflow-y: auto;
+    flex-shrink: 0;
+  }
+  .modal .qbox::before {
+    content: "问";
+    display: inline-block;
+    margin-right: 8px;
+    padding: 1px 7px;
+    border-radius: 6px;
+    background: var(--accent);
+    color: #fff;
+    font-size: 11px;
+    font-weight: 700;
+    vertical-align: 1px;
   }
   .modal textarea {
     min-height: 120px;
-    margin-bottom: 12px;
+    margin-bottom: 14px;
   }
-  .modal-actions { display: flex; justify-content: flex-end; gap: 8px; flex-wrap: wrap; }
+  .answer-toolbar {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    margin-bottom: 10px;
+    flex-wrap: wrap;
+  }
+  .answer-tabs {
+    display: inline-flex;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    background: #f3f6f4;
+  }
+  .answer-tabs button {
+    border: none;
+    border-radius: 0;
+    background: transparent;
+    padding: 6px 14px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .answer-tabs button.active {
+    background: #fff;
+    color: var(--accent);
+    font-weight: 700;
+    box-shadow: inset 0 0 0 1px var(--line);
+  }
+  .answer-toolbar .ghost {
+    border: 1px dashed var(--line);
+    background: #fff;
+    color: var(--accent);
+    font-size: 12px;
+    padding: 6px 12px;
+  }
+  .answer-toolbar .ghost:hover { background: #f0f7f3; }
+  .answer-panes {
+    flex: 1 1 auto;
+    min-height: 320px;
+    max-height: 52vh;
+    display: flex;
+    flex-direction: column;
+    margin-bottom: 16px;
+  }
+  .modal.modal-answer textarea {
+    flex: 1 1 auto;
+    min-height: 300px;
+    height: 100%;
+    margin-bottom: 0;
+    font-size: 14.5px;
+    line-height: 1.75;
+    padding: 14px 16px;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: #fbfcfb;
+    resize: vertical;
+    font-family: "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
+    tab-size: 2;
+  }
+  .modal.modal-answer textarea:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: #fff;
+    box-shadow: 0 0 0 3px rgba(47,111,87,.14);
+  }
+  .answer-preview {
+    flex: 1 1 auto;
+    min-height: 300px;
+    overflow-y: auto;
+    padding: 16px 18px;
+    border-radius: 12px;
+    border: 1px solid var(--line);
+    background: #fff;
+    font-size: 14.5px;
+    line-height: 1.7;
+    color: var(--ink);
+  }
+  .answer-preview p { margin: 0 0 10px; }
+  .answer-preview ul, .answer-preview ol { margin: 6px 0 12px; padding-left: 1.4em; }
+  .answer-preview li { margin: 4px 0; }
+  .answer-preview strong { color: #16352a; }
+  .answer-preview code {
+    font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+    font-size: 12.5px;
+    background: #eef3f0;
+    padding: 1px 5px;
+    border-radius: 4px;
+  }
+  .answer-preview pre {
+    background: #f3f6f4;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    padding: 10px 12px;
+    overflow-x: auto;
+    margin: 8px 0 12px;
+  }
+  .answer-preview.hidden, .answer-panes textarea.hidden { display: none; }
+  .modal-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 10px;
+    flex-wrap: wrap;
+    flex-shrink: 0;
+    padding-top: 2px;
+  }
+  .modal-actions button { min-width: 88px; padding: 9px 16px; }
   .modal .warn {
-    font-size: 13px;
+    font-size: 14px;
     color: #7a3b2e;
-    line-height: 1.5;
-    margin: 0 0 12px;
+    line-height: 1.55;
+    margin: 0 0 14px;
   }
   .modal label.check {
     display: flex;
     align-items: center;
     gap: 8px;
-    font-size: 13px;
-    margin-bottom: 14px;
+    font-size: 14px;
+    margin-bottom: 16px;
     color: var(--ink);
     cursor: pointer;
   }
@@ -327,6 +548,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
     background: var(--danger);
     color: #fff;
     border-color: var(--danger);
+  }
+  @media (max-width: 640px) {
+    .modal.modal-answer {
+      width: 100%;
+      max-height: 94vh;
+      padding: 18px 16px 14px;
+    }
+    .modal.modal-answer textarea { min-height: 220px; font-size: 14px; }
   }
 </style>
 </head>
@@ -348,6 +577,14 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="sub">输入 / 选择指令 · 原有文字指令仍可用</div>
       </header>
       <div class="toolbar">
+        <label class="agent-mode-label" title="本地 Cursor LLM 回退权限：Ask 只读 / Plan 规划 / Agent 可写">
+          Agent 模式
+          <select id="agentMode">
+            <option value="ask">Ask 只读</option>
+            <option value="plan">Plan 规划</option>
+            <option value="agent">Agent 可写</option>
+          </select>
+        </label>
         <button type="button" id="btnWorking">查看短时记忆</button>
         <button type="button" id="btnLong">查看长时记忆</button>
         <button type="button" id="btnAllMem">查看全部记忆</button>
@@ -379,10 +616,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
   </div>
 
   <div class="modal-mask" id="answerModal">
-    <div class="modal">
+    <div class="modal modal-answer">
       <h3>补全答案</h3>
+      <p class="modal-hint">支持 Markdown（列表 / **加粗** / `代码`）。可用「整理排版」把顿号长列表拆成条目，再点「预览」查看效果。</p>
       <div class="qbox" id="modalQuestion"></div>
-      <textarea id="modalAnswer" placeholder="在此输入答案（答）"></textarea>
+      <div class="answer-toolbar">
+        <div class="answer-tabs" id="answerTabs">
+          <button type="button" class="active" data-pane="edit">编辑</button>
+          <button type="button" data-pane="preview">预览</button>
+        </div>
+        <button type="button" class="ghost" id="btnTidyAnswer" title="把 1)…（a、b、c）整理成 Markdown 列表">整理排版</button>
+      </div>
+      <div class="answer-panes">
+        <textarea id="modalAnswer" placeholder="在此输入答案（答）&#10;&#10;示例：&#10;1. **包名**：一句话说明&#10;   - 模块 A&#10;   - 模块 B"></textarea>
+        <div id="modalPreview" class="answer-preview md hidden"></div>
+      </div>
       <div class="modal-actions">
         <button type="button" id="btnModalCancel">取消</button>
         <button type="button" class="primary" id="btnModalOk">确认记住</button>
@@ -449,10 +697,19 @@ function savePending() {
   localStorage.setItem('ms_pending_q', JSON.stringify(pendingQuestions));
 }
 
-function append(text, cls) {
+function append(text, cls, opts) {
   const d = document.createElement('div');
   d.className = 'msg ' + cls;
-  d.textContent = text;
+  if (opts && opts.markdown) {
+    d.classList.add('md');
+    if (opts.label) {
+      d.innerHTML = '<div class="bot-label">' + escapeHtml(opts.label) + '</div>' + renderMarkdown(text);
+    } else {
+      d.innerHTML = renderMarkdown(text);
+    }
+  } else {
+    d.textContent = text;
+  }
   chat.appendChild(d);
   chat.scrollTop = chat.scrollHeight;
 }
@@ -622,7 +879,7 @@ function renderQaList() {
         '<button type="button" class="qa-del" data-id="' + escapeHtml(rec.id || '') + '">删除</button>' +
       '</div>' +
       '<p class="qa-q">' + escapeHtml(rec.question) + '</p>' +
-      '<p class="qa-a">' + escapeHtml(rec.answer) + '</p>';
+      '<div class="qa-a md">' + renderMarkdown(rec.answer || '') + '</div>';
     el.onclick = () => openAnswerModal(rec.question, rec.answer, -1);
     el.querySelector('.qa-del').onclick = (ev) => {
       ev.stopPropagation();
@@ -661,6 +918,123 @@ function escapeHtml(s) {
     .replace(/"/g, '&quot;');
 }
 
+function inlineMarkdown(escaped) {
+  return escaped
+    .replace(/`([^`\n]+)`/g, '<code>$1</code>')
+    .replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>')
+    .replace(/__([^_]+)__/g, '<strong>$1</strong>');
+}
+
+function renderMarkdown(src) {
+  const text = String(src || '').replace(/\r\n/g, '\n');
+  const parts = [];
+  const fence = /```([\s\S]*?)```/g;
+  let last = 0;
+  let m;
+  while ((m = fence.exec(text))) {
+    if (m.index > last) parts.push({ type: 'text', value: text.slice(last, m.index) });
+    parts.push({ type: 'code', value: m[1].replace(/^\n/, '').replace(/\n$/, '') });
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) parts.push({ type: 'text', value: text.slice(last) });
+
+  function renderTextBlock(block) {
+    const lines = block.split('\n');
+    let html = '';
+    let i = 0;
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^\s*[-*]\s+/.test(line)) {
+        html += '<ul>';
+        while (i < lines.length && /^\s*[-*]\s+/.test(lines[i])) {
+          html += '<li>' + inlineMarkdown(escapeHtml(lines[i].replace(/^\s*[-*]\s+/, ''))) + '</li>';
+          i++;
+        }
+        html += '</ul>';
+        continue;
+      }
+      if (/^\s*\d+[.)]\s+/.test(line)) {
+        html += '<ol>';
+        while (i < lines.length && /^\s*\d+[.)]\s+/.test(lines[i])) {
+          html += '<li>' + inlineMarkdown(escapeHtml(lines[i].replace(/^\s*\d+[.)]\s+/, ''))) + '</li>';
+          i++;
+        }
+        html += '</ol>';
+        continue;
+      }
+      if (/^\s*#{1,3}\s+/.test(line)) {
+        const hm = line.match(/^\s*(#{1,3})\s+(.*)$/);
+        const level = hm[1].length;
+        html += '<h' + level + '>' + inlineMarkdown(escapeHtml(hm[2])) + '</h' + level + '>';
+        i++;
+        continue;
+      }
+      if (!line.trim()) { i++; continue; }
+      let para = line;
+      i++;
+      while (i < lines.length && lines[i].trim() && !/^\s*[-*]\s+/.test(lines[i]) && !/^\s*\d+[.)]\s+/.test(lines[i]) && !/^\s*#{1,3}\s+/.test(lines[i])) {
+        para += '\n' + lines[i];
+        i++;
+      }
+      html += '<p>' + inlineMarkdown(escapeHtml(para)).replace(/\n/g, '<br>') + '</p>';
+    }
+    return html;
+  }
+
+  let out = '';
+  for (const p of parts) {
+    if (p.type === 'code') {
+      out += '<pre><code>' + escapeHtml(p.value) + '</code></pre>';
+    } else {
+      out += renderTextBlock(p.value);
+    }
+  }
+  return out || '<p></p>';
+}
+
+/** 把「1) 标题：说明（a、b、c）」整理成更易读的 Markdown */
+function tidyAnswerLayout(raw) {
+  let text = String(raw || '').replace(/\r\n/g, '\n').trim();
+  if (!text) return text;
+  // 粘在一起的编号项拆到新行
+  text = text.replace(/([^\n])\s*(?=\d+[)）．.]\s*)/g, '$1\n');
+  const chunks = text.split(/\n+/).filter(Boolean);
+  const out = [];
+  for (let chunk of chunks) {
+    chunk = chunk.trim();
+    const num = chunk.match(/^(\d+)[)）．.]\s*(.*)$/);
+    let body = num ? num[2] : chunk;
+    let head = num ? (num[1] + '. ') : '';
+    // 去掉已有加粗，避免 ****标题****
+    body = body.replace(/\*{2,}/g, '');
+    // 包名/标题加粗：xxx： 或 xxx:
+    body = body.replace(/^([A-Za-z0-9_./\-]+|[^\s：:]{1,40})\s*[:：]\s*/, (_, title) => {
+      return '**' + title.trim() + '**：';
+    });
+    // 全角/半角括号内顿号列表 → 子 bullet
+    body = body.replace(/[（(]([^）)]+)[）)]/g, (all, inner) => {
+      const items = inner.split(/[、,，;；]/).map((s) => s.trim()).filter(Boolean);
+      if (items.length < 2) return all;
+      return '\n' + items.map((it) => '   - `' + it.replace(/^`|`$/g, '') + '`').join('\n');
+    });
+    out.push(head + body);
+  }
+  return out.join('\n\n').replace(/\n{3,}/g, '\n\n').trim();
+}
+
+function setAnswerPane(pane) {
+  const editBtn = document.querySelector('#answerTabs [data-pane="edit"]');
+  const prevBtn = document.querySelector('#answerTabs [data-pane="preview"]');
+  const preview = document.getElementById('modalPreview');
+  if (!editBtn || !prevBtn || !preview || !modalAnswer) return;
+  const isPreview = pane === 'preview';
+  editBtn.classList.toggle('active', !isPreview);
+  prevBtn.classList.toggle('active', isPreview);
+  modalAnswer.classList.toggle('hidden', isPreview);
+  preview.classList.toggle('hidden', !isPreview);
+  if (isPreview) preview.innerHTML = renderMarkdown(modalAnswer.value || '_（空）_');
+}
+
 async function refreshSaved() {
   const data = await api('/api/list_memory', { layer: 'long_term' });
   savedMemories = (data.data && data.data.declarative) || [];
@@ -674,12 +1048,14 @@ function openAnswerModal(question, answer, pendingIndex) {
   modalAnswer.value = answer || '';
   answerModal.dataset.pendingIndex = String(pendingIndex);
   answerModal.classList.add('show');
+  setAnswerPane('edit');
   modalAnswer.focus();
 }
 
 function closeAnswerModal() {
   answerModal.classList.remove('show');
   editingQuestion = '';
+  setAnswerPane('edit');
 }
 
 async function confirmAnswer() {
@@ -704,7 +1080,8 @@ async function confirmAnswer() {
     savePending();
   }
   closeAnswerModal();
-  append('已记住：' + question + ' => ' + answer, 'sys');
+  append('已记住：' + question, 'sys');
+  append(answer, 'bot', { markdown: true, label: '答' });
   activeTab = 'saved';
   document.querySelectorAll('.side-tabs button').forEach(b => {
     b.classList.toggle('active', b.dataset.tab === 'saved');
@@ -720,7 +1097,7 @@ async function sendText(text) {
     const data = await api('/api/chat', { text });
     if (data.error) append('错误：' + data.error, 'meta');
     else {
-      append('沙箱：' + data.answer, 'bot');
+      append(data.answer || '', 'bot', { markdown: true, label: '沙箱' });
       append('← 来源：' + (SOURCE[data.source] || data.source) + ' (' + data.source + ')', 'meta');
     }
     if (data.status_line) footer.textContent = data.status_line;
@@ -822,6 +1199,21 @@ document.getElementById('btnModalOk').onclick = confirmAnswer;
 answerModal.addEventListener('click', (e) => {
   if (e.target === answerModal) closeAnswerModal();
 });
+document.getElementById('answerTabs').onclick = (e) => {
+  const btn = e.target.closest('button[data-pane]');
+  if (!btn) return;
+  setAnswerPane(btn.dataset.pane);
+};
+document.getElementById('btnTidyAnswer').onclick = () => {
+  const before = modalAnswer.value;
+  const after = tidyAnswerLayout(before);
+  if (after === before.trim()) {
+    alert('未识别到可整理的编号/顿号列表。可手动用 Markdown：1. **标题** / - 条目');
+    return;
+  }
+  modalAnswer.value = after;
+  setAnswerPane('preview');
+};
 document.getElementById('btnConfirmClearCancel').onclick = closeConfirmClear;
 document.getElementById('btnConfirmClearOk').onclick = executeConfirmClear;
 document.getElementById('confirmClearModal').addEventListener('click', (e) => {
@@ -885,9 +1277,37 @@ document.getElementById('btnQuit').onclick = async () => {
   document.querySelectorAll('button, textarea').forEach((el) => { el.disabled = true; });
 };
 
-append('优先检索本地三级记忆。\\n新方式：输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n原有指令仍可用：记住：问 => 答 | 备份长时记忆 | 清空长时记忆（需确认）| 帮助', 'sys');
+const agentModeSel = document.getElementById('agentMode');
+async function refreshAgentMode() {
+  try {
+    const data = await api('/api/status');
+    const m = (data.status && data.status.llm && data.status.llm.agent_mode) || 'ask';
+    if (agentModeSel) agentModeSel.value = m;
+    if (data.status_line) footer.textContent = data.status_line;
+  } catch (e) {}
+}
+if (agentModeSel) {
+  agentModeSel.onchange = async () => {
+    const mode = agentModeSel.value;
+    if (mode === 'agent' && !confirm('切换为 Agent 可写模式？本地 LLM 可能修改工作区文件并执行命令。')) {
+      await refreshAgentMode();
+      return;
+    }
+    try {
+      const data = await api('/api/agent_mode', { mode, persist: true });
+      append(data.message || ('已切换 Agent 模式：' + mode), 'sys');
+      if (data.status_line) footer.textContent = data.status_line;
+    } catch (e) {
+      append('切换失败：' + (e.message || e), 'sys');
+      await refreshAgentMode();
+    }
+  };
+}
+
+append('优先检索本地三级记忆。\\n新方式：输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n原有指令仍可用：记住：问 => 答 | 备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏可切换 Agent 模式：Ask 只读 / Plan / Agent 可写。', 'sys');
 refreshSaved();
 renderQaList();
+refreshAgentMode();
 input.focus();
 </script>
 </body>
@@ -904,10 +1324,12 @@ class AppState:
 
     def status_line(self) -> str:
         st = self.sandbox.status()
+        am = (st.get("llm") or {}).get("agent_mode") or "ask"
         return (
             f"工作记忆 {st['working']['size']}/{st['working']['max_size']} · "
             f"长时记忆 {st['long_term']['declarative_count']} 条 · "
             f"场景 {st['working']['scene']} · "
+            f"Agent {am} · "
             f"数据 {app_support_dir()}"
         )
 
@@ -1007,6 +1429,38 @@ class Handler(BaseHTTPRequestHandler):
                     self,
                     200,
                     {"status": STATE.sandbox.status(), "status_line": STATE.status_line()},
+                )
+                return
+            if path == "/api/agent_mode":
+                mode = (data.get("mode") or data.get("agent_mode") or "").strip()
+                persist = data.get("persist", True)
+                if not mode:
+                    st = STATE.sandbox.status()
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "agent_mode": (st.get("llm") or {}).get("agent_mode"),
+                            "agent_force": (st.get("llm") or {}).get("agent_force"),
+                            "status_line": STATE.status_line(),
+                        },
+                    )
+                    return
+                try:
+                    msg = STATE.sandbox.set_agent_mode(mode, persist=bool(persist))
+                except ValueError as e:
+                    _json_response(self, 400, {"error": str(e), "status_line": STATE.status_line()})
+                    return
+                st = STATE.sandbox.status()
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "message": msg,
+                        "agent_mode": (st.get("llm") or {}).get("agent_mode"),
+                        "agent_force": (st.get("llm") or {}).get("agent_force"),
+                        "status_line": STATE.status_line(),
+                    },
                 )
                 return
             if path == "/api/list_memory":

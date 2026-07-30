@@ -41,6 +41,7 @@ class MemorySandbox:
 
     def __init__(self, config: Optional[AppConfig] = None, config_path: Optional[str] = None):
         cfg_path = config_path or str(default_config_path())
+        self.config_path = cfg_path
         self.config = config or load_config(cfg_path)
         self.embedder = LocalHasherEmbedder(dim=self.config.embedding.dim)
 
@@ -255,7 +256,32 @@ class MemorySandbox:
             return f"已按关键词删除 {n} 条与「{q}」相关的记忆"
         return f"未找到问题「{q}」对应的记忆"
 
+    def set_agent_mode(self, ui_mode: str, persist: bool = True) -> str:
+        """
+        切换本地 Cursor Agent 模式：ask（只读）| plan（规划）| agent（可写全工具）。
+        立即作用于后续 chat LLM 回退；可选持久化到用户 config.yaml。
+        """
+        from .config import apply_agent_ui_mode, persist_llm_agent_settings
+
+        ui = apply_agent_ui_mode(self.config.llm, ui_mode)
+        path_hint = ""
+        if persist:
+            path = persist_llm_agent_settings(
+                getattr(self, "config_path", None),
+                self.config.llm.agent_mode,
+                self.config.llm.agent_force,
+            )
+            path_hint = f"；已写入 {path}"
+        labels = {
+            "ask": "Ask 只读（可读盘，不改文件）",
+            "plan": "Plan 规划（只读规划）",
+            "agent": "Agent 全工具（可改文件/执行命令，慎用）",
+        }
+        return f"已切换为 {labels.get(ui, ui)}{path_hint}"
+
     def status(self) -> dict:
+        from .config import agent_ui_mode_from_config
+
         return {
             "sensory": self.sensory.stats(),
             "working": self.working.stats(),
@@ -263,6 +289,10 @@ class MemorySandbox:
             "llm": {
                 "enabled": self.config.llm.enabled,
                 "provider": self.config.llm.provider,
+                "runtime": getattr(self.config.llm, "runtime", ""),
+                "agent_mode": agent_ui_mode_from_config(self.config.llm),
+                "agent_force": bool(self.config.llm.agent_force),
+                "cwd": getattr(self.config.llm, "cwd", "") or "",
             },
         }
 
@@ -542,5 +572,30 @@ class MemorySandbox:
                 answer=f"已切换场景为「{self.working.scene}」。同场景记忆检索将优先。",
                 source="command",
             )
+
+        m = re.match(
+            r"^(?:切换Agent模式|切换agent模式|Agent模式|agent模式|切换LLM模式)[:：]?\s*(.*)$",
+            text,
+            re.IGNORECASE,
+        )
+        if m:
+            raw = (m.group(1) or "").strip()
+            if not raw:
+                from .config import agent_ui_mode_from_config
+
+                cur = agent_ui_mode_from_config(self.config.llm)
+                return ChatResult(
+                    answer=(
+                        f"当前 Agent 模式：{cur}\n"
+                        "切换：切换Agent模式：ask | plan | agent\n"
+                        "ask=只读，plan=规划，agent=可写全工具（慎用）"
+                    ),
+                    source="command",
+                )
+            try:
+                msg = self.set_agent_mode(raw, persist=True)
+            except ValueError as e:
+                return ChatResult(answer=str(e), source="command")
+            return ChatResult(answer=msg, source="command")
 
         return None

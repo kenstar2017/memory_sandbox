@@ -28,8 +28,8 @@ llm:
   cwd: ""                     # 空 = 启动时的 cwd；可填项目绝对路径
   runtime: local              # local=本机 agent 可读盘 | cloud=Cloud 无仓库
   agent_bin: ""               # 空则 PATH 找 agent / cursor-agent
-  agent_mode: ask             # ask=只读 | plan | 空=全工具
-  agent_force: false          # 全工具时是否 --force（慎用）
+  agent_mode: ask             # ask=只读 | plan=规划 | 空=Agent 全工具（建议用 CLI/网页切换）
+  agent_force: false          # Agent 可写时是否 --force（CLI/网页切到 agent 会自动打开）
 
 sandbox:
   # 开发场景标签，用于情境依赖回忆

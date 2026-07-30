@@ -290,12 +290,15 @@ def resolve_llm_cwd(config: LLMConfig) -> str:
 
 def describe_cursor_llm(config: LLMConfig) -> str:
     """供 CLI 启动时展示回退目标。"""
+    from .config import agent_ui_mode_from_config
+
     runtime = (config.runtime or "local").lower().strip()
     if runtime == "cloud":
         return "cursor/cloud（无仓库，不能读本机盘）"
     cwd = resolve_llm_cwd(config)
-    mode = (config.agent_mode or "").strip() or "full"
-    return f"cursor/local workspace={cwd} mode={mode}"
+    mode = agent_ui_mode_from_config(config)
+    force = " force" if config.agent_force and mode == "agent" else ""
+    return f"cursor/local workspace={cwd} mode={mode}{force}"
 
 
 class CursorLocalAgentLLM(BaseLLM):
@@ -314,8 +317,6 @@ class CursorLocalAgentLLM(BaseLLM):
         self.model = (config.model or os.getenv("CURSOR_MODEL", "")).strip()
         self.cwd = resolve_llm_cwd(config)
         self.timeout = int(config.timeout or 600)
-        self.agent_mode = (config.agent_mode or "").strip()
-        self.agent_force = bool(config.agent_force)
         self.agent_bin = resolve_agent_bin(config)
 
     def generate(
@@ -324,6 +325,12 @@ class CursorLocalAgentLLM(BaseLLM):
         context: str = "",
         on_progress: Optional[ProgressCallback] = None,
     ) -> str:
+        # 每次从 config 读取，支持运行时切换 ask/plan/agent
+        agent_mode = (self.config.agent_mode or "").strip()
+        agent_force = bool(self.config.agent_force)
+        self.cwd = resolve_llm_cwd(self.config)
+        self.agent_bin = resolve_agent_bin(self.config) or self.agent_bin
+
         if not self.agent_bin:
             return (
                 "[LLM Error] 未找到本机 Cursor agent CLI（agent / cursor-agent）。\n"
@@ -333,10 +340,16 @@ class CursorLocalAgentLLM(BaseLLM):
         if not os.path.isdir(self.cwd):
             return f"[LLM Error] workspace 目录不存在: {self.cwd}"
 
-        text = (
-            "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
-            "简洁、可落地。默认只读分析，不要修改文件、不要开 PR。\n\n"
-        )
+        if agent_mode in {"ask", "plan"}:
+            text = (
+                "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
+                "简洁、可落地。当前为只读/规划模式：不要修改文件、不要开 PR。\n\n"
+            )
+        else:
+            text = (
+                "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
+                "简洁、可落地。当前为 Agent 全工具模式：可按需改文件与执行命令，谨慎操作。\n\n"
+            )
         if context:
             text += f"近期上下文:\n{context}\n\n"
         text += f"用户问题:\n{prompt}"
@@ -350,9 +363,9 @@ class CursorLocalAgentLLM(BaseLLM):
             "--workspace",
             self.cwd,
         ]
-        if self.agent_mode:
-            cmd.extend(["--mode", self.agent_mode])
-        if self.agent_force:
+        if agent_mode:
+            cmd.extend(["--mode", agent_mode])
+        if agent_force:
             cmd.append("--force")
         if self.model:
             cmd.extend(["--model", self.model])
@@ -360,10 +373,11 @@ class CursorLocalAgentLLM(BaseLLM):
             cmd.extend(["--api-key", self.api_key])
         cmd.append(text)
 
-        mode_hint = self.agent_mode or "full"
+        mode_hint = agent_mode or "agent"
         _emit(
             on_progress,
-            f"Cursor Local Agent：workspace={self.cwd} mode={mode_hint}（可读本机盘）…",
+            f"Cursor Local Agent：workspace={self.cwd} mode={mode_hint}"
+            f"{' force' if agent_force else ''}（可读本机盘）…",
         )
         env = os.environ.copy()
         if self.api_key:

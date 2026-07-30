@@ -16,7 +16,7 @@ if str(ROOT) not in sys.path:
 
 from core import MemorySandbox
 from core.cli_ui import CliUi
-from core.config import load_config
+from core.config import agent_ui_mode_from_config, load_config
 from core.paths import default_config_path, default_persist_dir
 from core.utils import assemble_long_term_query, clean_text
 
@@ -142,6 +142,12 @@ def build_parser() -> argparse.ArgumentParser:
         help="使用项目 data/memory，而不是用户 Application Support 记忆库",
     )
     p.add_argument("--json", action="store_true", help="JSON 输出")
+    p.add_argument(
+        "--agent-mode",
+        choices=["ask", "plan", "agent"],
+        default=None,
+        help="本地 Cursor Agent 模式：ask 只读 | plan 规划 | agent 可写（全局，可持久化）",
+    )
 
     sub = p.add_subparsers(dest="cmd")
 
@@ -150,6 +156,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("query", nargs="+", help="问题文本")
     sp.add_argument("--local", action="store_true", help="仅查本地三级记忆，不调沙箱 LLM")
     sp.add_argument("--json", action="store_true", help="JSON 输出")
+    sp.add_argument(
+        "--agent-mode",
+        choices=["ask", "plan", "agent"],
+        default=None,
+        help="本轮覆盖 Agent 模式（ask|plan|agent）",
+    )
 
     # prepare（对齐 MCP memory_prepare）
     sp = sub.add_parser("prepare", help="拼接「记录到长期记忆」后只查本地记忆")
@@ -202,9 +214,19 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("--yes", action="store_true", help="确认清空")
     sp.add_argument("--backup-first", action="store_true", help="清空前先备份")
 
-    # scene / seed / reoptimize
+    # scene / seed / reoptimize / agent-mode
     sp = sub.add_parser("scene", help="切换工作记忆场景")
     sp.add_argument("name", help="场景名，如 dev")
+
+    sp = sub.add_parser("agent-mode", help="查看或切换本地 Cursor Agent 模式")
+    sp.add_argument(
+        "mode",
+        nargs="?",
+        choices=["ask", "plan", "agent"],
+        default=None,
+        help="ask 只读 | plan 规划 | agent 可写；省略则显示当前",
+    )
+    sp.add_argument("--no-persist", action="store_true", help="只改本次进程，不写配置文件")
 
     sub.add_parser("seed", help="写入一组开发常用种子记忆")
 
@@ -214,6 +236,12 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("interactive", help="交互模式")
     sp.add_argument("--local", action="store_true", help="交互时仅查本地记忆")
     sp.add_argument("--json", action="store_true", help="JSON 输出")
+    sp.add_argument(
+        "--agent-mode",
+        choices=["ask", "plan", "agent"],
+        default=None,
+        help="启动时切换 Agent 模式",
+    )
 
     # 兼容旧旗标（无子命令时）
     p.add_argument("-q", "--query", default=None, help=argparse.SUPPRESS)
@@ -228,6 +256,11 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
     use_user = not args.project_memory
     sb = build_sandbox(config_path=args.config, use_user_memory=use_user)
+
+    # 全局 --agent-mode（子命令也可各自带）
+    global_mode = getattr(args, "agent_mode", None)
+    if args.cmd is None and global_mode:
+        print(sb.set_agent_mode(global_mode, persist=True), file=sys.stderr)
 
     # ---- 兼容旧入口 ----
     if not args.cmd:
@@ -254,6 +287,8 @@ def main(argv=None) -> int:
     as_json = bool(getattr(args, "json", False))
 
     if cmd == "ask":
+        if getattr(args, "agent_mode", None):
+            print(sb.set_agent_mode(args.agent_mode, persist=False), file=sys.stderr)
         query = clean_text(" ".join(args.query))
         ui = None if as_json else CliUi()
         if ui:
@@ -342,6 +377,25 @@ def main(argv=None) -> int:
         print(f"已切换场景为「{sb.working.scene}」")
         return 0
 
+    if cmd == "agent-mode":
+        if args.mode is None:
+            cur = agent_ui_mode_from_config(sb.config.llm)
+            print(
+                json.dumps(
+                    {
+                        "agent_mode": cur,
+                        "agent_force": bool(sb.config.llm.agent_force),
+                        "runtime": sb.config.llm.runtime,
+                        "provider": sb.config.llm.provider,
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        print(sb.set_agent_mode(args.mode, persist=not args.no_persist))
+        return 0
+
     if cmd == "seed":
         seed_dev_memories(sb)
         return 0
@@ -352,6 +406,8 @@ def main(argv=None) -> int:
         return 0
 
     if cmd == "interactive":
+        if getattr(args, "agent_mode", None):
+            print(sb.set_agent_mode(args.agent_mode, persist=True), file=sys.stderr)
         interactive(sb, as_json=as_json, local_only=args.local)
         return 0
 

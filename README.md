@@ -216,6 +216,8 @@ Requires Cursor Agent CLI (`agent` on PATH). If missing, it errors clearly and d
 
 `agent` = full tools writable (uses `--force`; use with care); `ask`/`plan` = read-only. Settings go to `~/Library/Application Support/MemorySandbox/config.yaml`.
 
+Sandbox fallback Local/Cloud Agents **must not `git push` or open PRs**; push from your own terminal when needed.
+
 ### OpenAI-compatible gateway
 
 ```yaml

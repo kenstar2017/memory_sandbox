@@ -216,6 +216,8 @@ llm:
 
 `agent` = 全工具可写（会带 `--force`，慎用）；`ask`/`plan` = 只读。设置写入用户配置 `~/Library/Application Support/MemorySandbox/config.yaml`。
 
+沙箱回退的 Local/Cloud Agent **禁止 `git push` / 开 PR**；需要推远程时请你在本机终端自行执行。
+
 ### 接入 OpenAI 兼容网关
 
 ```yaml

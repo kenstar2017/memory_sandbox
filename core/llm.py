@@ -180,7 +180,7 @@ class CursorCloudLLM(BaseLLM):
     ) -> str:
         text = (
             "你是开发助手。请简洁、可落地地回答用户问题。"
-            "不要创建仓库、不要开 PR、不要修改远程代码；只输出文字答案。\n\n"
+            "不要创建仓库、不要开 PR、不要 git push、不要修改远程代码；只输出文字答案。\n\n"
         )
         if context:
             text += f"近期上下文:\n{context}\n\n"
@@ -340,15 +340,25 @@ class CursorLocalAgentLLM(BaseLLM):
         if not os.path.isdir(self.cwd):
             return f"[LLM Error] workspace 目录不存在: {self.cwd}"
 
+        # 记忆沙箱回退 Agent：禁止推远程；推送由用户本机自行决定
+        git_ban = (
+            "【硬性约束】禁止执行任何 git push / git push --force / gh pr create 等推送或发布远程操作；"
+            "禁止要求用户登录 GitHub 来替你完成推送。"
+            "若只需同步远程，用一句话提示用户自行在本机终端 push，不要代为执行。"
+            "本地 git status / diff / log 只读查询可以。"
+        )
         if agent_mode in {"ask", "plan"}:
             text = (
                 "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
-                "简洁、可落地。当前为只读/规划模式：不要修改文件、不要开 PR。\n\n"
+                "简洁、可落地。当前为只读/规划模式：不要修改文件、不要开 PR、不要 commit。\n"
+                f"{git_ban}\n\n"
             )
         else:
             text = (
                 "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
-                "简洁、可落地。当前为 Agent 全工具模式：可按需改文件与执行命令，谨慎操作。\n\n"
+                "简洁、可落地。当前为 Agent 全工具模式：可按需改本地文件；"
+                "不要自动 git commit，除非用户明确要求提交。\n"
+                f"{git_ban}\n\n"
             )
         if context:
             text += f"近期上下文:\n{context}\n\n"

@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "memory-sandbox": {
+      "type": "stdio",
+      "command": "/ABS/PATH/TO/memory_sandbox/.venv/bin/python",
+      "args": [
+        "/ABS/PATH/TO/memory_sandbox/mcp_server.py"
+      ],
+      "env": {
+        "PYTHONUNBUFFERED": "1"
+      }
+    }
+  }
+}

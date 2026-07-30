@@ -1,0 +1,26 @@
+#!/usr/bin/env bash
+# 记忆沙箱 CLI 快捷入口：./scripts/memory ask "..."
+# 支持经 symlink 安装到 PATH（需解析真实路径，否则 ROOT 会变成 /usr/local）
+set -euo pipefail
+
+_resolve_root() {
+  local src="${BASH_SOURCE[0]:-$0}"
+  # 跟随 symlink 到真实脚本（macOS 无 readlink -f）
+  while [[ -L "$src" ]]; do
+    local link
+    link="$(readlink "$src")"
+    if [[ "$link" == /* ]]; then
+      src="$link"
+    else
+      src="$(cd "$(dirname "$src")" && pwd)/$link"
+    fi
+  done
+  cd "$(dirname "$src")/.." && pwd
+}
+
+ROOT="$(_resolve_root)"
+PY="${ROOT}/.venv/bin/python"
+if [[ ! -x "$PY" ]]; then
+  PY="$(command -v python3)"
+fi
+exec "$PY" "${ROOT}/main.py" "$@"

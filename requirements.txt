@@ -1,0 +1,14 @@
+# 核心依赖（轻量本地版）
+PyYAML>=6.0
+
+# 可选：更快向量运算（未安装时回退纯 Python）
+# numpy>=1.24
+
+# 可选：Cursor SDK 本地 Agent（需 Python>=3.10；未安装时 cursor provider 走 Cloud Agents REST）
+# cursor-sdk>=1.0
+
+# 可选：大模型调用（OpenAI 兼容接口）
+# openai>=1.0
+
+# 可选：Chroma 向量库（未安装时使用内置 JSON 向量库）
+# chromadb>=0.4

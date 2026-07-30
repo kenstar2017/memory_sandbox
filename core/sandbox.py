@@ -1,0 +1,546 @@
+"""记忆沙箱主编排：感觉 → 工作 → 长时 →（可选）大模型 → 回写。"""
+
+from __future__ import annotations
+
+import re
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any, Dict, Optional
+
+from .config import AppConfig, load_config
+from .embedding import LocalHasherEmbedder
+from .llm import BaseLLM, ProgressCallback, build_llm
+from .long_term import LongTermMemory
+from .paths import default_config_path, default_persist_dir, is_frozen, resource_root
+from .sensory import SensoryMemory
+from .utils import extract_keywords
+from .working import WorkingMemory
+
+_PROJECT_ROOT = resource_root()
+
+
+@dataclass
+class ChatResult:
+    answer: str
+    source: str  # sensory_reject | working | long_term | procedural | llm | command | miss
+    meta: Dict[str, Any] = field(default_factory=dict)
+
+    def __str__(self) -> str:
+        return self.answer
+
+
+class MemorySandbox:
+    """
+    统一入口 chat(input_text)：
+    1. 感觉记忆预处理
+    2. 工作记忆本地匹配
+    3. 长时记忆检索
+    4. 沙箱无解 → 大模型
+    5. 结果回写巩固
+    """
+
+    def __init__(self, config: Optional[AppConfig] = None, config_path: Optional[str] = None):
+        cfg_path = config_path or str(default_config_path())
+        self.config = config or load_config(cfg_path)
+        self.embedder = LocalHasherEmbedder(dim=self.config.embedding.dim)
+
+        self.sensory = SensoryMemory(ttl=self.config.sensory.ttl)
+        self.working = WorkingMemory(
+            chunk_size=self.config.working.chunk_size,
+            idle_clear_seconds=self.config.working.idle_clear_seconds,
+        )
+        self.working.scene = self.config.sandbox.default_scene
+
+        persist_dir = Path(self.config.long_term.persist_dir)
+        if not persist_dir.is_absolute():
+            # 打包态默认写到 Application Support；开发态写到项目 data/
+            persist_dir = (default_persist_dir() if is_frozen() else _PROJECT_ROOT / persist_dir)
+
+        self.long_term = LongTermMemory(
+            persist_dir=str(persist_dir),
+            similarity_threshold=self.config.long_term.similarity_threshold,
+            top_k=self.config.long_term.top_k,
+            reinforce_boost=self.config.long_term.reinforce_boost,
+            embedder=self.embedder,
+        )
+        self.llm: Optional[BaseLLM] = build_llm(self.config.llm)
+
+    # ---------- public API ----------
+    def ask_local(
+        self,
+        input_text: str,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> ChatResult:
+        """
+        仅检索感觉 / 工作 / 长时（含程序性）记忆，绝不调用沙箱内 LLM。
+        供外部 AI 工具（Cursor MCP 等）使用：未命中由外部模型继续推理。
+        """
+        def _p(msg: str) -> None:
+            if on_progress:
+                try:
+                    on_progress(msg)
+                except Exception:
+                    pass
+
+        cmd = self._handle_command(input_text)
+        if cmd is not None:
+            return cmd
+
+        _p("感觉记忆：预处理输入…")
+        item = self.sensory.add(input_text)
+        valid = self.sensory.get_valid_data()
+        if item is None or not valid:
+            return ChatResult(answer="无效输入", source="sensory_reject")
+
+        text = item.text
+        keywords = item.keywords
+        vec = self.embedder.embed(text)
+
+        _p("工作记忆：本地匹配…")
+        local_res = self.working.local_match(text, user_vec=vec)
+        if local_res:
+            self._write_back(text, keywords, vec, local_res, persist_long=False)
+            _p("命中工作记忆")
+            return ChatResult(answer=local_res, source="working")
+
+        proc = self.long_term.match_procedure(text)
+        if proc and ("模板" in text or text.strip() in self.long_term.procedural):
+            self._write_back(text, keywords, vec, proc, persist_long=False)
+            _p("命中程序性记忆")
+            return ChatResult(answer=proc, source="procedural")
+
+        _p(f"长时记忆：向量检索（场景 {self.working.scene}）…")
+        long_res = self.long_term.search(text, query_vec=vec, scene=self.working.scene)
+        if long_res:
+            self._write_back(text, keywords, vec, long_res, persist_long=False)
+            _p("命中长时记忆")
+            return ChatResult(answer=long_res, source="long_term")
+
+        _p("本地三级记忆未命中")
+        return ChatResult(
+            answer="",
+            source="miss",
+            meta={"hit_local": False},
+        )
+
+    def chat(
+        self,
+        input_text: str,
+        stream_callback=None,
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> ChatResult:
+        """
+        标准调用链路。stream_callback 预留流式适配（当前同步返回）。
+        on_progress：阶段进度（CLI 交互模式等可打印到 stderr）。
+        Web/CLI 等本地入口：本地记忆未命中时可回退沙箱内 LLM。
+        """
+        local = self.ask_local(input_text, on_progress=on_progress)
+        # 指令 / 本地命中 / 感觉层拒绝：直接返回
+        if local.source != "miss":
+            if stream_callback:
+                stream_callback(local.answer)
+            return local
+
+        text = (input_text or "").strip()
+        keywords = extract_keywords(text)
+        vec = self.embedder.embed(text)
+
+        # 沙箱无解 → 大模型（仅本地 App/CLI；MCP 应走 ask_local）
+        if self.llm is None:
+            answer = "沙箱无匹配记忆，且大模型未启用（config.llm.enabled=false）。"
+            result = ChatResult(answer=answer, source="llm", meta={"skipped": True})
+            if on_progress:
+                on_progress("大模型未启用，跳过")
+            if stream_callback:
+                stream_callback(result.answer)
+            return result
+
+        provider = getattr(self.config.llm, "provider", "") or "llm"
+        runtime = getattr(self.config.llm, "runtime", "") or ""
+        if on_progress:
+            hint = f"provider={provider}"
+            if str(provider).lower() in {"cursor", "cursor_cloud", "cursor-agent"}:
+                from .llm import describe_cursor_llm
+
+                hint = describe_cursor_llm(self.config.llm)
+            elif runtime:
+                hint += f" runtime={runtime}"
+            on_progress(f"本地无解 → 回退沙箱 LLM（{hint}）…")
+        context = self.working.recent_context_text()
+        llm_res = self.llm.generate(text, context=context, on_progress=on_progress)
+
+        self._write_back(text, keywords, vec, llm_res, persist_long=True)
+        result = ChatResult(answer=llm_res, source="llm")
+        if stream_callback:
+            stream_callback(result.answer)
+        return result
+
+    def remember(self, question: str, answer: str, scene: Optional[str] = None) -> str:
+        from .question_optimize import optimize_question
+
+        scene = scene or self.working.scene
+        opt = optimize_question(question)
+        # 向量交给 save_memory 用 embed_text 生成，覆盖更多口语变体
+        rec = self.long_term.save_memory(question, answer, scene=scene)
+        self.working.add_context(opt.canonical, opt.keywords, rec.vector, role="user")
+        self.working.add_context(answer, extract_keywords(answer), role="assistant")
+        alias_hint = ""
+        if opt.canonical != opt.original:
+            alias_hint = f"；已优化为「{opt.canonical}」"
+        return (
+            f"已写入长时记忆 [{rec.id}]（场景: {rec.scene}{alias_hint}；"
+            f"别名 {len(rec.meta.get('aliases') or [])} 条）"
+        )
+
+    def forget(self, keyword: Optional[str] = None, layer: str = "all") -> str:
+        """主动遗忘。layer: sensory|working|long_term|all"""
+        counts = {}
+        if layer in ("sensory", "all"):
+            counts["sensory"] = self.sensory.forget(keyword)
+        if layer in ("working", "all"):
+            counts["working"] = self.working.forget(keyword)
+        if layer in ("long_term", "all"):
+            counts["long_term"] = self.long_term.forget(keyword)
+        if keyword is None:
+            return f"已清空记忆层 {layer}: {counts}"
+        return f"已按关键词「{keyword}」遗忘 {layer}: {counts}"
+
+    def backup_long_term(self, dest: Optional[str] = None) -> str:
+        """手动备份长时陈述性记忆。"""
+        self.long_term.reload()
+        path = self.long_term.backup_declarative(dest)
+        n = len(self.long_term.records)
+        return f"已备份长时记忆 {n} 条 → {path}"
+
+    def restore_long_term(self, path: Optional[str] = None) -> str:
+        """从备份恢复长时陈述性记忆（覆盖当前）。"""
+        try:
+            n = self.long_term.restore_declarative(path)
+        except FileNotFoundError as e:
+            return f"恢复失败：{e}"
+        except ValueError as e:
+            return f"恢复失败：{e}"
+        return f"已从备份恢复长时记忆 {n} 条" + (f"（{path}）" if path else "（最新备份）")
+
+    def clear_long_term(self, *, backup_first: bool = False) -> str:
+        """清空长时陈述性记忆（供已确认的 UI/API 调用）。"""
+        self.long_term.reload()
+        backup_msg = ""
+        if backup_first and self.long_term.records:
+            backup_msg = self.backup_long_term() + "\n"
+        n = self.long_term.forget()
+        return (
+            f"{backup_msg}长时记忆已清空（移除陈述性记忆 {n} 条）。程序性模板保留。"
+        )
+
+    def delete_memory(self, memory_id: str = "", question: str = "") -> str:
+        """删除单条长时记忆：优先 id，其次精确匹配问题。"""
+        if memory_id:
+            removed = self.long_term.delete_by_id(memory_id)
+            if removed:
+                return f"已删除记忆 [{removed.id}]：{removed.question}"
+            return f"未找到 id={memory_id} 的记忆"
+        q = (question or "").strip()
+        if not q:
+            return "请提供 memory_id 或 question"
+        self.long_term.reload()
+        for rec in list(self.long_term.records):
+            aliases = [rec.question] + list((rec.meta or {}).get("aliases") or [])
+            if q == rec.question or q in aliases:
+                self.long_term.delete_by_id(rec.id)
+                return f"已删除记忆 [{rec.id}]：{rec.question}"
+        # 退化：关键词删除 1 条最相近
+        n = self.long_term.forget(q)
+        if n:
+            return f"已按关键词删除 {n} 条与「{q}」相关的记忆"
+        return f"未找到问题「{q}」对应的记忆"
+
+    def status(self) -> dict:
+        return {
+            "sensory": self.sensory.stats(),
+            "working": self.working.stats(),
+            "long_term": self.long_term.stats(),
+            "llm": {
+                "enabled": self.config.llm.enabled,
+                "provider": self.config.llm.provider,
+            },
+        }
+
+    def list_working(self) -> list:
+        """短时/工作记忆窗口内容（不含向量）。"""
+        items = []
+        for i, item in enumerate(self.working.window, 1):
+            items.append({
+                "index": i,
+                "role": item.get("role", "user"),
+                "text": item.get("text", ""),
+                "keywords": item.get("kw") or [],
+            })
+        return items
+
+    def list_long_term(self, limit: int = 200) -> dict:
+        """长时记忆：陈述性 + 程序性（不含向量）。"""
+        self.long_term.reload()
+        declarative = []
+        for rec in self.long_term.records[: max(0, limit)]:
+            declarative.append({
+                "id": rec.id,
+                "question": rec.question,
+                "answer": rec.answer,
+                "scene": rec.scene,
+                "weight": round(rec.weight, 3),
+                "hit_count": rec.hit_count,
+                "keywords": rec.keywords,
+            })
+        return {
+            "declarative": declarative,
+            "declarative_total": len(self.long_term.records),
+            "procedural": dict(self.long_term.procedural),
+            "persist_dir": str(self.long_term.persist_dir),
+        }
+
+    def format_memory_view(self, layer: str = "all") -> str:
+        """人类可读的记忆清单，供 UI / MCP 展示。"""
+        parts = []
+        if layer in ("working", "all", "short"):
+            items = self.list_working()
+            parts.append(f"【工作记忆 / 短时】{len(items)}/{self.working.max_size} · 场景 {self.working.scene}")
+            if not items:
+                parts.append("  （空）")
+            else:
+                for it in items:
+                    role = "用户" if it["role"] == "user" else "助手"
+                    parts.append(f"  {it['index']}. [{role}] {it['text']}")
+        if layer in ("long_term", "all", "long"):
+            data = self.list_long_term()
+            parts.append("")
+            parts.append(
+                f"【长时记忆 / 陈述性】{data['declarative_total']} 条 · {data['persist_dir']}"
+            )
+            if not data["declarative"]:
+                parts.append("  （空）")
+            else:
+                for i, rec in enumerate(data["declarative"], 1):
+                    parts.append(
+                        f"  {i}. [{rec['scene']}] Q: {rec['question']}\n"
+                        f"     A: {rec['answer']}  "
+                        f"(命中{rec['hit_count']} 权重{rec['weight']})"
+                    )
+            parts.append("")
+            parts.append(f"【长时记忆 / 程序性】{len(data['procedural'])} 条")
+            if not data["procedural"]:
+                parts.append("  （空）")
+            else:
+                for name, tpl in data["procedural"].items():
+                    preview = tpl if len(tpl) <= 80 else tpl[:80] + "…"
+                    parts.append(f"  · {name}: {preview}")
+        return "\n".join(parts).strip()
+
+    # ---------- internals ----------
+    def _write_back(
+        self,
+        question: str,
+        keywords,
+        vec,
+        answer: str,
+        persist_long: bool,
+    ) -> None:
+        # Mock/失败占位不应污染工作记忆，否则重复提问会“假命中”
+        if answer.startswith("[MockLLM]") or answer.startswith("[LLM Error]"):
+            return
+        self.working.add_context(question, keywords, vec, role="user")
+        self.working.add_context(answer, extract_keywords(answer), role="assistant")
+        if persist_long and answer:
+            self.long_term.save_memory(
+                question,
+                answer,
+                scene=self.working.scene,
+                vector=vec,
+            )
+        # 高频短问答沉淀进工作记忆 FAQ，进一步减少模型调用
+        if persist_long and len(question) <= 20 and len(answer) <= 80:
+            hits = self.long_term.search_hits(question, query_vec=vec, threshold=0.9, top_k=1)
+            if hits and hits[0][0].hit_count >= 3:
+                self.working.rule_engine.add_faq(question, answer)
+
+    def _handle_command(self, raw: str) -> Optional[ChatResult]:
+        text = (raw or "").strip()
+        if not text:
+            return None
+
+        # 记住：问 => 答  /  记住 问 => 答
+        m = re.match(
+            r"^(?:记住[:：]\s*|记住\s+)(.+?)\s*(?:=>|→|->|＝|=)\s*(.+)$",
+            text,
+            re.DOTALL,
+        )
+        if m:
+            msg = self.remember(m.group(1).strip(), m.group(2).strip())
+            return ChatResult(answer=msg, source="command")
+
+        # 记住：纯知识片段
+        m = re.match(r"^记住[:：]\s*(.+)$", text, re.DOTALL)
+        if m:
+            content = m.group(1).strip()
+            msg = self.remember(content, content)
+            return ChatResult(answer=msg, source="command")
+
+        # 忘记刚才内容
+        if text in {"忘记刚才内容", "忘记刚才", "忘掉刚才"}:
+            n = self.working.forget()
+            self.sensory.clear()
+            return ChatResult(
+                answer=f"已清空工作记忆与感觉记忆（工作记忆移除 {n} 条）。",
+                source="command",
+            )
+
+        m = re.match(r"^忘记[:：]\s*(.+)$", text)
+        if m:
+            return ChatResult(answer=self.forget(m.group(1).strip()), source="command")
+
+        m = re.match(r"^(?:删除记忆|删掉记忆|移除记忆)[:：]\s*(.+)$", text)
+        if m:
+            target = m.group(1).strip()
+            if re.fullmatch(r"[0-9a-fA-F]{8,16}", target):
+                return ChatResult(answer=self.delete_memory(memory_id=target), source="command")
+            return ChatResult(answer=self.delete_memory(question=target), source="command")
+
+        if text in {"清空工作记忆", "清空上下文"}:
+            self.working.clear()
+            return ChatResult(answer="工作记忆已清空。", source="command")
+
+        if text in {"备份长时记忆", "备份长期记忆", "导出长时记忆", "backup long term"}:
+            return ChatResult(answer=self.backup_long_term(), source="command")
+
+        m = re.match(r"^(?:备份长时记忆|备份长期记忆|导出长时记忆)[:：]\s*(.+)$", text)
+        if m:
+            return ChatResult(answer=self.backup_long_term(m.group(1).strip()), source="command")
+
+        if text in {"恢复长时记忆备份", "从备份恢复长时记忆", "恢复最新长时备份"}:
+            return ChatResult(answer=self.restore_long_term(), source="command")
+
+        m = re.match(r"^(?:恢复长时记忆备份|从备份恢复长时记忆)[:：]\s*(.+)$", text)
+        if m:
+            return ChatResult(answer=self.restore_long_term(m.group(1).strip()), source="command")
+
+        if text in {"查看长时备份", "长时记忆备份列表", "列出长时备份"}:
+            backups = self.long_term.list_backups()
+            if not backups:
+                return ChatResult(answer="暂无长时记忆备份。可用「备份长时记忆」创建。", source="command")
+            lines = [f"共 {len(backups)} 份备份（新→旧）："]
+            for i, p in enumerate(backups[:20], 1):
+                lines.append(f"{i}. {p}")
+            return ChatResult(answer="\n".join(lines), source="command")
+
+        if text in {"清空长时记忆", "清空长期记忆", "清空持久记忆"}:
+            self.long_term.reload()
+            n = len(self.long_term.records)
+            return ChatResult(
+                answer=(
+                    f"即将清空全部长时记忆（当前 {n} 条陈述性问答）。此操作不可撤销。\n"
+                    "请发送「确认清空长时记忆」执行；\n"
+                    "建议先发送「备份长时记忆」；\n"
+                    "也可发送「确认清空长时记忆并备份」以先备份再清空。"
+                ),
+                source="command",
+                meta={"needs_confirm": True, "action": "clear_long_term", "count": n},
+            )
+
+        if text in {
+            "确认清空长时记忆",
+            "清空长时记忆：确认",
+            "清空长时记忆:确认",
+            "确认清空长期记忆",
+        }:
+            return ChatResult(answer=self.clear_long_term(backup_first=False), source="command")
+
+        if text in {
+            "确认清空长时记忆并备份",
+            "确认清空长时记忆（先备份）",
+            "确认清空长时记忆(先备份)",
+        }:
+            return ChatResult(answer=self.clear_long_term(backup_first=True), source="command")
+
+        # 清理低访问记忆：可选参数「清理低访问记忆 30」表示超过 N 天且命中次数≤0
+        m = re.match(r"^(?:清理低访问记忆|归档长时记忆|遗忘低访问记忆)(?:\s+(\d+))?$", text)
+        if m:
+            days = float(m.group(1) or 30)
+            n = self.long_term.archive_low_access(min_hits=0, older_than_days=days)
+            return ChatResult(
+                answer=f"已清理低访问长时记忆 {n} 条（命中次数≤0 且超过 {int(days)} 天未更新）。",
+                source="command",
+            )
+
+        if text in {"优化已有记忆", "重优化记忆", "刷新记忆索引"}:
+            n = self.long_term.reoptimize_all()
+            return ChatResult(
+                answer=f"已对 {n} 条长时记忆重新优化问题（补全别名并刷新向量）。",
+                source="command",
+            )
+
+        if text in {"清空全部记忆", "清空所有记忆"}:
+            self.long_term.reload()
+            n = len(self.long_term.records)
+            return ChatResult(
+                answer=(
+                    f"即将清空全部记忆（含工作/感觉，以及 {n} 条长时陈述性问答）。此操作不可撤销。\n"
+                    "请发送「确认清空全部记忆」执行；\n"
+                    "建议先「备份长时记忆」；\n"
+                    "或发送「确认清空全部记忆并备份」。"
+                ),
+                source="command",
+                meta={"needs_confirm": True, "action": "clear_all", "count": n},
+            )
+
+        if text in {"确认清空全部记忆", "清空全部记忆：确认", "清空全部记忆:确认"}:
+            n_w = self.working.forget()
+            n_s = self.sensory.forget()
+            n_l = self.long_term.forget()
+            return ChatResult(
+                answer=(
+                    f"已清空全部记忆：感觉 {n_s} · 工作 {n_w} · 长时陈述性 {n_l}。"
+                    "程序性模板保留。"
+                ),
+                source="command",
+            )
+
+        if text in {"确认清空全部记忆并备份", "确认清空全部记忆（先备份）", "确认清空全部记忆(先备份)"}:
+            backup_msg = ""
+            if self.long_term.records:
+                backup_msg = self.backup_long_term() + "\n"
+            n_w = self.working.forget()
+            n_s = self.sensory.forget()
+            n_l = self.long_term.forget()
+            return ChatResult(
+                answer=(
+                    f"{backup_msg}已清空全部记忆：感觉 {n_s} · 工作 {n_w} · 长时陈述性 {n_l}。"
+                    "程序性模板保留。"
+                ),
+                source="command",
+            )
+
+        if text in {"查看记忆状态", "记忆状态", "memory status", "status"}:
+            import json
+            return ChatResult(
+                answer=json.dumps(self.status(), ensure_ascii=False, indent=2),
+                source="command",
+            )
+
+        if text in {"查看短时记忆", "查看工作记忆", "短时记忆", "工作记忆"}:
+            return ChatResult(answer=self.format_memory_view("working"), source="command")
+
+        if text in {"查看长时记忆", "长时记忆"}:
+            return ChatResult(answer=self.format_memory_view("long_term"), source="command")
+
+        if text in {"查看全部记忆", "查看记忆", "全部记忆"}:
+            return ChatResult(answer=self.format_memory_view("all"), source="command")
+
+        m = re.match(r"^切换场景[:：]\s*(.+)$", text)
+        if m:
+            self.working.set_scene(m.group(1).strip())
+            return ChatResult(
+                answer=f"已切换场景为「{self.working.scene}」。同场景记忆检索将优先。",
+                source="command",
+            )
+
+        return None

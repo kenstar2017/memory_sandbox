@@ -53,13 +53,39 @@ Agent 会调用这些工具：
 
 | 工具 | 作用 |
 |------|------|
-| `memory_ask` | 先查本地三级记忆 |
-| `memory_remember` | 固化可复用结论 |
+| `memory_prepare` | **每轮首选**：拼接「记录到长期记忆」后检索；返回 `references`/`context_pack` 多条参考问答 |
+| `memory_ask` | 原样检索（不自动拼后缀） |
+| `memory_remember` | 固化可复用结论（可带 `tags`） |
 | `memory_forget` | 主动遗忘 |
 | `memory_status` | 查看记忆统计 |
 | `memory_set_scene` | 切换场景（如 `dev`） |
 
-项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_ask`，命中则直接用；未命中再推理，并把稳定结论 `memory_remember`。**
+项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_prepare`**；把返回的 `references` / `context_pack` 当参考并结合当前仓库；改功能时不要因硬命中短路；纯事实复述且 `hit_local` 才可直接用 `answer`；结束前 `memory_remember`。
+
+### 标签与类型（更好找）
+
+- 写入时可带标签，如 `feishu`、`frontend`；问题里写 `#tag` 也可以
+- 可标明类型：普通问答 / 命令 / 路径 / 环境变量 / 踩坑 / 决策
+- 命中时会带上分数和原因（为什么会命中），方便核对或删除
+
+### 省事与安全
+
+- 粘贴终端/日志可先「提炼候选」，确认后再记住
+- 写入时自动遮盖 token、密钥、私钥等敏感内容
+- 网页左侧可按标签筛选，并编辑标签与类型
+
+### 搜得更准、能分享
+
+- 检索同时看语义向量、关键词和 BM25（Web 工具栏「检索设置」可调，每项有说明；也写入用户 `config.yaml`）
+- 很久没用的条目会在检索时降权，也可一键归档
+- 可导出「知识包」发给同事，对方合并导入即可（不含向量、已脱敏）
+
+### 跟着代码变、和飞书联动
+
+- `git-check`：对照 Git 变更，提示哪些记忆可能过时
+- `review-suggest`：从近期提交提示可沉淀的协作习惯
+- `feishu-bookmark`：把飞书文档拉成待确认记忆（需先登录飞书）
+- `pack-list`：查看本机已导出的知识包
 
 记忆数据与桌面 App 共用：
 
@@ -109,7 +135,7 @@ python3 app_web.py
 ./scripts/memory ask "revenue 怎么本地启动"
 ./scripts/memory ask --local "PK组件"          # 只查本地，不调沙箱 LLM
 ./scripts/memory prepare "revenue怎么启动"     # 拼接「记录到长期记忆」后查本地
-./scripts/memory remember "问" "答" --scene dev
+./scripts/memory remember "问" "答" --scene dev --tag feishu
 ./scripts/memory list --layer long_term
 ./scripts/memory status
 ./scripts/memory backup
@@ -203,6 +229,8 @@ ln -sf "$(pwd)/scripts/memory" /usr/local/bin/memory-sandbox
 | 何时拉取 | 仅 Web / CLI 回退 LLM 前；MCP 的 `memory_prepare` **不会**拉飞书 |
 | 不复用工作记忆旧答 | 含飞书链接的提问不直接复用上次失败/旧结论，便于重试 |
 | 失败类答复 | 鉴权失败等不写入工作记忆 / 长时记忆 |
+| 入库「问」 | 自动用 **文档标题 + 用户意图** 重写（末尾保留链接）；Web「补全答案」里「问」可编辑，也可点「优化问法」 |
+| 不自动入库 | 飞书拉取成功后**不立刻写长时**，放入「待补全答」供你改问再确认；同文档 token / 指定 id 更新不会新开多条 |
 
 ### 配置位置
 

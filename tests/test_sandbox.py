@@ -99,6 +99,54 @@ class MemorySandboxTests(unittest.TestCase):
             "revenue 怎么本地启动，记录到长期记忆。",
         )
 
+    def test_tags_remember_and_filter(self):
+        self.sb.remember("飞书登录", "用 oauth 脚本", scene="dev", tags=["feishu", "oauth"])
+        self.sb.remember("前端构建", "pnpm build", scene="dev", tags=["frontend"])
+        hits = self.sb.long_term.search_hits("登录", tags=["feishu"])
+        self.assertTrue(hits)
+        self.assertIn("feishu", hits[0].record.tags)
+        self.assertTrue(any("tag:" in r for r in hits[0].reasons))
+        front = self.sb.long_term.search_hits("构建", tags=["frontend"])
+        self.assertTrue(front)
+        self.assertEqual(front[0].record.answer, "pnpm build")
+        miss = self.sb.long_term.search_hits("登录", tags=["frontend"], threshold=0.01)
+        self.assertFalse(any("oauth" in h.record.answer for h in miss))
+
+    def test_hash_tag_in_question(self):
+        self.sb.remember("如何配置 #feishu 机器人", "见 docs/feishu_zh.md", scene="dev")
+        self.assertIn("feishu", self.sb.long_term.records[0].tags)
+
+    def test_explainable_long_term_hit(self):
+        self.sb.remember("mock 端口", "3001", scene="dev", tags=["dev"])
+        r = self.sb.ask_local("mock 端口是多少")
+        self.assertEqual(r.source, "long_term")
+        self.assertIn("3001", r.answer)
+        self.assertTrue(r.meta.get("hits"))
+        self.assertIn("score", r.meta["hits"][0])
+        self.assertTrue(r.meta["hits"][0].get("reasons") or r.meta.get("explain"))
+
+    def test_concurrent_remember_no_lost_update(self):
+        import threading
+
+        errors = []
+
+        def writer(i):
+            try:
+                other = MemorySandbox(config=self.cfg)
+                other.remember(f"并发键-{i}", f"值-{i}", scene="dev", tags=["race"])
+            except Exception as e:
+                errors.append(e)
+
+        threads = [threading.Thread(target=writer, args=(i,)) for i in range(8)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+        self.assertFalse(errors)
+        self.sb.long_term.reload()
+        race = [r for r in self.sb.long_term.records if "race" in (r.tags or [])]
+        self.assertGreaterEqual(len(race), 8)
+
 
 if __name__ == "__main__":
     unittest.main()

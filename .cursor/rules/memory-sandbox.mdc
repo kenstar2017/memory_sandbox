@@ -1,5 +1,5 @@
 ---
-description: 每轮先 memory_prepare；凡 AI 对话结论都必须 memory_remember
+description: 每轮先 memory_prepare；参考问答结合仓库；凡 AI 对话结论都必须 memory_remember
 alwaysApply: true
 ---
 
@@ -11,17 +11,25 @@ alwaysApply: true
 
 1. 工具会把问题拼成 `xxxx，记录到长期记忆。`（用户已手写该后缀则不重复拼）
 2. **只检索**本地感觉/工作/长时记忆，**不会**调用记忆沙箱内的 LLM
-3. 未命中时由**当前 AI 工具自己的模型**继续推理；结束后 `memory_remember`
+3. 返回里通常含 `references` / `context_pack`（多条软召回参考问答）与可选硬命中 `answer`
+4. 未硬命中或改代码时：由**当前 AI 工具自己的模型**结合参考与仓库继续；结束后 `memory_remember`
 
 可跳过 `memory_prepare` 的纯管理指令示例：备份/清空/恢复/删除单条记忆、查看记忆状态、切换场景。
 
-## 命中 / 未命中
+## 命中 / 参考 / 未命中
 
-1. 若 `hit_local=true`：
-   - **直接采用沙箱的 `answer` 回答用户**
+1. 若返回 `references` 或 `context_pack`（有内容）：
+   - **必须纳入本轮推理**，与当前仓库、用户上下文一起用
+   - 参考可能过时，**以仓库/现状为准**，不要整段照抄当最终实现
+2. 若在改功能 / 查代码 / 排障：
+   - **不要**因 `hit_local=true` 而短路结束
+   - 把沙箱问答当背景参考，再读代码、给方案或改文件
+   - 本轮新结论结束前 `memory_remember`
+3. 若问题只是纯事实复述、无需改代码，且 `hit_local=true`：
+   - 可优先采用沙箱的 `answer` 回答用户
    - **不要**用模型默认身份覆盖沙箱答案
-   - 可简短注明「来自记忆沙箱」
-2. 若 `hit_local=false`：
+   - 可简短注明「来自记忆沙箱」；仍建议扫一眼 `references` 是否冲突
+4. 若 `hit_local=false` 且无参考：
    - 以返回的 `assembled` 作为待解决问题继续推理 / 查代码 / 排障
 
 ## 结束前必须写入（硬性 · 含排障与改代码）
@@ -40,6 +48,12 @@ alwaysApply: true
 - `question`：精简问法或用户 `original`（不要只写「帮我看看」）
 - `answer`：稳定结论（原因 + 做法 + 关键路径/命令）
 - `scene`：可用 `dev`
+- `tags`：可选，如 `["feishu","frontend"]`；也可在 question 写 `#tag`
+- `kind` / `facts`：可选结构化类型（command/path/env/pitfall/decision）
+- 命中时可读 `hits` / `explain` / `references`（分数与原因），便于纠错或 `forget`
+- 终端/日志可先 `memory_extract` 得候选，确认后再 `memory_remember`（写入自动脱敏）
+- 知识包分享：`memory_export_pack` / `memory_import_pack`；很久不用的用 `memory_archive`
+- 改完代码可 `memory_git_check` 扫过时记忆；飞书文档可用 `memory_feishu_bookmark` 再确认写入
 
 例外（可不写）：
 
@@ -52,7 +66,7 @@ alwaysApply: true
 
 ## 其它工具
 
-- 需要原样检索、不自动拼接后缀 → `memory_ask`
+- 需要原样检索、不自动拼接后缀 → `memory_ask`（同样返回 `references` / `context_pack`）
 - 用户要忘记内容 → `memory_forget`（清空长时/全部时必须 `confirm=true`，建议先 `memory_backup`）
 - 用户要备份长时记忆 → `memory_backup`
 - 切换项目/环境 → `memory_set_scene`

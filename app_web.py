@@ -31,7 +31,7 @@ from core.paths import app_support_dir, default_config_path, default_persist_dir
 HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
 # 前端/协议版本：用于识别旧进程（无思考过程流）并提示重启
-UI_BUILD = "20260731-stream2"
+UI_BUILD = "20260731-update-qa"
 UI_FEATURES = ("chat_stream", "think_card")
 
 HTML_PAGE = r"""<!DOCTYPE html>
@@ -466,10 +466,21 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .modal.modal-answer {
     width: min(860px, 96vw);
+    height: min(90vh, 920px);
     max-height: min(90vh, 920px);
     display: flex;
     flex-direction: column;
-    padding: 26px 28px 20px;
+    padding: 20px 24px 16px;
+    overflow: hidden;
+  }
+  .modal.modal-answer > h3,
+  .modal.modal-answer > .modal-hint,
+  .modal.modal-answer > .qbox-wrap,
+  .modal.modal-answer > .q-actions,
+  .modal.modal-answer > .meta-grid,
+  .modal.modal-answer > .answer-toolbar,
+  .modal.modal-answer > .modal-actions {
+    flex-shrink: 0;
   }
   .modal h3 {
     margin: 0 0 6px;
@@ -479,46 +490,75 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: var(--ink);
   }
   .modal .modal-hint {
-    margin: 0 0 14px;
+    margin: 0 0 10px;
     font-size: 13px;
     line-height: 1.45;
     color: var(--muted);
   }
-  .modal .qbox {
-    background: #f4f7f5;
-    border: 1px solid var(--line);
-    border-radius: 12px;
-    padding: 12px 14px;
-    font-size: 14px;
-    line-height: 1.55;
-    margin-bottom: 14px;
-    white-space: pre-wrap;
-    word-break: break-word;
-    max-height: 22vh;
-    overflow-y: auto;
+  .modal .qbox-wrap {
+    display: flex;
+    align-items: flex-start;
+    gap: 8px;
+    margin-bottom: 6px;
     flex-shrink: 0;
   }
-  .modal .qbox::before {
-    content: "问";
-    display: inline-block;
-    margin-right: 8px;
+  .modal .q-badge {
+    flex: 0 0 auto;
+    margin-top: 10px;
     padding: 1px 7px;
     border-radius: 6px;
     background: var(--accent);
     color: #fff;
     font-size: 11px;
     font-weight: 700;
-    vertical-align: 1px;
+  }
+  .modal .qbox-input {
+    flex: 1 1 auto;
+    min-height: 52px;
+    max-height: 96px;
+    margin: 0;
+    background: #f4f7f5;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    padding: 10px 12px;
+    font-size: 14px;
+    line-height: 1.55;
+    resize: none;
+    overflow-y: auto;
+    white-space: pre-wrap;
+    word-break: break-word;
+    font-family: inherit;
+  }
+  .modal .qbox-input:focus {
+    outline: none;
+    border-color: var(--accent);
+    background: #fff;
+    box-shadow: 0 0 0 3px rgba(47,111,87,.14);
+  }
+  .modal .q-actions {
+    display: flex;
+    justify-content: flex-end;
+    margin: 0 0 8px;
+  }
+  .modal .q-actions .ghost {
+    border: 1px dashed var(--line);
+    background: #fff;
+    color: var(--accent);
+    font-size: 12px;
+    padding: 4px 10px;
   }
   .modal textarea {
     min-height: 120px;
     margin-bottom: 14px;
   }
+  .modal.modal-answer .meta-grid {
+    margin: 0 0 8px;
+  }
   .answer-toolbar {
     display: flex;
     align-items: center;
     gap: 8px;
-    margin-bottom: 10px;
+    margin-bottom: 8px;
     flex-wrap: wrap;
   }
   .answer-tabs {
@@ -552,16 +592,16 @@ HTML_PAGE = r"""<!DOCTYPE html>
   .answer-toolbar .ghost:hover { background: #f0f7f3; }
   .answer-panes {
     flex: 1 1 auto;
-    min-height: 320px;
-    max-height: 52vh;
+    min-height: 0;
     display: flex;
     flex-direction: column;
-    margin-bottom: 16px;
+    margin-bottom: 12px;
+    overflow: hidden;
   }
-  .modal.modal-answer textarea {
+  .modal.modal-answer #modalAnswer {
     flex: 1 1 auto;
-    min-height: 300px;
-    height: 100%;
+    min-height: 0;
+    height: auto;
     margin-bottom: 0;
     font-size: 14.5px;
     line-height: 1.75;
@@ -569,11 +609,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
     border-radius: 12px;
     border: 1px solid var(--line);
     background: #fbfcfb;
-    resize: vertical;
+    resize: none;
+    overflow-y: auto;
     font-family: "SF Pro Text", "PingFang SC", "Helvetica Neue", sans-serif;
     tab-size: 2;
   }
-  .modal.modal-answer textarea:focus {
+  .modal.modal-answer #modalAnswer:focus {
     outline: none;
     border-color: var(--accent);
     background: #fff;
@@ -581,7 +622,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .answer-preview {
     flex: 1 1 auto;
-    min-height: 300px;
+    min-height: 0;
     overflow-y: auto;
     padding: 16px 18px;
     border-radius: 12px;
@@ -617,7 +658,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
     gap: 10px;
     flex-wrap: wrap;
     flex-shrink: 0;
-    padding-top: 2px;
+    margin-top: auto;
+    border-top: 1px solid #eef2ef;
+    padding-top: 12px;
   }
   .modal-actions button { min-width: 88px; padding: 9px 16px; }
   .modal .warn {
@@ -641,13 +684,129 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: #fff;
     border-color: var(--danger);
   }
+  .tag-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 0 10px;
+  }
+  .tag-chip {
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--muted);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .tag-chip.active {
+    background: var(--ink);
+    color: #fff;
+    border-color: var(--ink);
+  }
+  .meta-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 10px;
+    margin: 10px 0 12px;
+  }
+  .meta-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .meta-grid label.span2 { grid-column: 1 / -1; }
+  .meta-grid input, .meta-grid select {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-size: 13px;
+    color: var(--ink);
+    background: #fff;
+  }
+  .qa-badge.kind { background: #e8eef8; color: #2a4a7a; }
+  .modal.modal-settings {
+    width: min(640px, 96vw);
+    max-height: min(88vh, 860px);
+    display: flex;
+    flex-direction: column;
+  }
+  .modal.modal-settings .settings-body {
+    overflow-y: auto;
+    flex: 1 1 auto;
+    padding-right: 4px;
+    margin-bottom: 12px;
+  }
+  .settings-section {
+    margin: 0 0 14px;
+    padding: 12px 14px;
+    border: 1px solid var(--line);
+    border-radius: 12px;
+    background: #fbfcfb;
+  }
+  .settings-section h4 {
+    margin: 0 0 6px;
+    font-size: 14px;
+    color: var(--ink);
+  }
+  .settings-section .sec-help {
+    margin: 0 0 10px;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+  .settings-field {
+    display: grid;
+    grid-template-columns: 140px 1fr;
+    gap: 6px 12px;
+    align-items: start;
+    padding: 8px 0;
+    border-top: 1px dashed #e4ebe6;
+  }
+  .settings-field:first-of-type { border-top: none; padding-top: 0; }
+  .settings-field .fname {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--ink);
+    padding-top: 6px;
+  }
+  .settings-field .fctrl input[type="number"],
+  .settings-field .fctrl select {
+    width: 100%;
+    max-width: 180px;
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-size: 13px;
+  }
+  .settings-field .fctrl label.check {
+    margin: 0;
+    font-size: 13px;
+  }
+  .settings-field .fhelp {
+    grid-column: 2;
+    font-size: 12px;
+    color: var(--muted);
+    line-height: 1.45;
+  }
+  .settings-sum {
+    margin: 8px 0 0;
+    font-size: 12px;
+    color: var(--accent);
+  }
   @media (max-width: 640px) {
     .modal.modal-answer {
       width: 100%;
+      height: 94vh;
       max-height: 94vh;
-      padding: 18px 16px 14px;
+      padding: 14px 14px 12px;
     }
-    .modal.modal-answer textarea { min-height: 220px; font-size: 14px; }
+    .modal.modal-answer #modalAnswer { font-size: 14px; }
+    .modal .qbox-input { max-height: 72px; }
+    .settings-field { grid-template-columns: 1fr; }
+    .settings-field .fhelp { grid-column: 1; }
   }
 </style>
 </head>
@@ -660,6 +819,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button type="button" class="active" data-tab="pending" id="tabPending">待补全答</button>
         <button type="button" data-tab="saved" id="tabSaved">已记住</button>
       </div>
+      <div class="tag-filter" id="tagFilter" hidden></div>
       <div id="qaList"></div>
     </aside>
 
@@ -681,8 +841,12 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button type="button" id="btnLong">查看长时记忆</button>
         <button type="button" id="btnAllMem">查看全部记忆</button>
         <button type="button" id="btnStatus">记忆状态</button>
+        <button type="button" id="btnRetrieval">检索设置</button>
         <button type="button" id="btnClear">清空工作记忆</button>
         <button type="button" id="btnBackupLong">备份长时记忆</button>
+        <button type="button" id="btnExportPack">导出知识包</button>
+        <button type="button" id="btnGitCheck">检查过时记忆</button>
+        <button type="button" id="btnArchive">归档陈旧记忆</button>
         <button type="button" class="danger" id="btnClearLong">清空长时记忆</button>
         <button type="button" id="btnSeed">写入开发种子</button>
         <button type="button" id="btnData">打开数据目录</button>
@@ -710,8 +874,32 @@ HTML_PAGE = r"""<!DOCTYPE html>
   <div class="modal-mask" id="answerModal">
     <div class="modal modal-answer">
       <h3>补全答案</h3>
-      <p class="modal-hint">支持 Markdown（列表 / **加粗** / `代码`）。可用「整理排版」把顿号长列表拆成条目，再点「预览」查看效果。</p>
-      <div class="qbox" id="modalQuestion"></div>
+      <p class="modal-hint">「问」可直接修改。飞书链接会按文档标题+语义建议问法。答案支持 Markdown；可用「整理排版」再「预览」。</p>
+      <div class="qbox-wrap">
+        <span class="q-badge">问</span>
+        <textarea id="modalQuestion" class="qbox-input" rows="3" placeholder="可编辑的问题（问）"></textarea>
+      </div>
+      <div class="q-actions">
+        <button type="button" class="ghost" id="btnSuggestQuestion" title="按飞书标题/语义重写问法">优化问法</button>
+      </div>
+      <div class="meta-grid">
+        <label>标签（逗号分隔）
+          <input id="modalTags" placeholder="feishu, frontend" />
+        </label>
+        <label>类型
+          <select id="modalKind">
+            <option value="qa">qa 问答</option>
+            <option value="command">command 命令</option>
+            <option value="path">path 路径</option>
+            <option value="env">env 环境</option>
+            <option value="pitfall">pitfall 踩坑</option>
+            <option value="decision">decision 决策</option>
+          </select>
+        </label>
+        <label class="span2">结构化补充（可选，随类型填写）
+          <input id="modalFact" placeholder="如：pnpm build 或 ~/path 或 KEY=value" />
+        </label>
+      </div>
       <div class="answer-toolbar">
         <div class="answer-tabs" id="answerTabs">
           <button type="button" class="active" data-pane="edit">编辑</button>
@@ -745,6 +933,18 @@ HTML_PAGE = r"""<!DOCTYPE html>
     </div>
   </div>
 
+  <div class="modal-mask" id="retrievalModal">
+    <div class="modal modal-settings">
+      <h3>检索设置</h3>
+      <p class="modal-hint" id="retrievalHint">长时记忆如何打分与命中。改完立即生效，并写入本机用户配置。</p>
+      <div class="settings-body" id="retrievalFields"></div>
+      <div class="modal-actions">
+        <button type="button" id="btnRetrievalCancel">取消</button>
+        <button type="button" class="primary" id="btnRetrievalSave">保存</button>
+      </div>
+    </div>
+  </div>
+
 <script>
 const chat = document.getElementById('chat');
 const input = document.getElementById('input');
@@ -772,14 +972,36 @@ const COMMANDS = [
   { id: 'clear_w', name: '清空工作记忆', desc: '清空短时滑动窗口', icon: '清', run: '清空工作记忆' },
   { id: 'backup_l', name: '备份长时记忆', desc: '导出陈述性问答到 backups/', icon: '备', run: '备份长时记忆' },
   { id: 'clear_l', name: '清空长时记忆', desc: '清空持久化问答（需确认）', icon: '删', confirmClear: 'long' },
+  { id: 'extract', name: '提炼候选', desc: '从粘贴的终端/日志提炼候选记忆', icon: '炼', extract: true },
+  { id: 'retrieval', name: '检索设置', desc: '调整向量/关键词/BM25 权重与命中阈值', icon: '检', openRetrieval: true },
+];
+
+const RETRIEVAL_SECTIONS = [
+  {
+    title: '命中规则',
+    help: '决定什么时候算「找到了」并直接复用长时记忆。',
+    keys: ['similarity_threshold', 'top_k', 'reinforce_boost'],
+  },
+  {
+    title: '混合检索权重',
+    help: '语义向量、关键词、BM25 三项一起打分；保存时会自动按比例归一化，不必精确加到 1。',
+    keys: ['bm25_enabled', 'vector_weight', 'keyword_weight', 'bm25_weight'],
+  },
+  {
+    title: '陈旧记忆',
+    help: '很久没用的记忆会略降权，减少过时结论抢答。',
+    keys: ['aging_enabled', 'aging_days', 'aging_decay'],
+  },
 ];
 
 let activeTab = 'pending';
 let pendingQuestions = loadPending();
 let savedMemories = [];
+let activeTagFilter = '';
 let mode = null; // 'memory' | null
 let slashIndex = 0;
 let editingQuestion = '';
+let editingRecordId = '';
 
 function loadPending() {
   try { return JSON.parse(localStorage.getItem('ms_pending_q') || '[]'); }
@@ -817,10 +1039,16 @@ async function api(path, body) {
 
 function setMode(next) {
   mode = next;
-  modeBar.classList.toggle('show', mode === 'memory');
+  modeBar.classList.toggle('show', mode === 'memory' || mode === 'extract');
+  const label = modeBar.querySelector('span');
   if (mode === 'memory') {
+    if (label) label.textContent = '当前指令：记忆 — 请输入「问」';
     input.placeholder = '记忆模式：输入问题（问），Enter 加入左侧清单';
+  } else if (mode === 'extract') {
+    if (label) label.textContent = '当前指令：提炼 — 粘贴终端/日志';
+    input.placeholder = '提炼模式：粘贴终端输出或日志，Enter 提炼候选';
   } else {
+    if (label) label.textContent = '当前指令：记忆 — 请输入「问」';
     input.placeholder = '输入问题，或输入 / 选择指令。Enter 发送，Shift+Enter 换行';
   }
 }
@@ -869,12 +1097,56 @@ async function selectCommand(cmd) {
     input.focus();
     return;
   }
+  if (cmd.extract) {
+    setMode('extract');
+    append('已进入「提炼候选」：粘贴终端/日志文本到下方发送，将返回候选记忆供确认写入。', 'sys');
+    input.focus();
+    return;
+  }
   if (cmd.confirmClear) {
     openConfirmClear(cmd.confirmClear);
     return;
   }
+  if (cmd.openRetrieval) {
+    openRetrievalModal();
+    return;
+  }
   if (cmd.run) {
     await sendText(cmd.run);
+  }
+}
+
+async function runExtract(text) {
+  const data = await api('/api/extract', { text, max_n: 3 });
+  if (data.error) {
+    append('错误：' + data.error, 'meta');
+    return;
+  }
+  const cands = data.candidates || [];
+  if (!cands.length) {
+    append('未提炼出候选记忆，可换一段包含命令/路径/报错的文本再试。', 'sys');
+    return;
+  }
+  append('提炼到 ' + cands.length + ' 条候选（点击左侧填写或直接点「记住」）：', 'sys');
+  cands.forEach((c, i) => {
+    const label = '[' + (i + 1) + '] ' + (c.kind || 'qa') + ' · ' + (c.question || '');
+    append(label + '\n' + (c.answer || ''), 'bot', { markdown: false, label: '候选' });
+    pendingQuestions.push(c.question || ('候选' + (i + 1)));
+    // 用 session 暂存候选详情，点开弹窗时回填
+    try {
+      const map = JSON.parse(sessionStorage.getItem('ms_extract_map') || '{}');
+      map[c.question] = c;
+      sessionStorage.setItem('ms_extract_map', JSON.stringify(map));
+    } catch (e) {}
+  });
+  savePending();
+  activeTab = 'pending';
+  document.querySelectorAll('.side-tabs button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === 'pending');
+  });
+  renderQaList();
+  if (data.suggested_tags && data.suggested_tags.length) {
+    append('建议标签：' + data.suggested_tags.map((t) => '#' + t).join(' '), 'meta');
   }
 }
 
@@ -932,8 +1204,48 @@ async function executeConfirmClear() {
   }
 }
 
+function allSavedTags() {
+  const set = new Set();
+  savedMemories.forEach((rec) => (rec.tags || []).forEach((t) => set.add(t)));
+  return Array.from(set).sort();
+}
+
+function renderTagFilter() {
+  const bar = document.getElementById('tagFilter');
+  if (!bar) return;
+  if (activeTab !== 'saved') {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  const tags = allSavedTags();
+  if (!tags.length) {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  bar.hidden = false;
+  const chips = [{ tag: '', label: '全部' }].concat(tags.map((t) => ({ tag: t, label: '#' + t })));
+  bar.innerHTML = chips.map((c) =>
+    '<button type="button" class="tag-chip' + ((activeTagFilter === c.tag) ? ' active' : '') +
+    '" data-tag="' + escapeHtml(c.tag) + '">' + escapeHtml(c.label) + '</button>'
+  ).join('');
+  bar.querySelectorAll('.tag-chip').forEach((btn) => {
+    btn.onclick = () => {
+      activeTagFilter = btn.dataset.tag || '';
+      renderQaList();
+    };
+  });
+}
+
+function filteredSaved() {
+  if (!activeTagFilter) return savedMemories;
+  return savedMemories.filter((rec) => (rec.tags || []).includes(activeTagFilter));
+}
+
 function renderQaList() {
   qaList.innerHTML = '';
+  renderTagFilter();
   if (activeTab === 'pending') {
     if (!pendingQuestions.length) {
       qaList.innerHTML = '<div class="qa-a" style="padding:8px">暂无待补全的问题。输入 / 选择「记忆」添加。</div>';
@@ -958,21 +1270,32 @@ function renderQaList() {
     });
     return;
   }
+  const list = filteredSaved();
   if (!savedMemories.length) {
     qaList.innerHTML = '<div class="qa-a" style="padding:8px">暂无已记住的问答。</div>';
     return;
   }
-  savedMemories.forEach((rec) => {
+  if (!list.length) {
+    qaList.innerHTML = '<div class="qa-a" style="padding:8px">当前标签下无记忆。</div>';
+    return;
+  }
+  list.forEach((rec) => {
     const el = document.createElement('div');
     el.className = 'qa-item';
     el.innerHTML =
       '<div class="qa-top">' +
         '<div class="qa-badge">' + escapeHtml(rec.scene || 'general') + '</div>' +
+        (rec.kind && rec.kind !== 'qa'
+          ? '<div class="qa-badge kind">' + escapeHtml(rec.kind) + '</div>'
+          : '') +
+        ((rec.tags && rec.tags.length)
+          ? '<div class="qa-badge" style="opacity:.85">#' + escapeHtml(rec.tags.join(' #')) + '</div>'
+          : '') +
         '<button type="button" class="qa-del" data-id="' + escapeHtml(rec.id || '') + '">删除</button>' +
       '</div>' +
       '<p class="qa-q">' + escapeHtml(rec.question) + '</p>' +
       '<div class="qa-a md">' + renderMarkdown(rec.answer || '') + '</div>';
-    el.onclick = () => openAnswerModal(rec.question, rec.answer, -1);
+    el.onclick = () => openAnswerModal(rec.question, rec.answer, -1, rec);
     el.querySelector('.qa-del').onclick = (ev) => {
       ev.stopPropagation();
       deleteSaved(rec);
@@ -1134,52 +1457,191 @@ async function refreshSaved() {
   renderQaList();
 }
 
-function openAnswerModal(question, answer, pendingIndex) {
+function findSavedIdByQuestion(q) {
+  const needle = String(q || '').trim();
+  if (!needle) return '';
+  const hit = savedMemories.find((r) => (r.question || '') === needle);
+  return (hit && hit.id) || '';
+}
+
+function openAnswerModal(question, answer, pendingIndex, rec) {
+  let seed = rec || null;
+  if (!seed) {
+    try {
+      const map = JSON.parse(sessionStorage.getItem('ms_extract_map') || '{}');
+      seed = map[question] || null;
+    } catch (e) { seed = null; }
+  }
   editingQuestion = question;
-  modalQuestion.textContent = question;
-  modalAnswer.value = answer || '';
+  // 已记住点开 / 待补全若已入库：务必带上 id，改问也只更新一条
+  editingRecordId = (seed && seed.id) || findSavedIdByQuestion(question) || '';
+  modalQuestion.value = question;
+  modalAnswer.value = answer || (seed && seed.answer) || '';
+  const tagsEl = document.getElementById('modalTags');
+  const kindEl = document.getElementById('modalKind');
+  const factEl = document.getElementById('modalFact');
+  if (tagsEl) tagsEl.value = ((seed && seed.tags) || []).join(', ');
+  if (kindEl) kindEl.value = (seed && seed.kind) || 'qa';
+  if (factEl) {
+    const facts = (seed && seed.facts) || {};
+    const kind = (seed && seed.kind) || 'qa';
+    factEl.value = facts[kind] || facts.command || facts.path || facts.env || facts.pitfall || facts.decision || '';
+  }
   answerModal.dataset.pendingIndex = String(pendingIndex);
+  answerModal.dataset.originalQuestion = question;
+  answerModal.dataset.recordId = editingRecordId;
+  // 从「已记住」打开，或已解析到 id → 保存时禁止新建
+  answerModal.dataset.updateOnly = (pendingIndex < 0 || !!editingRecordId) ? '1' : '';
   answerModal.classList.add('show');
   setAnswerPane('edit');
-  modalAnswer.focus();
+  // 飞书链接：打开时拉取标题并语义化「问」（静默）
+  if (/larkoffice|feishu\.cn|larksuite/i.test(question)) {
+    suggestQuestion(true, true).catch(() => {});
+  }
+  modalQuestion.focus();
 }
 
 function closeAnswerModal() {
   answerModal.classList.remove('show');
   editingQuestion = '';
+  editingRecordId = '';
+  answerModal.dataset.originalQuestion = '';
+  answerModal.dataset.recordId = '';
+  answerModal.dataset.updateOnly = '';
   setAnswerPane('edit');
 }
 
+async function suggestQuestion(silent, fetchDocs) {
+  const q = (modalQuestion.value || '').trim();
+  const a = (modalAnswer.value || '').trim();
+  if (!q) return;
+  const doFetch = fetchDocs !== false;
+  try {
+    const data = await api('/api/suggest_question', {
+      question: q, answer: a, fetch: doFetch,
+    });
+    if (data.error) {
+      if (!silent) alert(data.error);
+      return;
+    }
+    if (data.question && data.question !== q) {
+      modalQuestion.value = data.question;
+      if (data.tags && data.tags.length) {
+        const tagsEl = document.getElementById('modalTags');
+        if (tagsEl && !tagsEl.value.trim()) tagsEl.value = data.tags.join(', ');
+      }
+    } else if (!silent) {
+      alert((data.hint || '当前问法已较合适，无需改动。'));
+    }
+  } catch (e) {
+    if (!silent) alert('优化问法失败：' + (e.message || e));
+  }
+}
+
+function parseTagsInput(raw) {
+  return String(raw || '')
+    .split(/[,，\s]+/)
+    .map((s) => s.replace(/^#/, '').trim())
+    .filter(Boolean);
+}
+
 async function confirmAnswer() {
-  const answer = modalAnswer.value.trim();
-  const question = editingQuestion.trim();
+  const btn = document.getElementById('btnModalOk');
+  const answer = (modalAnswer && modalAnswer.value || '').trim();
+  const question = (modalQuestion && modalQuestion.value || editingQuestion || '').trim();
+  const originalQuestion = (answerModal.dataset.originalQuestion || editingQuestion || '').trim();
+  let recordId = (
+    editingRecordId || answerModal.dataset.recordId || findSavedIdByQuestion(originalQuestion) || ''
+  ).trim();
+  const updateOnly = answerModal.dataset.updateOnly === '1' || !!recordId;
   if (!question || !answer) {
     alert('问题和答案都不能为空');
     return;
   }
-  const data = await api('/api/remember', { question, answer, scene: 'general' });
-  if (data.error) {
-    append('错误：' + data.error, 'meta');
-    return;
+  const kind = (document.getElementById('modalKind') || {}).value || 'qa';
+  const tags = parseTagsInput((document.getElementById('modalTags') || {}).value);
+  const factVal = ((document.getElementById('modalFact') || {}).value || '').trim();
+  const facts = {};
+  if (factVal && kind && kind !== 'qa') facts[kind] = factVal;
+  // 飞书链接：即使类型是 qa，也写入 path，便于 token 命中
+  const feishuUrl = (question + ' ' + answer + ' ' + factVal).match(
+    /https?:\/\/[^\s]+?(?:larkoffice|feishu\.cn|larksuite)[^\s]*/i
+  );
+  if (feishuUrl && !facts.path) facts.path = feishuUrl[0].replace(/[)。.,，、；;]+$/, '');
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = '保存中…';
   }
-  const pIdx = parseInt(answerModal.dataset.pendingIndex || '-1', 10);
-  if (pIdx >= 0) {
-    pendingQuestions.splice(pIdx, 1);
-    savePending();
-  } else {
-    // 若问题原先在待补全列表里，一并移除
-    pendingQuestions = pendingQuestions.filter(q => q !== question);
+  try {
+    const payload = {
+      question, answer, scene: 'dev', tags, kind, facts,
+    };
+    // 改问定位旧条：打开弹窗时的原问法（勿用新问法冒充）
+    if (originalQuestion) payload.original_question = originalQuestion;
+    if (recordId) payload.id = recordId;
+    // 从「已记住」打开或已解析到 id：禁止新建
+    if (updateOnly) payload.update_only = true;
+    const data = await api('/api/remember', payload);
+    if (data.error) {
+      alert('保存失败：' + data.error);
+      append('错误：' + data.error, 'meta');
+      return;
+    }
+    const pIdx = parseInt(answerModal.dataset.pendingIndex || '-1', 10);
+    if (pIdx >= 0) {
+      pendingQuestions.splice(pIdx, 1);
+      savePending();
+    } else {
+      pendingQuestions = pendingQuestions.filter(
+        q => q !== question && q !== originalQuestion
+      );
+      savePending();
+    }
+    closeAnswerModal();
+    const verb = data.updated ? '已更新：' : '已记住：';
+    append(verb + (data.stored_question || question), 'sys');
+    append(answer, 'bot', { markdown: true, label: '答' });
+    activeTab = 'saved';
+    document.querySelectorAll('.side-tabs button').forEach(b => {
+      b.classList.toggle('active', b.dataset.tab === 'saved');
+    });
+    await refreshSaved();
+    if (data.status_line) footer.textContent = data.status_line;
+  } catch (e) {
+    alert('保存失败：' + (e.message || e));
+    append('保存失败：' + e, 'meta');
+  } finally {
+    if (btn) {
+      btn.disabled = false;
+      btn.textContent = '确认记住';
+    }
+  }
+}
+
+function enqueuePendingMemory(seed) {
+  const q = (seed && seed.question || '').trim();
+  if (!q) return;
+  if (!pendingQuestions.includes(q)) {
+    pendingQuestions.unshift(q);
     savePending();
   }
-  closeAnswerModal();
-  append('已记住：' + question, 'sys');
-  append(answer, 'bot', { markdown: true, label: '答' });
-  activeTab = 'saved';
+  try {
+    const map = JSON.parse(sessionStorage.getItem('ms_extract_map') || '{}');
+    map[q] = {
+      question: q,
+      answer: (seed && seed.answer) || '',
+      tags: (seed && seed.tags) || [],
+      kind: (seed && seed.kind) || 'qa',
+      facts: (seed && seed.facts) || {},
+      id: (seed && seed.id) || '',
+    };
+    sessionStorage.setItem('ms_extract_map', JSON.stringify(map));
+  } catch (e) {}
+  activeTab = 'pending';
   document.querySelectorAll('.side-tabs button').forEach(b => {
-    b.classList.toggle('active', b.dataset.tab === 'saved');
+    b.classList.toggle('active', b.dataset.tab === 'pending');
   });
-  await refreshSaved();
-  if (data.status_line) footer.textContent = data.status_line;
+  renderQaList();
 }
 
 function createThinkCard() {
@@ -1289,6 +1751,25 @@ async function sendText(text) {
       think.finish(true);
       append(finalData.answer || '', 'bot', { markdown: true, label: '沙箱' });
       append('← 来源：' + (SOURCE[finalData.source] || finalData.source) + ' (' + finalData.source + ')', 'meta');
+      if (finalData.awaiting_confirm) {
+        const pq = (finalData.pending_question || text || '').trim();
+        enqueuePendingMemory({
+          question: pq,
+          answer: finalData.pending_answer || finalData.answer || '',
+          tags: finalData.pending_tags || ['feishu', 'docs'],
+          kind: finalData.pending_kind || 'qa',
+          facts: finalData.pending_facts || {},
+        });
+        append(
+          '飞书文档未自动入库。已放入左侧「待补全答」——可改「问」后点确认记住（只会写一条）。',
+          'sys'
+        );
+        // 直接打开编辑，方便只改问
+        openAnswerModal(pq, finalData.pending_answer || finalData.answer || '', 0);
+      } else if (finalData.source === 'llm') {
+        await refreshSaved();
+        renderQaList();
+      }
     }
     if (finalData.status_line) footer.textContent = finalData.status_line;
     if (text.startsWith('记住') || text.includes('清空长时') || text.includes('清空全部')) {
@@ -1345,6 +1826,13 @@ async function send() {
     return;
   }
 
+  if (mode === 'extract') {
+    append(text.slice(0, 400) + (text.length > 400 ? '…' : ''), 'user');
+    setMode(null);
+    await runExtract(text);
+    return;
+  }
+
   await sendText(text);
 }
 
@@ -1386,6 +1874,8 @@ input.addEventListener('keydown', (e) => {
 document.getElementById('btnCancelMode').onclick = () => setMode(null);
 document.getElementById('btnModalCancel').onclick = closeAnswerModal;
 document.getElementById('btnModalOk').onclick = confirmAnswer;
+const btnSuggestQuestion = document.getElementById('btnSuggestQuestion');
+if (btnSuggestQuestion) btnSuggestQuestion.onclick = () => suggestQuestion(false, true);
 answerModal.addEventListener('click', (e) => {
   if (e.target === answerModal) closeAnswerModal();
 });
@@ -1433,6 +1923,125 @@ document.getElementById('btnStatus').onclick = async () => {
   append(JSON.stringify(data.status, null, 2), 'meta');
   footer.textContent = data.status_line || footer.textContent;
 };
+
+function closeRetrievalModal() {
+  document.getElementById('retrievalModal').classList.remove('show');
+}
+
+function _weightSumLine() {
+  const vw = parseFloat((document.getElementById('rs_vector_weight') || {}).value || 0) || 0;
+  const kw = parseFloat((document.getElementById('rs_keyword_weight') || {}).value || 0) || 0;
+  const bw = parseFloat((document.getElementById('rs_bm25_weight') || {}).value || 0) || 0;
+  const enabled = !!(document.getElementById('rs_bm25_enabled') || {}).checked;
+  const sum = vw + kw + (enabled ? bw : 0);
+  return '当前权重合计：' + sum.toFixed(2) +
+    (enabled ? '' : '（BM25 已关，不计入）') +
+    ' · 保存后会按比例归一化使用';
+}
+
+function renderRetrievalFields(payload) {
+  const values = payload.values || {};
+  const fieldMap = {};
+  (payload.fields || []).forEach((f) => { fieldMap[f.key] = f; });
+  const root = document.getElementById('retrievalFields');
+  root.innerHTML = '';
+  RETRIEVAL_SECTIONS.forEach((sec) => {
+    const box = document.createElement('div');
+    box.className = 'settings-section';
+    box.innerHTML = '<h4>' + escapeHtml(sec.title) + '</h4>' +
+      '<p class="sec-help">' + escapeHtml(sec.help) + '</p>';
+    sec.keys.forEach((key) => {
+      const spec = fieldMap[key];
+      if (!spec) return;
+      const row = document.createElement('div');
+      row.className = 'settings-field';
+      const id = 'rs_' + key;
+      let ctrl = '';
+      const val = values[key];
+      if (spec.type === 'bool') {
+        ctrl = '<label class="check"><input type="checkbox" id="' + id + '"' +
+          (val ? ' checked' : '') + ' /> <span>开启</span></label>';
+      } else {
+        ctrl = '<input type="number" id="' + id + '" value="' +
+          escapeHtml(String(val ?? '')) + '" step="' + (spec.step || 0.01) + '"' +
+          (spec.min != null ? ' min="' + spec.min + '"' : '') +
+          (spec.max != null ? ' max="' + spec.max + '"' : '') + ' />';
+      }
+      row.innerHTML =
+        '<div class="fname">' + escapeHtml(spec.label || key) + '</div>' +
+        '<div class="fctrl">' + ctrl + '</div>' +
+        '<div class="fhelp">' + escapeHtml(spec.help || '') + '</div>';
+      box.appendChild(row);
+    });
+    if (sec.title === '混合检索权重') {
+      const sum = document.createElement('p');
+      sum.className = 'settings-sum';
+      sum.id = 'retrievalWeightSum';
+      sum.textContent = '';
+      box.appendChild(sum);
+    }
+    root.appendChild(box);
+  });
+  ['rs_vector_weight', 'rs_keyword_weight', 'rs_bm25_weight', 'rs_bm25_enabled'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (!el) return;
+    el.addEventListener('input', () => {
+      const line = document.getElementById('retrievalWeightSum');
+      if (line) line.textContent = _weightSumLine();
+    });
+    el.addEventListener('change', () => {
+      const line = document.getElementById('retrievalWeightSum');
+      if (line) line.textContent = _weightSumLine();
+    });
+  });
+  const line = document.getElementById('retrievalWeightSum');
+  if (line) line.textContent = _weightSumLine();
+}
+
+async function openRetrievalModal() {
+  try {
+    const data = await api('/api/retrieval_settings', {});
+    if (data.error) {
+      append('错误：' + data.error, 'meta');
+      return;
+    }
+    const hint = document.getElementById('retrievalHint');
+    if (hint) {
+      hint.textContent = (data.hint || '') +
+        (data.config_path ? ' 配置文件：' + data.config_path : '');
+    }
+    renderRetrievalFields(data);
+    document.getElementById('retrievalModal').classList.add('show');
+  } catch (e) {
+    append('打开检索设置失败：' + e, 'meta');
+  }
+}
+
+async function saveRetrievalSettings() {
+  const updates = {};
+  const fieldsRoot = document.getElementById('retrievalFields');
+  fieldsRoot.querySelectorAll('[id^="rs_"]').forEach((el) => {
+    const key = el.id.slice(3);
+    if (el.type === 'checkbox') updates[key] = el.checked;
+    else if (el.type === 'number') updates[key] = Number(el.value);
+  });
+  const data = await api('/api/retrieval_settings', { updates, persist: true });
+  if (data.error) {
+    alert(data.error);
+    return;
+  }
+  closeRetrievalModal();
+  append(data.message || '检索设置已保存', 'sys');
+  if (data.status_line) footer.textContent = data.status_line;
+}
+
+document.getElementById('btnRetrieval').onclick = () => openRetrievalModal();
+document.getElementById('btnRetrievalCancel').onclick = closeRetrievalModal;
+document.getElementById('btnRetrievalSave').onclick = saveRetrievalSettings;
+document.getElementById('retrievalModal').addEventListener('click', (e) => {
+  if (e.target === document.getElementById('retrievalModal')) closeRetrievalModal();
+});
+
 document.getElementById('btnClear').onclick = async () => {
   const data = await api('/api/clear_working');
   append(data.message || '工作记忆已清空', 'sys');
@@ -1444,6 +2053,52 @@ document.getElementById('btnBackupLong').onclick = async () => {
     if (data.error) append('错误：' + data.error, 'meta');
     else append(data.message || '已备份', 'sys');
     if (data.status_line) footer.textContent = data.status_line;
+  } catch (e) {
+    append('请求失败：' + e, 'meta');
+  }
+};
+document.getElementById('btnExportPack').onclick = async () => {
+  try {
+    const name = prompt('知识包名称', 'memory-pack') || 'memory-pack';
+    const data = await api('/api/export_pack', {
+      name,
+      filter_tags: activeTagFilter ? [activeTagFilter] : undefined,
+    });
+    if (data.error) append('错误：' + data.error, 'meta');
+    else append(data.message || '已导出知识包', 'sys');
+    if (data.status_line) footer.textContent = data.status_line;
+  } catch (e) {
+    append('请求失败：' + e, 'meta');
+  }
+};
+document.getElementById('btnGitCheck').onclick = async () => {
+  try {
+    const data = await api('/api/git_check', {});
+    if (data.error) {
+      append('错误：' + data.error, 'meta');
+      return;
+    }
+    const stale = data.stale || [];
+    append(data.hint || '已检查 Git 变更与记忆关联', 'sys');
+    if (!stale.length) return;
+    stale.forEach((h) => {
+      append(
+        '可能过时：' + (h.question || '') + '\n相关文件：' + ((h.matched_paths || []).join(', ') || '-'),
+        'meta'
+      );
+    });
+  } catch (e) {
+    append('请求失败：' + e, 'meta');
+  }
+};
+document.getElementById('btnArchive').onclick = async () => {
+  if (!confirm('确认归档久未命中的长时记忆？（默认按配置 aging_days）')) return;
+  try {
+    const data = await api('/api/archive', { confirm: true });
+    if (data.error) append('错误：' + data.error, 'meta');
+    else append(data.message || '已归档', 'sys');
+    if (data.status_line) footer.textContent = data.status_line;
+    await refreshSaved();
   } catch (e) {
     append('请求失败：' + e, 'meta');
   }
@@ -1494,7 +2149,7 @@ if (agentModeSel) {
   };
 }
 
-append('优先检索本地三级记忆。\\n提问后会显示「思考中」过程（本地检索 → LLM）。\\n新方式：输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n原有指令仍可用：记住：问 => 答 | 备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏可切换 Agent 模式：Ask 只读 / Plan / Agent 可写。', 'sys');
+append('优先检索本地三级记忆。\\n提问后会显示「思考中」过程（本地检索 → LLM）。\\n新方式：输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n原有指令仍可用：记住：问 => 答 | 备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏：Agent 模式 · 「检索设置」（向量/关键词/BM25 权重，每项有说明）。', 'sys');
 refreshSaved();
 renderQaList();
 refreshAgentMode();
@@ -1683,12 +2338,19 @@ class Handler(BaseHTTPRequestHandler):
                     return
                 result = holder.get("result")
                 try:
+                    meta = getattr(result, "meta", None) or {}
                     _emit(
                         {
                             "type": "done",
                             "answer": getattr(result, "answer", "") or "",
                             "source": getattr(result, "source", "") or "",
                             "status_line": STATE.status_line(),
+                            "awaiting_confirm": bool(meta.get("awaiting_confirm")),
+                            "pending_question": meta.get("pending_question") or "",
+                            "pending_answer": meta.get("pending_answer") or "",
+                            "pending_tags": meta.get("pending_tags") or [],
+                            "pending_facts": meta.get("pending_facts") or {},
+                            "pending_kind": meta.get("pending_kind") or "qa",
                         }
                     )
                 except Exception:
@@ -1699,15 +2361,195 @@ class Handler(BaseHTTPRequestHandler):
                 question = (data.get("question") or "").strip()
                 answer = (data.get("answer") or "").strip()
                 scene = (data.get("scene") or "general").strip() or "general"
+                tags = data.get("tags")
+                if isinstance(tags, str):
+                    tags = [tags]
+                kind = (data.get("kind") or "").strip() or None
+                facts = data.get("facts") if isinstance(data.get("facts"), dict) else None
+                memory_id = (data.get("id") or data.get("memory_id") or "").strip() or None
+                original_question = (data.get("original_question") or "").strip() or None
+                update_only = bool(data.get("update_only") or data.get("require_existing"))
                 if not question or not answer:
                     _json_response(self, 400, {"error": "question/answer 不能为空"})
                     return
-                msg = STATE.sandbox.remember(question, answer, scene=scene)
+                try:
+                    msg = STATE.sandbox.remember(
+                        question,
+                        answer,
+                        scene=scene,
+                        tags=tags,
+                        kind=kind,
+                        facts=facts,
+                        memory_id=memory_id,
+                        original_question=original_question,
+                        update_only=update_only,
+                    )
+                except ValueError as exc:
+                    _json_response(self, 400, {"error": str(exc)})
+                    return
+                rec = getattr(STATE.sandbox, "last_remembered", None)
+                updated = bool(getattr(STATE.sandbox, "last_remembered_updated", False))
                 _json_response(
                     self,
                     200,
-                    {"message": msg, "status_line": STATE.status_line()},
+                    {
+                        "message": msg,
+                        "stored_question": getattr(rec, "question", None) or question,
+                        "id": getattr(rec, "id", None),
+                        "updated": updated,
+                        "status_line": STATE.status_line(),
+                    },
                 )
+                return
+            if path == "/api/suggest_question":
+                question = (data.get("question") or "").strip()
+                answer = (data.get("answer") or "").strip()
+                if not question:
+                    _json_response(self, 400, {"error": "question 不能为空"})
+                    return
+                from core.feishu import (
+                    extract_feishu_urls,
+                    feishu_configured,
+                    fetch_feishu_docs_for_text,
+                )
+                from core.feishu_question import rewrite_feishu_memory_question
+
+                if not extract_feishu_urls(question):
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "question": question,
+                            "changed": False,
+                            "hint": "未检测到飞书链接，保持原问法。",
+                            "status_line": STATE.status_line(),
+                        },
+                    )
+                    return
+                docs = []
+                hint = "已按语义建议问法；仍可手动改。"
+                want_fetch = data.get("fetch")
+                if want_fetch is None:
+                    want_fetch = True
+                feishu_cfg = getattr(STATE.sandbox.config, "feishu", None)
+                if want_fetch and feishu_configured(feishu_cfg):
+                    try:
+                        docs, _ = fetch_feishu_docs_for_text(
+                            feishu_cfg,
+                            question,
+                            config_path=STATE.sandbox.config_path,
+                        )
+                        if any(r.ok for r in docs):
+                            hint = "已按飞书文档标题与语义建议问法；仍可手动改。"
+                        else:
+                            hint = "飞书拉取未成功，已用本地语义建议；仍可手动改。"
+                    except Exception as e:
+                        hint = f"飞书拉取异常（{e}），已用本地语义建议。"
+                suggested = rewrite_feishu_memory_question(
+                    question,
+                    docs or None,
+                    answer=answer,
+                    force=True,
+                )
+                tags = ["feishu", "docs"] if suggested != question else []
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "question": suggested,
+                        "changed": suggested != question,
+                        "tags": tags,
+                        "titles": [
+                            (r.title or "").strip()
+                            for r in (docs or [])
+                            if getattr(r, "ok", False) and (r.title or "").strip()
+                        ],
+                        "hint": hint,
+                        "status_line": STATE.status_line(),
+                    },
+                )
+                return
+            if path == "/api/extract":
+                text = data.get("text") or ""
+                if not str(text).strip():
+                    _json_response(self, 400, {"error": "text 不能为空"})
+                    return
+                tags = data.get("tags")
+                if isinstance(tags, str):
+                    tags = [tags]
+                try:
+                    max_n = int(data.get("max_n") or 3)
+                except (TypeError, ValueError):
+                    max_n = 3
+                payload = STATE.sandbox.extract_candidates(
+                    str(text), max_n=max(1, min(max_n, 8)), tags=tags
+                )
+                payload["status_line"] = STATE.status_line()
+                _json_response(self, 200, payload)
+                return
+            if path == "/api/export_pack":
+                filter_tags = data.get("filter_tags") or data.get("tags")
+                if isinstance(filter_tags, str):
+                    filter_tags = [filter_tags]
+                try:
+                    limit = int(data.get("limit") or 500)
+                except (TypeError, ValueError):
+                    limit = 500
+                msg = STATE.sandbox.export_pack(
+                    name=(data.get("name") or "memory-pack").strip() or "memory-pack",
+                    dest=(data.get("dest") or "").strip() or None,
+                    description=(data.get("description") or "").strip(),
+                    filter_tags=filter_tags,
+                    filter_scene=(data.get("filter_scene") or data.get("scene") or "").strip()
+                    or None,
+                    limit=max(1, min(limit, 5000)),
+                )
+                _json_response(
+                    self, 200, {"message": msg, "status_line": STATE.status_line()}
+                )
+                return
+            if path == "/api/import_pack":
+                path_in = (data.get("path") or "").strip()
+                if not path_in:
+                    _json_response(self, 400, {"error": "path 不能为空"})
+                    return
+                merge = data.get("merge")
+                if merge is None:
+                    merge = True
+                msg = STATE.sandbox.import_pack(
+                    path_in, merge=bool(merge), confirm=bool(data.get("confirm"))
+                )
+                _json_response(
+                    self, 200, {"message": msg, "status_line": STATE.status_line()}
+                )
+                return
+            if path == "/api/archive":
+                msg = STATE.sandbox.archive_stale(
+                    min_hits=data.get("min_hits"),
+                    older_than_days=data.get("older_than_days"),
+                    confirm=bool(data.get("confirm")),
+                )
+                _json_response(
+                    self, 200, {"message": msg, "status_line": STATE.status_line()}
+                )
+                return
+            if path == "/api/git_check":
+                try:
+                    limit = int(data.get("limit") or 8)
+                except (TypeError, ValueError):
+                    limit = 8
+                payload = STATE.sandbox.check_git_changes(
+                    cwd=(data.get("cwd") or "").strip() or None,
+                    since_ref=(data.get("since_ref") or "HEAD~20").strip() or "HEAD~20",
+                    limit=max(1, min(limit, 30)),
+                )
+                payload["status_line"] = STATE.status_line()
+                _json_response(self, 200, payload)
+                return
+            if path == "/api/list_packs":
+                payload = STATE.sandbox.list_packs()
+                payload["status_line"] = STATE.status_line()
+                _json_response(self, 200, payload)
                 return
             if path == "/api/delete_memory":
                 memory_id = (data.get("id") or data.get("memory_id") or "").strip()
@@ -1763,6 +2605,42 @@ class Handler(BaseHTTPRequestHandler):
                         "status_line": STATE.status_line(),
                     },
                 )
+                return
+            if path == "/api/retrieval_settings":
+                updates = data.get("updates")
+                # 无 updates：返回当前值 + 字段说明；有 updates：保存
+                if updates is None and not data.get("persist"):
+                    # 兼容仅传单个字段
+                    if any(k in data for k in (
+                        "vector_weight", "keyword_weight", "bm25_weight",
+                        "bm25_enabled", "similarity_threshold", "top_k",
+                    )):
+                        updates = {
+                            k: data[k]
+                            for k in (
+                                "similarity_threshold", "top_k", "bm25_enabled",
+                                "vector_weight", "keyword_weight", "bm25_weight",
+                                "aging_enabled", "aging_days", "aging_decay",
+                                "reinforce_boost",
+                            )
+                            if k in data
+                        }
+                if updates is not None:
+                    persist = data.get("persist")
+                    if persist is None:
+                        persist = True
+                    msg = STATE.sandbox.set_retrieval_settings(
+                        updates if isinstance(updates, dict) else {},
+                        persist=bool(persist),
+                    )
+                    payload = STATE.sandbox.get_retrieval_settings()
+                    payload["message"] = msg
+                    payload["status_line"] = STATE.status_line()
+                    _json_response(self, 200, payload)
+                    return
+                payload = STATE.sandbox.get_retrieval_settings()
+                payload["status_line"] = STATE.status_line()
+                _json_response(self, 200, payload)
                 return
             if path == "/api/list_memory":
                 layer = (data.get("layer") or "all").strip()

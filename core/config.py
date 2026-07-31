@@ -50,6 +50,18 @@ def apply_agent_ui_mode(cfg: "LLMConfig", ui_mode: str) -> str:
     return ui
 
 
+def _user_config_path(config_path: Optional[str] = None) -> Path:
+    """优先写 Application Support 用户配置，避免改仓库内 config.yaml。"""
+    from .paths import app_support_dir
+
+    path = app_support_dir() / "config.yaml"
+    if config_path:
+        candidate = Path(config_path)
+        if candidate.is_file() and "Application Support" in str(candidate):
+            path = candidate
+    return path
+
+
 def persist_llm_agent_settings(
     config_path: Optional[str],
     agent_mode: str,
@@ -59,15 +71,7 @@ def persist_llm_agent_settings(
     把 agent_mode / agent_force 合并写入用户配置（Application Support），
     避免改仓库内 config.yaml。返回实际写入路径。
     """
-    from .paths import app_support_dir
-
-    path = app_support_dir() / "config.yaml"
-    # 若当前已加载的就是用户配置，仍写同一路径
-    if config_path:
-        candidate = Path(config_path)
-        if candidate.is_file() and "Application Support" in str(candidate):
-            path = candidate
-
+    path = _user_config_path(config_path)
     raw: Dict[str, Any] = {}
     if path.is_file():
         with open(path, "r", encoding="utf-8") as f:
@@ -76,6 +80,117 @@ def persist_llm_agent_settings(
     llm["agent_mode"] = agent_mode
     llm["agent_force"] = bool(agent_force)
     raw["llm"] = llm
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
+    return str(path)
+
+
+# Web/CLI 可调的长时检索字段（含说明文案）
+RETRIEVAL_SETTING_SPECS = [
+    {
+        "key": "similarity_threshold",
+        "label": "命中阈值",
+        "type": "float",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.01,
+        "help": "综合分超过此值才算「命中」并直接复用答案。越高越严格，越低越容易命中旧记忆。",
+    },
+    {
+        "key": "top_k",
+        "label": "召回条数",
+        "type": "int",
+        "min": 1,
+        "max": 20,
+        "step": 1,
+        "help": "每次检索最多返回几条候选。一般 3 即可；排查时可临时调高。",
+    },
+    {
+        "key": "bm25_enabled",
+        "label": "启用 BM25",
+        "type": "bool",
+        "help": "打开后，检索会同时看「语义向量 + 关键词重叠 + BM25 文本相关度」。关闭则只用向量和关键词。",
+    },
+    {
+        "key": "vector_weight",
+        "label": "语义向量权重",
+        "type": "float",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "help": "看意思是否相近（本地哈希向量）。口语换说法、近义表达时更有用。建议与关键词、BM25 权重之和约为 1。",
+    },
+    {
+        "key": "keyword_weight",
+        "label": "关键词权重",
+        "type": "float",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "help": "看分词/关键词是否对得上。专有名词、命令、路径等精确词较依赖这项。",
+    },
+    {
+        "key": "bm25_weight",
+        "label": "BM25 权重",
+        "type": "float",
+        "min": 0.0,
+        "max": 1.0,
+        "step": 0.05,
+        "help": "经典全文检索打分，对问句里的实词匹配更敏感。适合文档标题、术语较多的记忆。",
+    },
+    {
+        "key": "aging_enabled",
+        "label": "启用陈旧降权",
+        "type": "bool",
+        "help": "很久没命中的记忆，检索时分数会略降，避免老结论抢在新知识前面。",
+    },
+    {
+        "key": "aging_days",
+        "label": "陈旧天数",
+        "type": "float",
+        "min": 1.0,
+        "max": 3650.0,
+        "step": 1.0,
+        "help": "超过这么多天未命中，开始按「陈旧」降权；归档陈旧记忆也参考这个天数。",
+    },
+    {
+        "key": "aging_decay",
+        "label": "陈旧降权幅度",
+        "type": "float",
+        "min": 0.0,
+        "max": 0.8,
+        "step": 0.01,
+        "help": "最旧记忆最多再扣掉的分数比例。例如 0.15 ≈ 最多扣 15%。",
+    },
+    {
+        "key": "reinforce_boost",
+        "label": "重复命中加成",
+        "type": "float",
+        "min": 0.0,
+        "max": 0.5,
+        "step": 0.01,
+        "help": "同一条记忆被反复命中时，略微提高它的排序权重，让常用结论更稳。",
+    },
+]
+
+
+def persist_long_term_settings(
+    config_path: Optional[str],
+    updates: Dict[str, Any],
+) -> str:
+    """把 long_term 检索相关字段合并写入用户配置，返回路径。"""
+    allowed = {s["key"] for s in RETRIEVAL_SETTING_SPECS}
+    path = _user_config_path(config_path)
+    raw: Dict[str, Any] = {}
+    if path.is_file():
+        with open(path, "r", encoding="utf-8") as f:
+            raw = yaml.safe_load(f) or {}
+    lt = dict(raw.get("long_term") or {})
+    for k, v in (updates or {}).items():
+        if k in allowed:
+            lt[k] = v
+    raw["long_term"] = lt
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
@@ -107,11 +222,21 @@ class LongTermConfig:
     top_k: int = 3
     persist_dir: str = "data/memory"
     reinforce_boost: float = 0.05
+    # 混合检索权重（vector + keyword + bm25，建议和为 1）
+    bm25_enabled: bool = True
+    vector_weight: float = 0.55
+    keyword_weight: float = 0.20
+    bm25_weight: float = 0.25
+    # 很久未命中时检索降权；归档命令用同一天数阈值
+    aging_enabled: bool = True
+    aging_days: float = 90.0
+    aging_min_hits: int = 0
+    aging_decay: float = 0.15  # 最高再扣 15% 分数
 
 
 @dataclass
 class EmbeddingConfig:
-    dim: int = 256
+    dim: int = 256  # 改维度后需 reoptimize 刷新向量
 
 
 @dataclass

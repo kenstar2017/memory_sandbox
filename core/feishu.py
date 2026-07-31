@@ -9,7 +9,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from typing import Iterable, List, Optional, Set, Tuple
 
 from .config import FeishuConfig
 
@@ -19,8 +19,6 @@ _URL_RE = re.compile(
     r"(?P<kind>wiki|docx|docs|doc)/(?P<token>[A-Za-z0-9_-]+)",
     re.IGNORECASE,
 )
-
-
 @dataclass
 class FeishuDocRef:
     url: str
@@ -52,6 +50,27 @@ def extract_feishu_urls(text: str) -> List[FeishuDocRef]:
         seen.add(key)
         out.append(FeishuDocRef(url=url, kind=kind, token=token))
     return out
+
+
+def extract_feishu_tokens(text: str) -> Set[str]:
+    """提取文本中的飞书文档 token（来自完整 URL）。"""
+    return {ref.token for ref in extract_feishu_urls(text or "")}
+
+
+def record_matches_feishu_tokens(
+    record_texts: Iterable[str],
+    required_tokens: Set[str],
+) -> bool:
+    """
+    查询带飞书 token 时：记忆正文须包含至少一个相同 token，
+    避免「客服文档」类相似问法串到另一篇 wiki。
+    """
+    if not required_tokens:
+        return True
+    blob = "\n".join(t for t in record_texts if t)
+    if not blob:
+        return False
+    return any(token in blob for token in required_tokens)
 
 
 def feishu_configured(cfg: FeishuConfig) -> bool:
@@ -120,7 +139,10 @@ def _tenant_access_token(api_base: str, app_id: str, app_secret: str, timeout: f
     return token
 
 
-def _wiki_obj_token(api_base: str, access_token: str, wiki_token: str, timeout: float) -> str:
+def _wiki_node(
+    api_base: str, access_token: str, wiki_token: str, timeout: float
+) -> Tuple[str, str]:
+    """返回 (obj_token, title)。"""
     q = urllib.parse.urlencode({"token": wiki_token, "obj_type": "wiki"})
     url = f"{api_base}/open-apis/wiki/v2/spaces/get_node?{q}"
     data = _http_json(
@@ -135,7 +157,28 @@ def _wiki_obj_token(api_base: str, access_token: str, wiki_token: str, timeout: 
     obj = node.get("obj_token") or ""
     if not obj:
         raise RuntimeError("未能获取文档 obj_token（可能无权限或 token 无效）")
+    title = str(node.get("title") or "").strip()
+    return obj, title
+
+
+def _wiki_obj_token(api_base: str, access_token: str, wiki_token: str, timeout: float) -> str:
+    obj, _title = _wiki_node(api_base, access_token, wiki_token, timeout)
     return obj
+
+
+def _docx_title(api_base: str, access_token: str, document_id: str, timeout: float) -> str:
+    path = urllib.parse.quote(document_id, safe="")
+    url = f"{api_base}/open-apis/docx/v1/documents/{path}"
+    data = _http_json(
+        "GET",
+        url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=timeout,
+    )
+    if data.get("code") != 0:
+        return ""
+    doc = (data.get("data") or {}).get("document") or {}
+    return str(doc.get("title") or "").strip()
 
 
 def _docx_raw_content(api_base: str, access_token: str, document_id: str, timeout: float) -> str:
@@ -198,18 +241,22 @@ def fetch_feishu_document(
     except Exception as e:
         return FeishuFetchResult(url=ref.url, ok=False, error=f"获取应用凭证失败: {e}")
 
-    def _read_with(access_token: str) -> Tuple[str, str]:
+    def _read_with(access_token: str) -> Tuple[str, str, str]:
+        """返回 (document_id, content, title)。"""
         document_id = ref.token
+        title = ""
         if ref.kind == "wiki":
-            document_id = _wiki_obj_token(api_base, access_token, ref.token, timeout)
+            document_id, title = _wiki_node(api_base, access_token, ref.token, timeout)
         content = _docx_raw_content(api_base, access_token, document_id, timeout)
-        return document_id, content
+        if not title:
+            title = _docx_title(api_base, access_token, document_id, timeout)
+        return document_id, content, title
 
     errors: List[str] = []
     refreshed_once = False
     for label, access_token in tokens:
         try:
-            document_id, content = _read_with(access_token)
+            document_id, content, title = _read_with(access_token)
             if not content.strip():
                 errors.append(f"{label}: 正文为空")
                 continue
@@ -220,7 +267,7 @@ def fetch_feishu_document(
             return FeishuFetchResult(
                 url=ref.url,
                 ok=True,
-                title=ref.token,
+                title=title or ref.token,
                 content=trimmed,
                 document_id=document_id,
             )
@@ -240,7 +287,7 @@ def fetch_feishu_document(
                         cfg, config_path=config_path, force_refresh=True
                     )
                     refreshed_once = True
-                    document_id, content = _read_with(new_tok)
+                    document_id, content, title = _read_with(new_tok)
                     if content.strip():
                         max_chars = int(cfg.max_chars or 80000)
                         trimmed = content
@@ -252,7 +299,7 @@ def fetch_feishu_document(
                         return FeishuFetchResult(
                             url=ref.url,
                             ok=True,
-                            title=ref.token,
+                            title=title or ref.token,
                             content=trimmed,
                             document_id=document_id,
                         )
@@ -290,8 +337,11 @@ def fetch_feishu_docs_for_text(
         r = fetch_feishu_document(cfg, ref, config_path=config_path)
         results.append(r)
         if r.ok:
+            title = (r.title or "").strip()
+            title_line = f"### 飞书文档：{title}\n" if title else "### 飞书文档\n"
             blocks.append(
-                f"### 飞书文档 {r.url}\n"
+                f"{title_line}"
+                f"{r.url}\n"
                 f"(document_id={r.document_id})\n\n{r.content}"
             )
         else:

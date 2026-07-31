@@ -12,9 +12,17 @@ long_term:
   top_k: 3                    # 召回条数
   persist_dir: data/memory    # 持久化目录
   reinforce_boost: 0.05       # 重复命中权重提升
+  bm25_enabled: true          # 启用 BM25，和向量/关键词一起搜
+  vector_weight: 0.55
+  keyword_weight: 0.20
+  bm25_weight: 0.25
+  aging_enabled: true         # 很久没用的记忆检索时略降权
+  aging_days: 90
+  aging_min_hits: 0
+  aging_decay: 0.15
 
 embedding:
-  dim: 256                    # 本地哈希向量维度
+  dim: 256                    # 本地哈希向量维度（改后请跑 reoptimize）
 
 llm:
   enabled: true               # 沙箱无解时是否调用大模型

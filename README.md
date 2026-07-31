@@ -53,13 +53,39 @@ The Agent will call these tools:
 
 | Tool | Role |
 |------|------|
-| `memory_ask` | Query local three-layer memory |
-| `memory_remember` | Persist reusable conclusions |
+| `memory_prepare` | **Preferred each turn**: append “record to long-term…” then search; returns `references` / `context_pack` |
+| `memory_ask` | Search as-is (no suffix assembly) |
+| `memory_remember` | Persist reusable conclusions (optional `tags`) |
 | `memory_forget` | Active forgetting |
 | `memory_status` | Memory stats |
 | `memory_set_scene` | Switch scene (e.g. `dev`) |
 
-Project rule `.cursor/rules/memory-sandbox.mdc` guides the Agent: **`memory_ask` first; use the hit directly; on miss, reason then `memory_remember` stable conclusions.**
+Project rule `.cursor/rules/memory-sandbox.mdc` guides the Agent: **`memory_prepare` first**; treat `references` / `context_pack` as background and combine with the current repo; for feature work do not short-circuit on a hard hit; only reuse `answer` for pure factual Q&A when `hit_local`; always `memory_remember` stable conclusions.
+
+### Tags & types (easier to find)
+
+- Tag memories (`feishu`, `frontend`, or `#tag` in text)
+- Optional kinds: QA / command / path / env / pitfall / decision
+- Hits include score + reasons so you can verify or forget
+
+### Less friction, safer writes
+
+- Extract candidates from terminal/logs, then confirm before saving
+- Auto-redact tokens/secrets/private keys on write
+- Web sidebar: filter by tag; edit tags/kind in the modal
+
+### Better search & sharing
+
+- Hybrid retrieval: vectors + keywords + BM25 (Web toolbar “Retrieval settings”, with per-field help; also saved to user `config.yaml`)
+- Soft-decay rarely used items; archive when needed
+- Export scrubbed knowledge packs for teammates to import
+
+### Stay in sync with code & Feishu
+
+- `git-check`: flag memories that may be outdated after git changes
+- `review-suggest`: turn recent commits into habit/convention candidates
+- `feishu-bookmark`: turn Feishu docs into confirm-to-save candidates
+- `pack-list`: list locally exported packs
 
 Memory data is shared with the desktop app:
 
@@ -109,7 +135,7 @@ python3 app_web.py
 ./scripts/memory ask "how to start revenue locally"
 ./scripts/memory ask --local "PK component"   # local only, no sandbox LLM
 ./scripts/memory prepare "how to start revenue"  # append long-term suffix, local only
-./scripts/memory remember "Q" "A" --scene dev
+./scripts/memory remember "Q" "A" --scene dev --tag feishu
 ./scripts/memory list --layer long_term
 ./scripts/memory status
 ./scripts/memory backup
@@ -203,6 +229,8 @@ Message with Feishu URL
 | When | Web/CLI LLM fallback only; MCP `memory_prepare` does **not** fetch |
 | Working memory | Feishu-URL questions skip reusing prior answers (helps retries) |
 | Failures | Auth/fetch failures are not persisted to working/long-term memory |
+| Stored question | Rewritten from **doc title + user intent** (URL kept for token matching); Web “complete answer” modal lets you edit Q / “optimize question” |
+| No auto-save | After a successful Feishu fetch, long-term is **not** written until you confirm; edit Q then save once (same token / id updates in place) |
 
 ### Config locations
 

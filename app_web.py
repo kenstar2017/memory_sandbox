@@ -31,8 +31,20 @@ from core.paths import app_support_dir, default_config_path, default_persist_dir
 HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
 # 前端/协议版本：用于识别旧进程（无思考过程流）并提示重启
-UI_BUILD = "20260731-update-qa"
-UI_FEATURES = ("chat_stream", "think_card")
+UI_BUILD = "20260731-desktop-api"
+UI_FEATURES = ("chat_stream", "think_card", "api_only", "cors")
+# API-only：只提供 /api/*，供 desktop/（Vite+Tauri）调用；可用 --api-only 或 MS_API_ONLY=1
+API_ONLY = False
+# 开发/桌面允许的跨域来源（逗号分隔可用 MS_CORS_ORIGINS 覆盖）
+CORS_ORIGINS = (
+    "http://localhost:5173",
+    "http://127.0.0.1:5173",
+    "http://localhost:1420",
+    "http://127.0.0.1:1420",
+    "tauri://localhost",
+    "https://tauri.localhost",
+    "http://tauri.localhost",
+)
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -2195,12 +2207,46 @@ STATE: AppState
 SERVER: Optional[ThreadingHTTPServer] = None
 
 
+def _cors_origin(handler: BaseHTTPRequestHandler) -> Optional[str]:
+    """若请求 Origin 在白名单内则回显，否则开发态回退 *（仅本机 API）。"""
+    origin = (handler.headers.get("Origin") or "").strip()
+    if origin and origin in CORS_ORIGINS:
+        return origin
+    if origin and (
+        origin.startswith("http://localhost:")
+        or origin.startswith("http://127.0.0.1:")
+        or origin.startswith("tauri://")
+        or "tauri.localhost" in origin
+    ):
+        return origin
+    if not origin:
+        return None
+    # 本机 API：宽松放行未知本地前端端口
+    return origin
+
+
+def _apply_cors(handler: BaseHTTPRequestHandler) -> None:
+    origin = _cors_origin(handler)
+    if origin:
+        handler.send_header("Access-Control-Allow-Origin", origin)
+        handler.send_header("Vary", "Origin")
+    else:
+        handler.send_header("Access-Control-Allow-Origin", "*")
+    handler.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
+    handler.send_header(
+        "Access-Control-Allow-Headers",
+        "Content-Type, Authorization, X-Requested-With",
+    )
+    handler.send_header("Access-Control-Max-Age", "86400")
+
+
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: dict):
     raw = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     handler.send_response(code)
     handler.send_header("Content-Type", "application/json; charset=utf-8")
     handler.send_header("Content-Length", str(len(raw)))
     handler.send_header("Cache-Control", "no-store")
+    _apply_cors(handler)
     handler.end_headers()
     handler.wfile.write(raw)
 
@@ -2218,17 +2264,54 @@ def _html_response(handler: BaseHTTPRequestHandler, html: str):
     handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
     handler.send_header("Pragma", "no-cache")
     handler.send_header("Content-Length", str(len(raw)))
+    _apply_cors(handler)
     handler.end_headers()
     handler.wfile.write(raw)
+
+
+def parse_runtime_flags(argv: Optional[list] = None) -> None:
+    """解析 --api-only / MS_API_ONLY 与 MS_CORS_ORIGINS。"""
+    global API_ONLY, CORS_ORIGINS
+    args = list(argv if argv is not None else sys.argv[1:])
+    env_flag = (os.environ.get("MS_API_ONLY") or "").strip().lower()
+    if env_flag in ("1", "true", "yes", "on"):
+        API_ONLY = True
+    if "--api-only" in args or "--api_only" in args:
+        API_ONLY = True
+    extra = (os.environ.get("MS_CORS_ORIGINS") or "").strip()
+    if extra:
+        CORS_ORIGINS = tuple(
+            x.strip() for x in extra.split(",") if x.strip()
+        ) + tuple(CORS_ORIGINS)
 
 
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    def do_OPTIONS(self):
+        self.send_response(204)
+        _apply_cors(self)
+        self.send_header("Content-Length", "0")
+        self.end_headers()
+
     def do_GET(self):
         path = urlparse(self.path).path
         if path in ("/", "/index.html"):
+            if API_ONLY:
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "app": "memory-sandbox",
+                        "mode": "api_only",
+                        "build": UI_BUILD,
+                        "hint": "API-only：请用 desktop/（Tauri）或调用 /api/*",
+                        "health": "/api/health",
+                    },
+                )
+                return
             _html_response(self, HTML_PAGE)
             return
         if path == "/api/health":
@@ -2240,6 +2323,7 @@ class Handler(BaseHTTPRequestHandler):
                     "app": "memory-sandbox",
                     "build": UI_BUILD,
                     "features": list(UI_FEATURES),
+                    "api_only": bool(API_ONLY),
                 },
             )
             return
@@ -2275,6 +2359,7 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Cache-Control", "no-cache, no-store")
                 self.send_header("X-Accel-Buffering", "no")
                 self.send_header("Transfer-Encoding", "chunked")
+                _apply_cors(self)
                 self.end_headers()
 
                 def _emit(obj: dict) -> None:
@@ -2789,6 +2874,7 @@ def probe_running_sandbox(
                     "port": port,
                     "build": data.get("build") or "",
                     "features": list(data.get("features") or []),
+                    "api_only": bool(data.get("api_only")),
                 }
         except Exception:
             continue
@@ -2936,33 +3022,50 @@ def notify_mac(title: str, message: str):
 
 def main():
     global STATE, SERVER
+    parse_runtime_flags()
     if is_frozen():
         try:
             os.chdir(app_support_dir())
         except Exception:
             pass
 
-    # 已有实例：若含思考流则只刷新；否则关掉旧进程再起新服务
+    # 已有实例：API-only 复用同模式 / 关掉完整 UI 再起；非 API-only 则刷新浏览器标签
     existing = probe_running_sandbox()
     if existing and "chat_stream" in (existing.get("features") or []):
-        action = open_or_refresh_ui(existing["url"])
-        msg = (
-            f"已刷新已打开页面 {existing['url']} (build {existing.get('build') or '?'})"
-            if action == "refreshed"
-            else f"已唤起界面 {existing['url']}（未新启服务）"
-        )
-        notify_mac("记忆沙箱", msg)
-        print(msg)
-        return
+        if API_ONLY:
+            if existing.get("api_only"):
+                print(
+                    f"已有 API-only 在跑 {existing['url']}；桌面端请直连该地址。"
+                )
+                return
+            print(
+                f"检测到完整 Web UI {existing['url']}，关闭后以 API-only 重启（不打开浏览器）…"
+            )
+            request_shutdown_sandbox(existing["url"])
+            if not wait_until_port_free(int(existing["port"]), timeout_s=3.0):
+                force_free_port(int(existing["port"]))
+            existing = None  # 继续往下以 --api-only 启动
+        else:
+            action = open_or_refresh_ui(existing["url"])
+            msg = (
+                f"已刷新已打开页面 {existing['url']} (build {existing.get('build') or '?'})"
+                if action == "refreshed"
+                else f"已唤起界面 {existing['url']}（未新启服务）"
+            )
+            notify_mac("记忆沙箱", msg)
+            print(msg)
+            return
 
     if existing:
-        print(
-            f"检测到旧版服务 {existing['url']}（无 chat_stream），正在重启以显示思考过程…"
+        reason = (
+            "无 chat_stream，正在重启…"
+            if "chat_stream" not in (existing.get("features") or [])
+            else "端口占用，正在重启…"
         )
+        print(f"检测到旧版服务 {existing['url']}（{reason}）")
         request_shutdown_sandbox(existing["url"])
         if not wait_until_port_free(int(existing["port"]), timeout_s=3.0):
             force_free_port(int(existing["port"]))
-        # 再确认旧实例已消失；若仍在且仍无流能力，继续强制占端口启动会失败，故再清一次
         again = probe_running_sandbox()
         if again and "chat_stream" not in (again.get("features") or []):
             force_free_port(int(again["port"]))
@@ -2972,12 +3075,20 @@ def main():
     SERVER = ThreadingHTTPServer((HOST, port), Handler)
     url = f"http://{HOST}:{port}/"
 
-    def _open():
-        open_or_refresh_ui(url)
+    if API_ONLY:
+        # 不打开浏览器、不弹系统通知（供 BloomBox / 桌面端后台调用）
+        print(
+            f"记忆沙箱 API-only（无 Web 界面）: {url}  build={UI_BUILD}  features={list(UI_FEATURES)}\n"
+            f"  健康检查: {url}api/health\n"
+            f"  桌面端: cd desktop && npm i && npm run tauri:dev"
+        )
+    else:
+        def _open():
+            open_or_refresh_ui(url)
 
-    threading.Timer(0.4, _open).start()
-    notify_mac("记忆沙箱", f"已在浏览器打开 {url}，退出请点页面「退出应用」")
-    print(f"记忆沙箱 Web UI: {url}  build={UI_BUILD}  features={list(UI_FEATURES)}")
+        threading.Timer(0.4, _open).start()
+        notify_mac("记忆沙箱", f"已在浏览器打开 {url}，退出请点页面「退出应用」")
+        print(f"记忆沙箱 Web UI: {url}  build={UI_BUILD}  features={list(UI_FEATURES)}")
 
     try:
         SERVER.serve_forever()

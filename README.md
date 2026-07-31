@@ -128,8 +128,14 @@ pip install -r requirements.txt
 
 # Local Web UI (recommended; macOS 26 compatible)
 python3 app_web.py
+# API-only for desktop / split frontend (no browser auto-open)
+# python3 app_web.py --api-only
 # Legacy tkinter GUI (may crash on macOS 26 system Python)
 # python3 app_gui.py
+
+# Desktop (React + Tauri): terminal 1 → api-only; terminal 2 →
+#   cd desktop && npm i && npm run tauri:dev
+# See README_zh.md / desktop/README.md
 
 # CLI (shares user memory dir with MCP/Web)
 ./scripts/memory ask "how to start revenue locally"

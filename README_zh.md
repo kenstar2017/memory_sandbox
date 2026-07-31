@@ -128,6 +128,8 @@ pip install -r requirements.txt
 
 # 本地 Web UI（推荐，兼容 macOS 26）
 python3 app_web.py
+# API-only（供桌面端 / 前后分离；不自动开浏览器）
+# python3 app_web.py --api-only
 # 旧版 tkinter GUI（macOS 26 系统 Python 可能崩溃）
 # python3 app_gui.py
 
@@ -154,6 +156,41 @@ python3 examples/demo.py
 ```bash
 ln -sf "$(pwd)/scripts/memory" /usr/local/bin/memory-sandbox
 ```
+
+### 桌面端 BloomBox（React + Tauri，前后分离）
+
+独立前端在 `desktop/`（应用名 **BloomBox**），通过 HTTP 调用本机 Python API（默认 `http://127.0.0.1:8765`）。**Tauri 启动时会自动执行** `python3 app_web.py --api-only`（端口已占用则复用；退出时只杀自己拉起的进程）。旧浏览器内嵌 UI 仍可用。
+
+```bash
+cd desktop
+npm install
+npm run tauri:dev   # 窗口 + 自动起 API（需 Rust / Xcode CLT）
+# 仅浏览器联调前端时另开：python3 app_web.py --api-only
+# npm run dev → http://localhost:5173
+```
+
+若 `npm run tauri:dev` 报 `failed to run 'cargo metadata' ... No such file or directory`，说明未装 Rust：
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+source "$HOME/.cargo/env"
+# 若尚未安装：xcode-select --install
+cd desktop && npm run tauri:dev
+```
+
+仍需本机 Python 3 与 `pip install -r requirements.txt`。可选：`BLOOMBOX_PYTHON`、`BLOOMBOX_API_ROOT`。详见 [`desktop/README.md`](desktop/README.md)。
+
+环境变量：
+
+| 变量 | 作用 |
+|------|------|
+| `MS_API_ONLY=1` | 等同 `--api-only` |
+| `MS_CORS_ORIGINS` | 额外 CORS 来源（逗号分隔） |
+| `VITE_API_BASE` | 前端 API 地址（默认 `http://127.0.0.1:8765`） |
+| `BLOOMBOX_PYTHON` | BloomBox 拉起 API 时用的 Python 路径 |
+| `BLOOMBOX_API_ROOT` | 含 `app_web.py` 的目录（开发默认仓库根） |
+
+桌面端已对齐常用 Web 能力：聊天流式、标签筛选、Agent 模式、短时/长时/状态查看、检索设置、提炼候选、备份/清空/归档、导出知识包、优化问法、主题切换等。
 
 ### CLI 子命令
 
@@ -376,6 +413,8 @@ print(result.answer, result.source)  # source: working | long_term | llm | ...
 memory_sandbox/
 ├── config.yaml          # 阈值与 LLM 配置
 ├── main.py              # CLI
+├── app_web.py           # Web UI + /api/*（支持 --api-only）
+├── desktop/             # React + Vite + Tauri 桌面前端
 ├── core/
 │   ├── sensory.py       # 感觉记忆
 │   ├── working.py       # 工作记忆

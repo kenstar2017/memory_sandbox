@@ -17,3 +17,6 @@ packaging/MemorySandbox.iconset/
 *.dmg
 ./dist/*
 ./build/*
+desktop/node_modules/
+desktop/dist/
+desktop/src-tauri/target/

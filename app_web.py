@@ -5,10 +5,14 @@ from __future__ import annotations
 
 import json
 import os
+import queue
 import socket
+import subprocess
 import sys
 import threading
 import traceback
+import urllib.error
+import urllib.request
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -144,8 +148,8 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .qa-a.md {
     white-space: normal;
-    max-height: 160px;
-    overflow-y: auto;
+    max-height: none;
+    overflow: visible;
     line-height: 1.55;
     color: #3d4a42;
   }
@@ -276,6 +280,90 @@ HTML_PAGE = r"""<!DOCTYPE html>
   }
   .meta { color: var(--muted); font-size: 12px; margin-top: -8px; margin-bottom: 14px; }
   .sys { color: #7a6a4f; }
+
+  /* 思考过程（对齐 CLI 阶段进度） */
+  .think-card {
+    margin: 0 0 14px;
+    border: 1px solid #d5e4db;
+    background: linear-gradient(180deg, #f7fbf8 0%, #f2f7f4 100%);
+    border-radius: 14px;
+    padding: 12px 14px 10px;
+    box-shadow: 0 2px 10px rgba(47,111,87,.06);
+  }
+  .think-head {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+    font-weight: 700;
+    color: var(--accent);
+    margin-bottom: 8px;
+  }
+  .think-head .elapsed {
+    margin-left: auto;
+    font-weight: 500;
+    font-size: 12px;
+    color: var(--muted);
+    font-variant-numeric: tabular-nums;
+  }
+  .think-spinner {
+    width: 14px; height: 14px;
+    border: 2px solid #c5ddd0;
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: think-spin .7s linear infinite;
+    flex-shrink: 0;
+  }
+  .think-card.done .think-spinner {
+    animation: none;
+    border-color: var(--accent);
+    background: var(--accent);
+    box-shadow: inset 0 0 0 2px #f7fbf8;
+    position: relative;
+  }
+  .think-card.done .think-spinner::after {
+    content: "";
+    position: absolute;
+    left: 3px; top: 1px;
+    width: 4px; height: 7px;
+    border: solid #fff;
+    border-width: 0 2px 2px 0;
+    transform: rotate(45deg);
+  }
+  .think-card.error .think-head { color: var(--danger); }
+  .think-steps {
+    list-style: none;
+    margin: 0;
+    padding: 0;
+    max-height: 220px;
+    overflow-y: auto;
+  }
+  .think-steps li {
+    display: flex;
+    gap: 8px;
+    align-items: flex-start;
+    font-size: 12.5px;
+    line-height: 1.45;
+    color: #4a5c52;
+    padding: 4px 0;
+    border-top: 1px dashed #e2ebe5;
+  }
+  .think-steps li:first-child { border-top: none; }
+  .think-steps li .mark {
+    flex-shrink: 0;
+    width: 14px;
+    text-align: center;
+    color: var(--muted);
+    font-size: 11px;
+    margin-top: 1px;
+  }
+  .think-steps li.done .mark { color: var(--accent); }
+  .think-steps li.active {
+    color: #16352a;
+    font-weight: 600;
+  }
+  .think-steps li.active .mark { color: var(--accent); }
+  @keyframes think-spin { to { transform: rotate(360deg); } }
   .composer-wrap { position: relative; margin-top: 12px; }
   .mode-bar {
     display: none;
@@ -1090,23 +1178,121 @@ async function confirmAnswer() {
   if (data.status_line) footer.textContent = data.status_line;
 }
 
+function createThinkCard() {
+  const card = document.createElement('div');
+  card.className = 'think-card';
+  card.innerHTML =
+    '<div class="think-head">' +
+      '<span class="think-spinner"></span>' +
+      '<span class="think-title">思考中</span>' +
+      '<span class="elapsed">0s</span>' +
+    '</div>' +
+    '<ul class="think-steps"></ul>';
+  chat.appendChild(card);
+  chat.scrollTop = chat.scrollHeight;
+  const t0 = Date.now();
+  const timer = setInterval(() => {
+    const el = card.querySelector('.elapsed');
+    if (el) el.textContent = Math.floor((Date.now() - t0) / 1000) + 's';
+  }, 250);
+  const steps = card.querySelector('.think-steps');
+  return {
+    el: card,
+    addProgress(msg) {
+      const prev = steps.querySelector('li.active');
+      if (prev) {
+        prev.classList.remove('active');
+        prev.classList.add('done');
+        const m = prev.querySelector('.mark');
+        if (m) m.textContent = '✓';
+      }
+      const li = document.createElement('li');
+      li.className = 'active';
+      const short = String(msg || '').replace(/…/g, '').trim();
+      li.innerHTML = '<span class="mark">●</span><span class="text"></span>';
+      li.querySelector('.text').textContent = short || msg;
+      steps.appendChild(li);
+      chat.scrollTop = chat.scrollHeight;
+    },
+    finish(ok) {
+      clearInterval(timer);
+      const prev = steps.querySelector('li.active');
+      if (prev) {
+        prev.classList.remove('active');
+        prev.classList.add('done');
+        const m = prev.querySelector('.mark');
+        if (m) m.textContent = ok ? '✓' : '!';
+      }
+      card.classList.add(ok ? 'done' : 'error');
+      const title = card.querySelector('.think-title');
+      if (title) title.textContent = ok ? '思考完成' : '思考中断';
+      const el = card.querySelector('.elapsed');
+      if (el) el.textContent = Math.floor((Date.now() - t0) / 1000) + 's';
+    }
+  };
+}
+
 async function sendText(text) {
   append('你：' + text, 'user');
   btnSend.disabled = true;
+  const think = createThinkCard();
   try {
-    const data = await api('/api/chat', { text });
-    if (data.error) append('错误：' + data.error, 'meta');
-    else {
-      append(data.answer || '', 'bot', { markdown: true, label: '沙箱' });
-      append('← 来源：' + (SOURCE[data.source] || data.source) + ' (' + data.source + ')', 'meta');
+    const res = await fetch('/api/chat_stream', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({ text })
+    });
+    if (!res.ok || !res.body) {
+      think.finish(false);
+      append('错误：流式接口不可用（HTTP ' + res.status + '）', 'meta');
+      return;
     }
-    if (data.status_line) footer.textContent = data.status_line;
-    // 文字指令记住后刷新左侧
+    const reader = res.body.getReader();
+    const decoder = new TextDecoder('utf-8');
+    let buf = '';
+    let finalData = null;
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buf += decoder.decode(value, { stream: true });
+      let idx;
+      while ((idx = buf.indexOf('\n')) >= 0) {
+        const line = buf.slice(0, idx).trim();
+        buf = buf.slice(idx + 1);
+        if (!line) continue;
+        let ev;
+        try { ev = JSON.parse(line); } catch (e) { continue; }
+        if (ev.type === 'progress') think.addProgress(ev.message || '');
+        else if (ev.type === 'done' || ev.type === 'error') finalData = ev;
+      }
+    }
+    if (buf.trim()) {
+      try {
+        const ev = JSON.parse(buf.trim());
+        if (ev.type === 'progress') think.addProgress(ev.message || '');
+        else if (ev.type === 'done' || ev.type === 'error') finalData = ev;
+      } catch (e) {}
+    }
+    if (!finalData) {
+      think.finish(false);
+      append('错误：未收到完整结果', 'meta');
+      return;
+    }
+    if (finalData.type === 'error' || finalData.error) {
+      think.finish(false);
+      append('错误：' + (finalData.error || '未知错误'), 'meta');
+    } else {
+      think.finish(true);
+      append(finalData.answer || '', 'bot', { markdown: true, label: '沙箱' });
+      append('← 来源：' + (SOURCE[finalData.source] || finalData.source) + ' (' + finalData.source + ')', 'meta');
+    }
+    if (finalData.status_line) footer.textContent = finalData.status_line;
     if (text.startsWith('记住') || text.includes('清空长时') || text.includes('清空全部')) {
       await refreshSaved();
       renderQaList();
     }
   } catch (e) {
+    think.finish(false);
     append('请求失败：' + e, 'meta');
   } finally {
     btnSend.disabled = false;
@@ -1367,7 +1553,7 @@ class Handler(BaseHTTPRequestHandler):
             _html_response(self, HTML_PAGE)
             return
         if path == "/api/health":
-            _json_response(self, 200, {"ok": True})
+            _json_response(self, 200, {"ok": True, "app": "memory-sandbox"})
             return
         self.send_error(404)
 
@@ -1393,6 +1579,73 @@ class Handler(BaseHTTPRequestHandler):
                         "status_line": STATE.status_line(),
                     },
                 )
+                return
+            if path == "/api/chat_stream":
+                text = (data.get("text") or "").strip()
+                self.send_response(200)
+                self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
+                self.send_header("Cache-Control", "no-cache, no-store")
+                self.send_header("X-Accel-Buffering", "no")
+                self.end_headers()
+
+                def _emit(obj: dict) -> None:
+                    line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+                    self.wfile.write(line)
+                    self.wfile.flush()
+
+                ev_q: "queue.Queue[Optional[dict]]" = queue.Queue()
+                holder: dict = {}
+
+                def on_progress(msg: str) -> None:
+                    ev_q.put({"type": "progress", "message": msg})
+
+                def worker() -> None:
+                    try:
+                        result = STATE.sandbox.chat(text, on_progress=on_progress)
+                        holder["result"] = result
+                    except Exception as e:
+                        holder["error"] = str(e)
+                        holder["trace"] = traceback.format_exc()
+                    finally:
+                        ev_q.put(None)
+
+                try:
+                    _emit({"type": "progress", "message": "开始处理…"})
+                except Exception:
+                    return
+                threading.Thread(target=worker, daemon=True).start()
+                while True:
+                    item = ev_q.get()
+                    if item is None:
+                        break
+                    try:
+                        _emit(item)
+                    except Exception:
+                        return
+                if holder.get("error"):
+                    try:
+                        _emit(
+                            {
+                                "type": "error",
+                                "error": holder["error"],
+                                "status_line": STATE.status_line(),
+                            }
+                        )
+                    except Exception:
+                        pass
+                    return
+                result = holder.get("result")
+                try:
+                    _emit(
+                        {
+                            "type": "done",
+                            "answer": getattr(result, "answer", "") or "",
+                            "source": getattr(result, "source", "") or "",
+                            "status_line": STATE.status_line(),
+                        }
+                    )
+                except Exception:
+                    pass
                 return
             if path == "/api/remember":
                 question = (data.get("question") or "").strip()
@@ -1593,6 +1846,93 @@ def find_free_port(start: int = PREFERRED_PORT, span: int = 20) -> int:
     raise RuntimeError("无可用本地端口")
 
 
+def find_running_sandbox(start: int = PREFERRED_PORT, span: int = 20) -> Optional[str]:
+    """探测本机是否已有记忆沙箱 Web 服务，返回页面 URL。"""
+    for port in range(start, start + span):
+        health = f"http://{HOST}:{port}/api/health"
+        try:
+            with urllib.request.urlopen(health, timeout=0.35) as resp:
+                if resp.status != 200:
+                    continue
+                data = json.loads(resp.read().decode("utf-8") or "{}")
+            if data.get("ok") and data.get("app", "memory-sandbox") == "memory-sandbox":
+                return f"http://{HOST}:{port}/"
+        except Exception:
+            continue
+    return None
+
+
+def _macos_refresh_tab(url_prefix: str) -> bool:
+    """在常见浏览器中查找已打开的沙箱页并 reload，避免新开标签。"""
+    prefix = url_prefix.rstrip("/")
+    # AppleScript：Chrome 系 / Safari；任一成功即返回
+    script = f'''
+on run
+  set prefix to "{prefix}"
+  set apps to {{"Google Chrome", "Chromium", "Microsoft Edge", "Brave Browser", "Arc", "Safari"}}
+  repeat with appName in apps
+    try
+      if application appName is running then
+        if appName is "Safari" then
+          tell application "Safari"
+            repeat with w in windows
+              repeat with t in tabs of w
+                if (URL of t as string) starts with prefix then
+                  set current tab of w to t
+                  set index of w to 1
+                  set u to URL of t
+                  set URL of t to u
+                  activate
+                  return "ok"
+                end if
+              end repeat
+            end repeat
+          end tell
+        else
+          tell application appName
+            repeat with w in windows
+              set i to 0
+              repeat with t in tabs of w
+                set i to i + 1
+                if (URL of t as string) starts with prefix then
+                  set active tab index of w to i
+                  set index of w to 1
+                  tell t to reload
+                  activate
+                  return "ok"
+                end if
+              end repeat
+            end repeat
+          end tell
+        end if
+      end if
+    end try
+  end repeat
+  return "miss"
+end run
+'''
+    try:
+        proc = subprocess.run(
+            ["osascript", "-e", script],
+            capture_output=True,
+            text=True,
+            timeout=8,
+        )
+        return proc.returncode == 0 and (proc.stdout or "").strip() == "ok"
+    except Exception:
+        return False
+
+
+def open_or_refresh_ui(url: str) -> str:
+    """优先刷新已打开标签；否则新开。返回 refreshed | opened。"""
+    prefix = url.rstrip("/")
+    if sys.platform == "darwin" and _macos_refresh_tab(prefix):
+        return "refreshed"
+    # new=0：尽量同窗口；多数浏览器仍可能新开标签，故 macOS 优先走上面的 refresh
+    webbrowser.open(url, new=0, autoraise=True)
+    return "opened"
+
+
 def notify_mac(title: str, message: str):
     if sys.platform != "darwin":
         return
@@ -1611,13 +1951,26 @@ def main():
         except Exception:
             pass
 
+    # 已有实例：只刷新旧页，不再起第二个服务、不新开标签
+    existing = find_running_sandbox()
+    if existing:
+        action = open_or_refresh_ui(existing)
+        msg = (
+            f"已刷新已打开页面 {existing}"
+            if action == "refreshed"
+            else f"已唤起界面 {existing}（未新启服务）"
+        )
+        notify_mac("记忆沙箱", msg)
+        print(msg)
+        return
+
     STATE = AppState()
     port = find_free_port()
     SERVER = ThreadingHTTPServer((HOST, port), Handler)
     url = f"http://{HOST}:{port}/"
 
     def _open():
-        webbrowser.open(url)
+        open_or_refresh_ui(url)
 
     threading.Timer(0.4, _open).start()
     notify_mac("记忆沙箱", f"已在浏览器打开 {url}，退出请点页面「退出应用」")

@@ -121,7 +121,7 @@ class LLMConfig:
     base_url: str = ""
     api_key: str = ""
     model: str = ""
-    timeout: int = 60
+    timeout: int = 600
     # cursor：工作目录；空则用进程 cwd（在项目根启动 CLI 即作用该项目）
     cwd: str = ""
     # cursor：local=本机 agent CLI 可读盘；cloud=Cloud 无仓库（看不到本机文件）

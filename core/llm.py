@@ -273,7 +273,11 @@ class CursorCloudLLM(BaseLLM):
 
 
 def resolve_agent_bin(config: LLMConfig) -> Optional[str]:
-    """解析本机 Cursor agent CLI 路径。"""
+    """解析本机 Cursor agent CLI 路径。
+
+    Web/DMG 等 GUI 启动时常没有 shell 的 PATH（~/.local/bin 不在其中），
+    因此除 PATH 查找外，再探测常见安装位置。
+    """
     explicit = (config.agent_bin or "").strip()
     if explicit:
         return explicit if os.path.isfile(explicit) and os.access(explicit, os.X_OK) else explicit
@@ -281,11 +285,33 @@ def resolve_agent_bin(config: LLMConfig) -> Optional[str]:
         found = shutil.which(name)
         if found:
             return found
+    home = os.path.expanduser("~")
+    candidates = [
+        os.path.join(home, ".local", "bin", "agent"),
+        os.path.join(home, ".local", "bin", "cursor-agent"),
+        "/usr/local/bin/agent",
+        "/usr/local/bin/cursor-agent",
+        "/opt/homebrew/bin/agent",
+        "/opt/homebrew/bin/cursor-agent",
+    ]
+    for path in candidates:
+        if os.path.isfile(path) and os.access(path, os.X_OK):
+            return path
     return None
 
 
 def resolve_llm_cwd(config: LLMConfig) -> str:
-    return (config.cwd or os.getenv("CURSOR_CWD", "") or os.getcwd()).strip() or os.getcwd()
+    explicit = (config.cwd or os.getenv("CURSOR_CWD", "")).strip()
+    if explicit:
+        return explicit
+    cwd = (os.getcwd() or "").strip()
+    # 打包 App 常 chdir 到 Application Support/MemorySandbox，不适合做 Agent 工作区
+    norm = cwd.replace("\\", "/")
+    if "Application Support/MemorySandbox" in norm:
+        home = os.path.expanduser("~")
+        docs = os.path.join(home, "Documents")
+        return docs if os.path.isdir(docs) else home
+    return cwd or os.path.expanduser("~")
 
 
 def describe_cursor_llm(config: LLMConfig) -> str:
@@ -384,40 +410,107 @@ class CursorLocalAgentLLM(BaseLLM):
         cmd.append(text)
 
         mode_hint = agent_mode or "agent"
+        self.timeout = int(self.config.timeout or self.timeout or 600)
         _emit(
             on_progress,
             f"Cursor Local Agent：workspace={self.cwd} mode={mode_hint}"
-            f"{' force' if agent_force else ''}（可读本机盘）…",
+            f"{' force' if agent_force else ''} timeout={self.timeout}s…",
         )
         env = os.environ.copy()
         if self.api_key:
             env["CURSOR_API_KEY"] = self.api_key
 
         t0 = time.time()
+        # 用 Popen 以便超时时 kill 并尽量拿到已缓冲的 stdout/stderr
         try:
-            proc = subprocess.run(
+            proc = subprocess.Popen(
                 cmd,
-                capture_output=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
                 text=True,
-                timeout=max(30, self.timeout),
                 cwd=self.cwd,
                 env=env,
             )
-        except subprocess.TimeoutExpired:
-            return f"[LLM Error] Cursor Local Agent 超时（>{self.timeout}s），workspace={self.cwd}"
         except FileNotFoundError:
             return f"[LLM Error] 无法执行 agent：{self.agent_bin}"
         except Exception as e:
-            return f"[LLM Error] Cursor Local Agent: {e}"
+            return (
+                f"[LLM Error] Cursor Local Agent 启动失败: {type(e).__name__}: {e}\n"
+                f"agent_bin={self.agent_bin}\nworkspace={self.cwd}"
+            )
 
-        out = (proc.stdout or "").strip()
-        err = (proc.stderr or "").strip()
+        try:
+            out, err = proc.communicate(timeout=max(30, self.timeout))
+        except subprocess.TimeoutExpired as e:
+            _emit(on_progress, f"Cursor Local Agent：超时，正在终止进程（>{self.timeout}s）…")
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            try:
+                out2, err2 = proc.communicate(timeout=5)
+            except Exception:
+                out2, err2 = "", ""
+            # TimeoutExpired 可能已带部分输出
+            partial_out = ""
+            partial_err = ""
+            if isinstance(getattr(e, "stdout", None), str):
+                partial_out = e.stdout
+            if isinstance(getattr(e, "stderr", None), str):
+                partial_err = e.stderr
+            out = (partial_out or out2 or "").strip()
+            err = (partial_err or err2 or "").strip()
+            elapsed = time.time() - t0
+            lines = [
+                f"[LLM Error] Cursor Local Agent 超时（>{self.timeout}s，实际约 {elapsed:.0f}s）",
+                f"exception: subprocess.TimeoutExpired",
+                f"workspace={self.cwd}",
+                f"agent_bin={self.agent_bin}",
+                f"mode={mode_hint} force={agent_force}",
+                f"returncode={proc.returncode}",
+                "说明：Agent 在时限内未结束。常见原因：飞书/外网需登录或很慢、任务过重、timeout 过短。",
+                "处理：在用户 config 提高 llm.timeout（如 900）；llm.cwd 设为项目目录；确认能访问该文档。",
+            ]
+            if err:
+                lines.append("—— stderr ——\n" + err[:2000])
+            if out:
+                lines.append("—— stdout（部分） ——\n" + out[:2000])
+            if not err and not out:
+                lines.append("—— 无 stdout/stderr（进程可能一直阻塞且未刷缓冲）——")
+            msg = "\n".join(lines)
+            _emit(on_progress, "Cursor Local Agent：已超时并暴露诊断信息")
+            return msg
+        except Exception as e:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            return (
+                f"[LLM Error] Cursor Local Agent 异常: {type(e).__name__}: {e}\n"
+                f"workspace={self.cwd}\nagent_bin={self.agent_bin}"
+            )
+
+        out = (out or "").strip()
+        err = (err or "").strip()
         elapsed = time.time() - t0
         if proc.returncode != 0:
-            detail = err or out or f"exit={proc.returncode}"
-            return f"[LLM Error] Cursor Local Agent 失败（{elapsed:.0f}s）: {detail[:800]}"
+            detail = err or out or f"（无输出）"
+            return (
+                f"[LLM Error] Cursor Local Agent 失败（{elapsed:.0f}s）\n"
+                f"exception: nonzero exit\n"
+                f"returncode={proc.returncode}\n"
+                f"workspace={self.cwd}\n"
+                f"agent_bin={self.agent_bin}\n"
+                f"mode={mode_hint}\n"
+                f"—— stderr/stdout ——\n{detail[:2000]}"
+            )
         if not out:
-            return f"[LLM Error] Cursor Local Agent 无输出（{elapsed:.0f}s）: {(err or '')[:400]}"
+            return (
+                f"[LLM Error] Cursor Local Agent 无输出（{elapsed:.0f}s）\n"
+                f"returncode={proc.returncode}\n"
+                f"workspace={self.cwd}\n"
+                f"—— stderr ——\n{(err or '（空）')[:1500]}"
+            )
         _emit(on_progress, f"Cursor Local Agent：完成（{elapsed:.0f}s）")
         return out
 

@@ -10,6 +10,7 @@ import socket
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import urllib.error
 import urllib.request
@@ -29,6 +30,9 @@ from core.paths import app_support_dir, default_config_path, default_persist_dir
 
 HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
+# 前端/协议版本：用于识别旧进程（无思考过程流）并提示重启
+UI_BUILD = "20260731-stream2"
+UI_FEATURES = ("chat_stream", "think_card")
 
 HTML_PAGE = r"""<!DOCTYPE html>
 <html lang="zh-CN">
@@ -1490,10 +1494,22 @@ if (agentModeSel) {
   };
 }
 
-append('优先检索本地三级记忆。\\n新方式：输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n原有指令仍可用：记住：问 => 答 | 备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏可切换 Agent 模式：Ask 只读 / Plan / Agent 可写。', 'sys');
+append('优先检索本地三级记忆。\\n提问后会显示「思考中」过程（本地检索 → LLM）。\\n新方式：输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n原有指令仍可用：记住：问 => 答 | 备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏可切换 Agent 模式：Ask 只读 / Plan / Agent 可写。', 'sys');
 refreshSaved();
 renderQaList();
 refreshAgentMode();
+(async function ensureStreamUi() {
+  try {
+    const r = await fetch('/api/health', { cache: 'no-store' });
+    const h = await r.json();
+    const feats = h.features || [];
+    if (!feats.includes('chat_stream')) {
+      append('当前后台过旧，没有「思考过程」流。请点「退出应用」，再运行：python3 app_web.py', 'meta');
+    } else if (h.build) {
+      footer.title = 'build ' + h.build;
+    }
+  } catch (e) {}
+})();
 input.focus();
 </script>
 </body>
@@ -1535,9 +1551,17 @@ def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: dict):
 
 
 def _html_response(handler: BaseHTTPRequestHandler, html: str):
-    raw = html.encode("utf-8")
+    # 注入 build，避免浏览器/旧页缓存导致「没有分析过程」
+    injected = html.replace(
+        "</title>",
+        f"</title>\n<meta name=\"ms-build\" content=\"{UI_BUILD}\" />",
+        1,
+    )
+    raw = injected.encode("utf-8")
     handler.send_response(200)
     handler.send_header("Content-Type", "text/html; charset=utf-8")
+    handler.send_header("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
+    handler.send_header("Pragma", "no-cache")
     handler.send_header("Content-Length", str(len(raw)))
     handler.end_headers()
     handler.wfile.write(raw)
@@ -1553,7 +1577,16 @@ class Handler(BaseHTTPRequestHandler):
             _html_response(self, HTML_PAGE)
             return
         if path == "/api/health":
-            _json_response(self, 200, {"ok": True, "app": "memory-sandbox"})
+            _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "app": "memory-sandbox",
+                    "build": UI_BUILD,
+                    "features": list(UI_FEATURES),
+                },
+            )
             return
         self.send_error(404)
 
@@ -1586,12 +1619,23 @@ class Handler(BaseHTTPRequestHandler):
                 self.send_header("Content-Type", "application/x-ndjson; charset=utf-8")
                 self.send_header("Cache-Control", "no-cache, no-store")
                 self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Transfer-Encoding", "chunked")
                 self.end_headers()
 
                 def _emit(obj: dict) -> None:
-                    line = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
-                    self.wfile.write(line)
+                    # HTTP chunked，避免整段缓冲导致前端长时间无进度
+                    payload = (json.dumps(obj, ensure_ascii=False) + "\n").encode("utf-8")
+                    self.wfile.write(f"{len(payload):X}\r\n".encode("ascii"))
+                    self.wfile.write(payload)
+                    self.wfile.write(b"\r\n")
                     self.wfile.flush()
+
+                def _end_chunks() -> None:
+                    try:
+                        self.wfile.write(b"0\r\n\r\n")
+                        self.wfile.flush()
+                    except Exception:
+                        pass
 
                 ev_q: "queue.Queue[Optional[dict]]" = queue.Queue()
                 holder: dict = {}
@@ -1612,6 +1656,7 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     _emit({"type": "progress", "message": "开始处理…"})
                 except Exception:
+                    _end_chunks()
                     return
                 threading.Thread(target=worker, daemon=True).start()
                 while True:
@@ -1621,6 +1666,7 @@ class Handler(BaseHTTPRequestHandler):
                     try:
                         _emit(item)
                     except Exception:
+                        _end_chunks()
                         return
                 if holder.get("error"):
                     try:
@@ -1633,6 +1679,7 @@ class Handler(BaseHTTPRequestHandler):
                         )
                     except Exception:
                         pass
+                    _end_chunks()
                     return
                 result = holder.get("result")
                 try:
@@ -1646,6 +1693,7 @@ class Handler(BaseHTTPRequestHandler):
                     )
                 except Exception:
                     pass
+                _end_chunks()
                 return
             if path == "/api/remember":
                 question = (data.get("question") or "").strip()
@@ -1846,8 +1894,10 @@ def find_free_port(start: int = PREFERRED_PORT, span: int = 20) -> int:
     raise RuntimeError("无可用本地端口")
 
 
-def find_running_sandbox(start: int = PREFERRED_PORT, span: int = 20) -> Optional[str]:
-    """探测本机是否已有记忆沙箱 Web 服务，返回页面 URL。"""
+def probe_running_sandbox(
+    start: int = PREFERRED_PORT, span: int = 20
+) -> Optional[dict]:
+    """探测本机是否已有记忆沙箱 Web 服务。"""
     for port in range(start, start + span):
         health = f"http://{HOST}:{port}/api/health"
         try:
@@ -1856,10 +1906,73 @@ def find_running_sandbox(start: int = PREFERRED_PORT, span: int = 20) -> Optiona
                     continue
                 data = json.loads(resp.read().decode("utf-8") or "{}")
             if data.get("ok") and data.get("app", "memory-sandbox") == "memory-sandbox":
-                return f"http://{HOST}:{port}/"
+                return {
+                    "url": f"http://{HOST}:{port}/",
+                    "port": port,
+                    "build": data.get("build") or "",
+                    "features": list(data.get("features") or []),
+                }
         except Exception:
             continue
     return None
+
+
+def find_running_sandbox(start: int = PREFERRED_PORT, span: int = 20) -> Optional[str]:
+    """兼容旧调用：只返回页面 URL。"""
+    info = probe_running_sandbox(start=start, span=span)
+    return info["url"] if info else None
+
+
+def request_shutdown_sandbox(base_url: str) -> bool:
+    """请求已运行实例退出。"""
+    endpoint = base_url.rstrip("/") + "/api/shutdown"
+    try:
+        req = urllib.request.Request(
+            endpoint,
+            data=b"{}",
+            method="POST",
+            headers={"Content-Type": "application/json"},
+        )
+        with urllib.request.urlopen(req, timeout=2.0) as resp:
+            _ = resp.read()
+        return True
+    except Exception:
+        return False
+
+
+def wait_until_port_free(port: int, timeout_s: float = 4.0) -> bool:
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.settimeout(0.2)
+            try:
+                s.connect((HOST, port))
+            except OSError:
+                return True
+        time.sleep(0.15)
+    return False
+
+
+def force_free_port(port: int) -> None:
+    """shutdown 失败时，按端口清理监听进程（仅本机开发/桌面场景）。"""
+    if sys.platform != "darwin" and sys.platform != "linux":
+        return
+    try:
+        proc = subprocess.run(
+            ["lsof", "-ti", f"tcp:{port}", f"-sTCP:LISTEN"],
+            capture_output=True,
+            text=True,
+            timeout=3,
+        )
+        pids = [p.strip() for p in (proc.stdout or "").splitlines() if p.strip()]
+        for pid in pids:
+            try:
+                os.kill(int(pid), 15)
+            except Exception:
+                pass
+        wait_until_port_free(port, timeout_s=2.0)
+    except Exception:
+        pass
 
 
 def _macos_refresh_tab(url_prefix: str) -> bool:
@@ -1951,18 +2064,30 @@ def main():
         except Exception:
             pass
 
-    # 已有实例：只刷新旧页，不再起第二个服务、不新开标签
-    existing = find_running_sandbox()
-    if existing:
-        action = open_or_refresh_ui(existing)
+    # 已有实例：若含思考流则只刷新；否则关掉旧进程再起新服务
+    existing = probe_running_sandbox()
+    if existing and "chat_stream" in (existing.get("features") or []):
+        action = open_or_refresh_ui(existing["url"])
         msg = (
-            f"已刷新已打开页面 {existing}"
+            f"已刷新已打开页面 {existing['url']} (build {existing.get('build') or '?'})"
             if action == "refreshed"
-            else f"已唤起界面 {existing}（未新启服务）"
+            else f"已唤起界面 {existing['url']}（未新启服务）"
         )
         notify_mac("记忆沙箱", msg)
         print(msg)
         return
+
+    if existing:
+        print(
+            f"检测到旧版服务 {existing['url']}（无 chat_stream），正在重启以显示思考过程…"
+        )
+        request_shutdown_sandbox(existing["url"])
+        if not wait_until_port_free(int(existing["port"]), timeout_s=3.0):
+            force_free_port(int(existing["port"]))
+        # 再确认旧实例已消失；若仍在且仍无流能力，继续强制占端口启动会失败，故再清一次
+        again = probe_running_sandbox()
+        if again and "chat_stream" not in (again.get("features") or []):
+            force_free_port(int(again["port"]))
 
     STATE = AppState()
     port = find_free_port()
@@ -1974,6 +2099,7 @@ def main():
 
     threading.Timer(0.4, _open).start()
     notify_mac("记忆沙箱", f"已在浏览器打开 {url}，退出请点页面「退出应用」")
+    print(f"记忆沙箱 Web UI: {url}  build={UI_BUILD}  features={list(UI_FEATURES)}")
 
     try:
         SERVER.serve_forever()

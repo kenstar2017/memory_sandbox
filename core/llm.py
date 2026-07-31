@@ -354,6 +354,7 @@ class CursorLocalAgentLLM(BaseLLM):
         # 每次从 config 读取，支持运行时切换 ask/plan/agent
         agent_mode = (self.config.agent_mode or "").strip()
         agent_force = bool(self.config.agent_force)
+        approve_mcps = bool(getattr(self.config, "approve_mcps", True))
         self.cwd = resolve_llm_cwd(self.config)
         self.agent_bin = resolve_agent_bin(self.config) or self.agent_bin
 
@@ -403,6 +404,9 @@ class CursorLocalAgentLLM(BaseLLM):
             cmd.extend(["--mode", agent_mode])
         if agent_force:
             cmd.append("--force")
+        if approve_mcps:
+            # 使 ~/.cursor/mcp.json 中的飞书等 MCP 在无交互 -p 模式下可用
+            cmd.append("--approve-mcps")
         if self.model:
             cmd.extend(["--model", self.model])
         if self.api_key:
@@ -414,7 +418,9 @@ class CursorLocalAgentLLM(BaseLLM):
         _emit(
             on_progress,
             f"Cursor Local Agent：workspace={self.cwd} mode={mode_hint}"
-            f"{' force' if agent_force else ''} timeout={self.timeout}s…",
+            f"{' force' if agent_force else ''}"
+            f"{' approve-mcps' if approve_mcps else ''}"
+            f" timeout={self.timeout}s…",
         )
         env = os.environ.copy()
         if self.api_key:

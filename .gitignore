@@ -16,3 +16,4 @@ dist/
 packaging/MemorySandbox.iconset/
 *.dmg
 ./dist/*
+./build/*

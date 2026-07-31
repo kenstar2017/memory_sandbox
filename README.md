@@ -161,6 +161,7 @@ For in-project `data/memory`, add `--project-memory`.
 | `清空工作记忆` | Clear sliding window only |
 | `切换场景：dev` | Context-weighted retrieval |
 | `切换Agent模式：ask\|plan\|agent` | Local LLM read-only / plan / writable |
+| `飞书登录` | Browser OAuth for Feishu doc reading |
 | `查看记忆状态` | Print per-layer stats |
 | `帮助` | Built-in rule-engine help |
 
@@ -176,6 +177,94 @@ See `config.yaml`:
 - `long_term.persist_dir`: persistence dir (default `data/memory`)
 - `llm.provider`: `mock` (offline stub) | `cursor` | `openai_compatible`
 - `llm.runtime` (cursor only): `local` (local `agent` CLI, can read disk) | `cloud` (no repo; cannot scan local source)
+- `feishu.*`: Feishu wiki/docx reading (see “Feishu / Lark document reading” below)
+
+## Feishu / Lark document reading
+
+When a message contains a Feishu wiki/docx URL, the sandbox can **fetch the body** before LLM fallback.
+
+- Does **not** depend on Cursor/Trae MCP; does **not** change `~/.cursor/mcp.json`
+- Secrets stay in the local user config — **do not commit**
+- Code: `core/feishu.py`, `core/feishu_oauth.py`; scripts: `scripts/feishu_login.py`, `scripts/configure_feishu.sh`
+
+### How it works
+
+```
+Message with Feishu URL
+  → local memory miss
+  → parse wiki/docx URL
+  → (optional) refresh user_access_token
+  → OpenAPI wiki node → docx raw_content
+  → inject into LLM context → answer
+```
+
+| Topic | Behavior |
+|-------|----------|
+| When | Web/CLI LLM fallback only; MCP `memory_prepare` does **not** fetch |
+| Working memory | Feishu-URL questions skip reusing prior answers (helps retries) |
+| Failures | Auth/fetch failures are not persisted to working/long-term memory |
+
+### Config locations
+
+| File | Role |
+|------|------|
+| Repo `config.yaml` | Template (`feishu.enabled: false` by default) |
+| **`~/Library/Application Support/MemorySandbox/config.yaml`** | **Effective** user config |
+
+Env (optional): `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_USER_ACCESS_TOKEN` / `FEISHU_API_BASE`.
+
+### Setup
+
+1. Create an app in the [Feishu Open Platform](https://open.feishu.cn/). Suggested scopes: `offline_access`, `docs:document.content:read`, `wiki:wiki:readonly` / `wiki:node:read`.
+2. Add redirect URL (must match config exactly):
+
+```text
+http://127.0.0.1:18765/feishu/callback
+```
+
+This is the **OAuth login callback**, not the Web UI (`8765`) and not an event-subscription URL.
+
+3. User config:
+
+```yaml
+feishu:
+  enabled: true
+  app_id: "cli_xxx"
+  app_secret: "xxx"
+  redirect_uri: "http://127.0.0.1:18765/feishu/callback"
+```
+
+Or: `FEISHU_APP_ID=... FEISHU_APP_SECRET=... ./scripts/configure_feishu.sh`
+
+4. Browser OAuth (`user_access_token` is not shown in the admin console):
+
+```bash
+python3 scripts/feishu_login.py
+# or send in chat: 飞书登录
+```
+
+Stores `user_access_token` + `refresh_token`; auto-refresh on expiry.
+
+5. Restart Web/CLI and ask with a Feishu link.
+
+### Related commands
+
+| Command | Meaning |
+|---------|---------|
+| `飞书登录` / `飞书授权` / `登录飞书` | Browser OAuth |
+| `重试` / `再试一次` / `重新分析` | Skip working-memory reuse |
+| `清空工作记忆` | Clear short-term window |
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---------|-----|
+| `99991668` | Re-run `feishu_login.py` |
+| `131006` | Need user token for personal docs, or authorize the doc to the app |
+| Missing wiki scope | Enable wiki read scopes on the app |
+| Callback timeout | Redirect URL must match; port `18765` free |
+| Stale answer | Clear working memory or say「重试」; restart Web after code changes |
+| Repo config ignored | Edit Application Support user config |
 
 ### Cursor model (when memory misses)
 

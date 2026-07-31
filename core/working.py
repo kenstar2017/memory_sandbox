@@ -2,11 +2,35 @@
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Any, Dict, List, Optional
 
 from .rules import RuleEngine
 from .utils import cosine_similarity, extract_keywords, keyword_overlap
+
+# 失败/鉴权类答复：不可复用（删长时后仍会卡在工作记忆）
+_NON_REUSABLE_ANS = re.compile(
+    r"(?:"
+    r"^\[(?:MockLLM|LLM Error)\]"
+    r"|读不到该文档"
+    r"|Invalid access token"
+    r"|99991668|99991672"
+    r"|Access denied\..*wiki"
+    r"|飞书文档：.*失败"
+    r"|未配置飞书"
+    r"|tenant_access_token:.*失败"
+    r"|user_access_token:.*失败"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def is_non_reusable_answer(answer: str) -> bool:
+    text = (answer or "").strip()
+    if not text:
+        return True
+    return bool(_NON_REUSABLE_ANS.search(text))
 
 
 class WorkingMemory:
@@ -96,6 +120,26 @@ class WorkingMemory:
         if not self.window:
             return None
 
+        # 「刚才说了什么 / 上一句是什么」——先于复用逻辑
+        normalized = user_input.strip().rstrip("？?")
+        if normalized in {"刚才说了什么", "上一句是什么", "刚才问了什么", "上下文"}:
+            if not self.window:
+                return "工作记忆为空。"
+            lines = []
+            for item in self.window[-4:]:
+                role = "用户" if item.get("role") == "user" else "助手"
+                lines.append(f"{role}: {item.get('text')}")
+            return "\n".join(lines)
+
+        # 飞书链接：凭证/正文可能变化，不复用工作记忆旧答（否则删长时后仍假命中）
+        try:
+            from .feishu import extract_feishu_urls
+
+            if extract_feishu_urls(user_input):
+                return None
+        except Exception:
+            pass
+
         # 重复提问：与历史 user 高度重合
         user_kw = extract_keywords(user_input)
         best_score = 0.0
@@ -110,7 +154,7 @@ class WorkingMemory:
                 continue
 
             ans = str(item.get("text") or "")
-            if ans.startswith("[MockLLM]") or ans.startswith("[LLM Error]"):
+            if is_non_reusable_answer(ans):
                 continue
 
             score = keyword_overlap(user_kw, pending_user.get("kw") or [])
@@ -128,17 +172,6 @@ class WorkingMemory:
         # 工作记忆内高相似重复问
         if best_score >= 0.92 and best_answer:
             return best_answer
-
-        # 「刚才说了什么 / 上一句是什么」
-        normalized = user_input.strip().rstrip("？?")
-        if normalized in {"刚才说了什么", "上一句是什么", "刚才问了什么", "上下文"}:
-            if not self.window:
-                return "工作记忆为空。"
-            lines = []
-            for item in self.window[-4:]:
-                role = "用户" if item.get("role") == "user" else "助手"
-                lines.append(f"{role}: {item.get('text')}")
-            return "\n".join(lines)
 
         return None
 

@@ -68,6 +68,7 @@ class RuleEngine:
                 "- 优化已有记忆（给旧条目补别名/刷新向量）\n"
                 "- 查看短时记忆 / 查看长时记忆 / 查看全部记忆\n"
                 "- 查看记忆状态\n"
+                "- 飞书登录（浏览器 OAuth 获取 user_access_token，管理后台无明文）\n"
                 "- 切换场景：<场景名>"
             ),
             "help": "Commands: remember / forget / backup long-term / confirm clear / list / status.",

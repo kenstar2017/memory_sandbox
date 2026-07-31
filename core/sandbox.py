@@ -97,8 +97,14 @@ class MemorySandbox:
         keywords = item.keywords
         vec = self.embedder.embed(text)
 
+        # 「重试 / 再试一次」：跳过工作记忆复用，强制重新走检索/飞书/LLM
+        force_retry = bool(
+            re.search(r"(?:请)?(?:再试一次|重新试|重试|重新分析|重新拉取|再分析一遍)", text)
+        )
         _p("工作记忆：本地匹配…")
-        local_res = self.working.local_match(text, user_vec=vec)
+        local_res = None if force_retry else self.working.local_match(text, user_vec=vec)
+        if force_retry:
+            _p("检测到重试意图，跳过工作记忆复用")
         if local_res:
             self._write_back(text, keywords, vec, local_res, persist_long=False)
             _p("命中工作记忆")
@@ -112,6 +118,12 @@ class MemorySandbox:
 
         _p(f"长时记忆：向量检索（场景 {self.working.scene}）…")
         long_res = self.long_term.search(text, query_vec=vec, scene=self.working.scene)
+        if long_res:
+            from .working import is_non_reusable_answer
+
+            if is_non_reusable_answer(long_res):
+                _p("长时命中为失败类答复，忽略并继续")
+                long_res = None
         if long_res:
             self._write_back(text, keywords, vec, long_res, persist_long=False)
             _p("命中长时记忆")
@@ -167,7 +179,34 @@ class MemorySandbox:
             elif runtime:
                 hint += f" runtime={runtime}"
             on_progress(f"本地无解 → 回退沙箱 LLM（{hint}）…")
+
+        # 飞书链接：在沙箱内用 OpenAPI 拉正文，注入 LLM 上下文（不依赖 Cursor MCP）
         context = self.working.recent_context_text()
+        feishu_cfg = getattr(self.config, "feishu", None)
+        if feishu_cfg is not None:
+            from .feishu import extract_feishu_urls, feishu_configured, fetch_feishu_docs_for_text
+
+            refs = extract_feishu_urls(text)
+            if refs:
+                if not feishu_configured(feishu_cfg):
+                    if on_progress:
+                        on_progress("检测到飞书链接，但未配置 feishu.* 凭证，跳过拉取")
+                else:
+                    if on_progress:
+                        on_progress(f"飞书文档：拉取 {len(refs)} 篇…")
+                    results, feishu_ctx = fetch_feishu_docs_for_text(
+                        feishu_cfg, text, config_path=self.config_path
+                    )
+                    ok_n = sum(1 for r in results if r.ok)
+                    if on_progress:
+                        on_progress(f"飞书文档：成功 {ok_n}/{len(results)}")
+                    if feishu_ctx:
+                        context = (
+                            (context + "\n\n" if context else "")
+                            + "【飞书文档正文（由记忆沙箱拉取）】\n"
+                            + feishu_ctx
+                        )
+
         llm_res = self.llm.generate(text, context=context, on_progress=on_progress)
 
         self._write_back(text, keywords, vec, llm_res, persist_long=True)
@@ -294,6 +333,23 @@ class MemorySandbox:
                 "agent_force": bool(self.config.llm.agent_force),
                 "cwd": getattr(self.config.llm, "cwd", "") or "",
             },
+            "feishu": self._feishu_status(),
+        }
+
+    def _feishu_status(self) -> dict:
+        from .feishu import feishu_configured
+
+        cfg = getattr(self.config, "feishu", None)
+        if cfg is None:
+            return {"enabled": False, "configured": False}
+        return {
+            "enabled": bool(cfg.enabled),
+            "configured": feishu_configured(cfg),
+            "api_base": (cfg.api_base or "")[:80],
+            "has_app_id": bool((cfg.app_id or "").strip()),
+            "has_user_token": bool((cfg.user_access_token or "").strip()),
+            "has_refresh_token": bool((getattr(cfg, "refresh_token", "") or "").strip()),
+            "redirect_uri": (getattr(cfg, "redirect_uri", "") or "")[:120],
         }
 
     def list_working(self) -> list:
@@ -375,8 +431,10 @@ class MemorySandbox:
         answer: str,
         persist_long: bool,
     ) -> None:
-        # Mock/失败占位不应污染工作记忆，否则重复提问会“假命中”
-        if answer.startswith("[MockLLM]") or answer.startswith("[LLM Error]"):
+        # 失败/鉴权类答复不进工作记忆与长时，否则删长时后仍会「命中工作记忆」假复用
+        from .working import is_non_reusable_answer
+
+        if is_non_reusable_answer(answer):
             return
         self.working.add_context(question, keywords, vec, role="user")
         self.working.add_context(answer, extract_keywords(answer), role="assistant")
@@ -438,6 +496,37 @@ class MemorySandbox:
         if text in {"清空工作记忆", "清空上下文"}:
             self.working.clear()
             return ChatResult(answer="工作记忆已清空。", source="command")
+
+        if text in {"飞书登录", "飞书授权", "登录飞书"}:
+            try:
+                from .config import load_config
+                from .feishu_oauth import run_oauth_login
+                from .paths import app_support_dir
+
+                user_cfg = str(app_support_dir() / "config.yaml")
+                _, path = run_oauth_login(
+                    self.config.feishu,
+                    config_path=user_cfg,
+                    open_browser=True,
+                )
+                fresh = load_config(user_cfg)
+                self.config.feishu = fresh.feishu
+                return ChatResult(
+                    answer=(
+                        f"飞书授权成功，token 已写入 {path}。"
+                        "之后过期会自动 refresh；失效再发「飞书登录」。"
+                    ),
+                    source="command",
+                )
+            except Exception as e:
+                return ChatResult(
+                    answer=(
+                        f"飞书登录失败：{e}\n"
+                        "也可在终端执行：python3 scripts/feishu_login.py\n"
+                        "注意：user_access_token 不能在管理后台查看明文，必须浏览器授权换取。"
+                    ),
+                    source="command",
+                )
 
         if text in {"备份长时记忆", "备份长期记忆", "导出长时记忆", "backup long term"}:
             return ChatResult(answer=self.backup_long_term(), source="command")

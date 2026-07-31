@@ -132,6 +132,31 @@ class LLMConfig:
     agent_mode: str = "ask"
     # cursor local：是否传 --force（可写/跑命令，慎用）
     agent_force: bool = False
+    # cursor local：是否传 --approve-mcps（批准 Cursor mcp.json；飞书读文档请用下方 feishu 配置）
+    approve_mcps: bool = False
+
+
+@dataclass
+class FeishuConfig:
+    """记忆沙箱内置飞书读文档（OpenAPI，不依赖 Cursor/Trae MCP）。"""
+
+    enabled: bool = False
+    app_id: str = ""
+    app_secret: str = ""
+    # 由 OAuth 动态获取，勿指望在飞书管理后台查看明文
+    user_access_token: str = ""
+    refresh_token: str = ""
+    user_token_expires_at: int = 0
+    # OAuth 回调，需与开放平台「重定向 URL」一致
+    redirect_uri: str = "http://127.0.0.1:18765/feishu/callback"
+    oauth_scope: str = (
+        "offline_access docs:document.content:read wiki:wiki:readonly wiki:node:read"
+    )
+    # 开放平台 API 根；国内一般 https://open.feishu.cn
+    api_base: str = "https://open.feishu.cn"
+    timeout: float = 30.0
+    # 注入 LLM 前的正文最大字符数
+    max_chars: int = 80000
 
 
 @dataclass
@@ -146,6 +171,7 @@ class AppConfig:
     long_term: LongTermConfig = field(default_factory=LongTermConfig)
     embedding: EmbeddingConfig = field(default_factory=EmbeddingConfig)
     llm: LLMConfig = field(default_factory=LLMConfig)
+    feishu: FeishuConfig = field(default_factory=FeishuConfig)
     sandbox: SandboxConfig = field(default_factory=SandboxConfig)
 
     @classmethod
@@ -156,6 +182,7 @@ class AppConfig:
             long_term=LongTermConfig(**_filter_kwargs(LongTermConfig, data.get("long_term"))),
             embedding=EmbeddingConfig(**_filter_kwargs(EmbeddingConfig, data.get("embedding"))),
             llm=LLMConfig(**_filter_kwargs(LLMConfig, data.get("llm"))),
+            feishu=FeishuConfig(**_filter_kwargs(FeishuConfig, data.get("feishu"))),
             sandbox=SandboxConfig(**_filter_kwargs(SandboxConfig, data.get("sandbox"))),
         )
 

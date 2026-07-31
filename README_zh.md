@@ -161,6 +161,7 @@ ln -sf "$(pwd)/scripts/memory" /usr/local/bin/memory-sandbox
 | `清空工作记忆` | 仅清空滑动窗口 |
 | `切换场景：dev` | 情境依赖检索加权 |
 | `切换Agent模式：ask\|plan\|agent` | 本地 LLM 只读/规划/可写 |
+| `飞书登录` | 浏览器 OAuth 获取飞书读文档凭证 |
 | `查看记忆状态` | 打印各层统计 |
 | `帮助` | 规则引擎内置帮助 |
 
@@ -176,6 +177,106 @@ ln -sf "$(pwd)/scripts/memory" /usr/local/bin/memory-sandbox
 - `long_term.persist_dir`：持久化目录（默认 `data/memory`）
 - `llm.provider`：`mock`（离线占位）| `cursor` | `openai_compatible`
 - `llm.runtime`（仅 cursor）：`local`（本机 `agent` CLI，可读盘）| `cloud`（Cloud 无仓库，不能扫本机源码）
+- `feishu.*`：飞书 wiki/docx 读取（见下方「飞书文档读取」）
+
+## 飞书文档读取
+
+对话中出现飞书 wiki/docx 链接时，沙箱可在回退 LLM 前 **自动拉取正文**。
+
+- **不依赖** Cursor MCP、Trae MCP；**不改** `~/.cursor/mcp.json`
+- 密钥只写本机用户配置，**勿提交 git**
+- 代码：`core/feishu.py`、`core/feishu_oauth.py`；脚本：`scripts/feishu_login.py`、`scripts/configure_feishu.sh`
+
+### 工作原理
+
+```
+用户输入含飞书链接
+  → 本地三级记忆未命中
+  → 解析 wiki/docx URL
+  →（可选）用 refresh_token 续期 user_access_token
+  → OpenAPI：wiki 节点 → docx raw_content
+  → 正文注入 LLM 上下文 → 生成回答
+```
+
+| 点 | 说明 |
+|----|------|
+| 何时拉取 | 仅 Web / CLI 回退 LLM 前；MCP 的 `memory_prepare` **不会**拉飞书 |
+| 不复用工作记忆旧答 | 含飞书链接的提问不直接复用上次失败/旧结论，便于重试 |
+| 失败类答复 | 鉴权失败等不写入工作记忆 / 长时记忆 |
+
+### 配置位置
+
+| 文件 | 用途 |
+|------|------|
+| 仓库 `config.yaml` | 字段模板，默认 `feishu.enabled: false` |
+| **`~/Library/Application Support/MemorySandbox/config.yaml`** | **真正生效**（密钥写这里） |
+
+环境变量（可选）：`FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_USER_ACCESS_TOKEN` / `FEISHU_API_BASE`。
+
+### 接入步骤
+
+1. 在 [飞书开放平台](https://open.feishu.cn/) 创建应用，记下 App ID / App Secret。建议权限：`offline_access`、`docs:document.content:read`、`wiki:wiki:readonly` / `wiki:node:read`。
+2. 「安全设置 → 重定向 URL」添加（须与配置完全一致）：
+
+```text
+http://127.0.0.1:18765/feishu/callback
+```
+
+这是 **OAuth 登录回调**，不是 Web UI（`8765`），也不是事件订阅 Request URL。登录时本机临时监听 `18765` 接收授权码。
+
+3. 写入用户配置：
+
+```yaml
+feishu:
+  enabled: true
+  app_id: "cli_xxx"
+  app_secret: "xxx"
+  redirect_uri: "http://127.0.0.1:18765/feishu/callback"
+  api_base: "https://open.feishu.cn"
+  # user_access_token / refresh_token 由 OAuth 写入，管理后台看不到明文
+```
+
+或：`FEISHU_APP_ID=... FEISHU_APP_SECRET=... ./scripts/configure_feishu.sh`
+
+4. 浏览器授权（`user_access_token` 必须 OAuth 换取）：
+
+```bash
+python3 scripts/feishu_login.py
+# 或对话发送：飞书登录
+```
+
+成功后写入 `user_access_token` + `refresh_token`；过期自动 refresh；长期失效再登录。
+
+5. 重启 Web / CLI，提问带飞书链接的问题即可（进度中应有「飞书文档：拉取…」）。
+
+### 配置字段
+
+| 字段 | 说明 |
+|------|------|
+| `enabled` | `true` 才启用 |
+| `app_id` / `app_secret` | 开放平台应用凭证 |
+| `redirect_uri` | 须与开放平台重定向 URL 一致 |
+| `user_access_token` / `refresh_token` | OAuth 写入；后者用于续期 |
+| `api_base` / `timeout` / `max_chars` | API 根、超时、注入截断长度 |
+
+### 相关指令
+
+| 指令 | 说明 |
+|------|------|
+| `飞书登录` / `飞书授权` / `登录飞书` | 浏览器 OAuth |
+| `重试` / `再试一次` / `重新分析` | 跳过工作记忆复用 |
+| `清空工作记忆` | 清掉短时旧结论 |
+
+### 排障
+
+| 现象 | 处理 |
+|------|------|
+| `99991668` Invalid access token | 再跑 `feishu_login.py` |
+| `131006` node permission denied | 个人文档靠 user token；或把文档授权给应用 |
+| 缺 wiki scope | 开放平台开通 wiki 读权限 |
+| 回调失败 / 超时 | 重定向 URL 完全一致；`18765` 未被占用 |
+| 只回旧答案 | 「清空工作记忆」或加「重试」；改代码后重启 Web |
+| 改仓库 `config.yaml` 不生效 | 改 Application Support 用户配置 |
 
 ### 接入 Cursor 模型（记忆未命中时）
 

@@ -641,6 +641,49 @@ HTML_PAGE = r"""<!DOCTYPE html>
     color: #fff;
     border-color: var(--danger);
   }
+  .tag-filter {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+    padding: 0 0 10px;
+  }
+  .tag-chip {
+    border: 1px solid var(--line);
+    background: #fff;
+    color: var(--muted);
+    border-radius: 999px;
+    padding: 3px 10px;
+    font-size: 12px;
+    cursor: pointer;
+  }
+  .tag-chip.active {
+    background: var(--ink);
+    color: #fff;
+    border-color: var(--ink);
+  }
+  .meta-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 8px 10px;
+    margin: 10px 0 12px;
+  }
+  .meta-grid label {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .meta-grid label.span2 { grid-column: 1 / -1; }
+  .meta-grid input, .meta-grid select {
+    border: 1px solid var(--line);
+    border-radius: 8px;
+    padding: 7px 9px;
+    font-size: 13px;
+    color: var(--ink);
+    background: #fff;
+  }
+  .qa-badge.kind { background: #e8eef8; color: #2a4a7a; }
   @media (max-width: 640px) {
     .modal.modal-answer {
       width: 100%;
@@ -660,6 +703,7 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button type="button" class="active" data-tab="pending" id="tabPending">待补全答</button>
         <button type="button" data-tab="saved" id="tabSaved">已记住</button>
       </div>
+      <div class="tag-filter" id="tagFilter" hidden></div>
       <div id="qaList"></div>
     </aside>
 
@@ -683,6 +727,9 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <button type="button" id="btnStatus">记忆状态</button>
         <button type="button" id="btnClear">清空工作记忆</button>
         <button type="button" id="btnBackupLong">备份长时记忆</button>
+        <button type="button" id="btnExportPack">导出知识包</button>
+        <button type="button" id="btnGitCheck">检查过时记忆</button>
+        <button type="button" id="btnArchive">归档陈旧记忆</button>
         <button type="button" class="danger" id="btnClearLong">清空长时记忆</button>
         <button type="button" id="btnSeed">写入开发种子</button>
         <button type="button" id="btnData">打开数据目录</button>
@@ -712,6 +759,24 @@ HTML_PAGE = r"""<!DOCTYPE html>
       <h3>补全答案</h3>
       <p class="modal-hint">支持 Markdown（列表 / **加粗** / `代码`）。可用「整理排版」把顿号长列表拆成条目，再点「预览」查看效果。</p>
       <div class="qbox" id="modalQuestion"></div>
+      <div class="meta-grid">
+        <label>标签（逗号分隔）
+          <input id="modalTags" placeholder="feishu, frontend" />
+        </label>
+        <label>类型
+          <select id="modalKind">
+            <option value="qa">qa 问答</option>
+            <option value="command">command 命令</option>
+            <option value="path">path 路径</option>
+            <option value="env">env 环境</option>
+            <option value="pitfall">pitfall 踩坑</option>
+            <option value="decision">decision 决策</option>
+          </select>
+        </label>
+        <label class="span2">结构化补充（可选，随类型填写）
+          <input id="modalFact" placeholder="如：pnpm build 或 ~/path 或 KEY=value" />
+        </label>
+      </div>
       <div class="answer-toolbar">
         <div class="answer-tabs" id="answerTabs">
           <button type="button" class="active" data-pane="edit">编辑</button>
@@ -772,14 +837,17 @@ const COMMANDS = [
   { id: 'clear_w', name: '清空工作记忆', desc: '清空短时滑动窗口', icon: '清', run: '清空工作记忆' },
   { id: 'backup_l', name: '备份长时记忆', desc: '导出陈述性问答到 backups/', icon: '备', run: '备份长时记忆' },
   { id: 'clear_l', name: '清空长时记忆', desc: '清空持久化问答（需确认）', icon: '删', confirmClear: 'long' },
+  { id: 'extract', name: '提炼候选', desc: '从粘贴的终端/日志提炼候选记忆', icon: '炼', extract: true },
 ];
 
 let activeTab = 'pending';
 let pendingQuestions = loadPending();
 let savedMemories = [];
+let activeTagFilter = '';
 let mode = null; // 'memory' | null
 let slashIndex = 0;
 let editingQuestion = '';
+let editingRecordId = '';
 
 function loadPending() {
   try { return JSON.parse(localStorage.getItem('ms_pending_q') || '[]'); }
@@ -817,10 +885,16 @@ async function api(path, body) {
 
 function setMode(next) {
   mode = next;
-  modeBar.classList.toggle('show', mode === 'memory');
+  modeBar.classList.toggle('show', mode === 'memory' || mode === 'extract');
+  const label = modeBar.querySelector('span');
   if (mode === 'memory') {
+    if (label) label.textContent = '当前指令：记忆 — 请输入「问」';
     input.placeholder = '记忆模式：输入问题（问），Enter 加入左侧清单';
+  } else if (mode === 'extract') {
+    if (label) label.textContent = '当前指令：提炼 — 粘贴终端/日志';
+    input.placeholder = '提炼模式：粘贴终端输出或日志，Enter 提炼候选';
   } else {
+    if (label) label.textContent = '当前指令：记忆 — 请输入「问」';
     input.placeholder = '输入问题，或输入 / 选择指令。Enter 发送，Shift+Enter 换行';
   }
 }
@@ -869,12 +943,52 @@ async function selectCommand(cmd) {
     input.focus();
     return;
   }
+  if (cmd.extract) {
+    setMode('extract');
+    append('已进入「提炼候选」：粘贴终端/日志文本到下方发送，将返回候选记忆供确认写入。', 'sys');
+    input.focus();
+    return;
+  }
   if (cmd.confirmClear) {
     openConfirmClear(cmd.confirmClear);
     return;
   }
   if (cmd.run) {
     await sendText(cmd.run);
+  }
+}
+
+async function runExtract(text) {
+  const data = await api('/api/extract', { text, max_n: 3 });
+  if (data.error) {
+    append('错误：' + data.error, 'meta');
+    return;
+  }
+  const cands = data.candidates || [];
+  if (!cands.length) {
+    append('未提炼出候选记忆，可换一段包含命令/路径/报错的文本再试。', 'sys');
+    return;
+  }
+  append('提炼到 ' + cands.length + ' 条候选（点击左侧填写或直接点「记住」）：', 'sys');
+  cands.forEach((c, i) => {
+    const label = '[' + (i + 1) + '] ' + (c.kind || 'qa') + ' · ' + (c.question || '');
+    append(label + '\n' + (c.answer || ''), 'bot', { markdown: false, label: '候选' });
+    pendingQuestions.push(c.question || ('候选' + (i + 1)));
+    // 用 session 暂存候选详情，点开弹窗时回填
+    try {
+      const map = JSON.parse(sessionStorage.getItem('ms_extract_map') || '{}');
+      map[c.question] = c;
+      sessionStorage.setItem('ms_extract_map', JSON.stringify(map));
+    } catch (e) {}
+  });
+  savePending();
+  activeTab = 'pending';
+  document.querySelectorAll('.side-tabs button').forEach(b => {
+    b.classList.toggle('active', b.dataset.tab === 'pending');
+  });
+  renderQaList();
+  if (data.suggested_tags && data.suggested_tags.length) {
+    append('建议标签：' + data.suggested_tags.map((t) => '#' + t).join(' '), 'meta');
   }
 }
 
@@ -932,8 +1046,48 @@ async function executeConfirmClear() {
   }
 }
 
+function allSavedTags() {
+  const set = new Set();
+  savedMemories.forEach((rec) => (rec.tags || []).forEach((t) => set.add(t)));
+  return Array.from(set).sort();
+}
+
+function renderTagFilter() {
+  const bar = document.getElementById('tagFilter');
+  if (!bar) return;
+  if (activeTab !== 'saved') {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  const tags = allSavedTags();
+  if (!tags.length) {
+    bar.hidden = true;
+    bar.innerHTML = '';
+    return;
+  }
+  bar.hidden = false;
+  const chips = [{ tag: '', label: '全部' }].concat(tags.map((t) => ({ tag: t, label: '#' + t })));
+  bar.innerHTML = chips.map((c) =>
+    '<button type="button" class="tag-chip' + ((activeTagFilter === c.tag) ? ' active' : '') +
+    '" data-tag="' + escapeHtml(c.tag) + '">' + escapeHtml(c.label) + '</button>'
+  ).join('');
+  bar.querySelectorAll('.tag-chip').forEach((btn) => {
+    btn.onclick = () => {
+      activeTagFilter = btn.dataset.tag || '';
+      renderQaList();
+    };
+  });
+}
+
+function filteredSaved() {
+  if (!activeTagFilter) return savedMemories;
+  return savedMemories.filter((rec) => (rec.tags || []).includes(activeTagFilter));
+}
+
 function renderQaList() {
   qaList.innerHTML = '';
+  renderTagFilter();
   if (activeTab === 'pending') {
     if (!pendingQuestions.length) {
       qaList.innerHTML = '<div class="qa-a" style="padding:8px">暂无待补全的问题。输入 / 选择「记忆」添加。</div>';
@@ -958,21 +1112,32 @@ function renderQaList() {
     });
     return;
   }
+  const list = filteredSaved();
   if (!savedMemories.length) {
     qaList.innerHTML = '<div class="qa-a" style="padding:8px">暂无已记住的问答。</div>';
     return;
   }
-  savedMemories.forEach((rec) => {
+  if (!list.length) {
+    qaList.innerHTML = '<div class="qa-a" style="padding:8px">当前标签下无记忆。</div>';
+    return;
+  }
+  list.forEach((rec) => {
     const el = document.createElement('div');
     el.className = 'qa-item';
     el.innerHTML =
       '<div class="qa-top">' +
         '<div class="qa-badge">' + escapeHtml(rec.scene || 'general') + '</div>' +
+        (rec.kind && rec.kind !== 'qa'
+          ? '<div class="qa-badge kind">' + escapeHtml(rec.kind) + '</div>'
+          : '') +
+        ((rec.tags && rec.tags.length)
+          ? '<div class="qa-badge" style="opacity:.85">#' + escapeHtml(rec.tags.join(' #')) + '</div>'
+          : '') +
         '<button type="button" class="qa-del" data-id="' + escapeHtml(rec.id || '') + '">删除</button>' +
       '</div>' +
       '<p class="qa-q">' + escapeHtml(rec.question) + '</p>' +
       '<div class="qa-a md">' + renderMarkdown(rec.answer || '') + '</div>';
-    el.onclick = () => openAnswerModal(rec.question, rec.answer, -1);
+    el.onclick = () => openAnswerModal(rec.question, rec.answer, -1, rec);
     el.querySelector('.qa-del').onclick = (ev) => {
       ev.stopPropagation();
       deleteSaved(rec);
@@ -1134,10 +1299,28 @@ async function refreshSaved() {
   renderQaList();
 }
 
-function openAnswerModal(question, answer, pendingIndex) {
+function openAnswerModal(question, answer, pendingIndex, rec) {
+  let seed = rec || null;
+  if (!seed) {
+    try {
+      const map = JSON.parse(sessionStorage.getItem('ms_extract_map') || '{}');
+      seed = map[question] || null;
+    } catch (e) { seed = null; }
+  }
   editingQuestion = question;
+  editingRecordId = (seed && seed.id) || '';
   modalQuestion.textContent = question;
-  modalAnswer.value = answer || '';
+  modalAnswer.value = answer || (seed && seed.answer) || '';
+  const tagsEl = document.getElementById('modalTags');
+  const kindEl = document.getElementById('modalKind');
+  const factEl = document.getElementById('modalFact');
+  if (tagsEl) tagsEl.value = ((seed && seed.tags) || []).join(', ');
+  if (kindEl) kindEl.value = (seed && seed.kind) || 'qa';
+  if (factEl) {
+    const facts = (seed && seed.facts) || {};
+    const kind = (seed && seed.kind) || 'qa';
+    factEl.value = facts[kind] || facts.command || facts.path || facts.env || facts.pitfall || facts.decision || '';
+  }
   answerModal.dataset.pendingIndex = String(pendingIndex);
   answerModal.classList.add('show');
   setAnswerPane('edit');
@@ -1147,7 +1330,15 @@ function openAnswerModal(question, answer, pendingIndex) {
 function closeAnswerModal() {
   answerModal.classList.remove('show');
   editingQuestion = '';
+  editingRecordId = '';
   setAnswerPane('edit');
+}
+
+function parseTagsInput(raw) {
+  return String(raw || '')
+    .split(/[,，\s]+/)
+    .map((s) => s.replace(/^#/, '').trim())
+    .filter(Boolean);
 }
 
 async function confirmAnswer() {
@@ -1157,7 +1348,14 @@ async function confirmAnswer() {
     alert('问题和答案都不能为空');
     return;
   }
-  const data = await api('/api/remember', { question, answer, scene: 'general' });
+  const kind = (document.getElementById('modalKind') || {}).value || 'qa';
+  const tags = parseTagsInput((document.getElementById('modalTags') || {}).value);
+  const factVal = ((document.getElementById('modalFact') || {}).value || '').trim();
+  const facts = {};
+  if (factVal && kind && kind !== 'qa') facts[kind] = factVal;
+  const data = await api('/api/remember', {
+    question, answer, scene: 'dev', tags, kind, facts,
+  });
   if (data.error) {
     append('错误：' + data.error, 'meta');
     return;
@@ -1345,6 +1543,13 @@ async function send() {
     return;
   }
 
+  if (mode === 'extract') {
+    append(text.slice(0, 400) + (text.length > 400 ? '…' : ''), 'user');
+    setMode(null);
+    await runExtract(text);
+    return;
+  }
+
   await sendText(text);
 }
 
@@ -1444,6 +1649,52 @@ document.getElementById('btnBackupLong').onclick = async () => {
     if (data.error) append('错误：' + data.error, 'meta');
     else append(data.message || '已备份', 'sys');
     if (data.status_line) footer.textContent = data.status_line;
+  } catch (e) {
+    append('请求失败：' + e, 'meta');
+  }
+};
+document.getElementById('btnExportPack').onclick = async () => {
+  try {
+    const name = prompt('知识包名称', 'memory-pack') || 'memory-pack';
+    const data = await api('/api/export_pack', {
+      name,
+      filter_tags: activeTagFilter ? [activeTagFilter] : undefined,
+    });
+    if (data.error) append('错误：' + data.error, 'meta');
+    else append(data.message || '已导出知识包', 'sys');
+    if (data.status_line) footer.textContent = data.status_line;
+  } catch (e) {
+    append('请求失败：' + e, 'meta');
+  }
+};
+document.getElementById('btnGitCheck').onclick = async () => {
+  try {
+    const data = await api('/api/git_check', {});
+    if (data.error) {
+      append('错误：' + data.error, 'meta');
+      return;
+    }
+    const stale = data.stale || [];
+    append(data.hint || '已检查 Git 变更与记忆关联', 'sys');
+    if (!stale.length) return;
+    stale.forEach((h) => {
+      append(
+        '可能过时：' + (h.question || '') + '\n相关文件：' + ((h.matched_paths || []).join(', ') || '-'),
+        'meta'
+      );
+    });
+  } catch (e) {
+    append('请求失败：' + e, 'meta');
+  }
+};
+document.getElementById('btnArchive').onclick = async () => {
+  if (!confirm('确认归档久未命中的长时记忆？（默认按配置 aging_days）')) return;
+  try {
+    const data = await api('/api/archive', { confirm: true });
+    if (data.error) append('错误：' + data.error, 'meta');
+    else append(data.message || '已归档', 'sys');
+    if (data.status_line) footer.textContent = data.status_line;
+    await refreshSaved();
   } catch (e) {
     append('请求失败：' + e, 'meta');
   }
@@ -1699,15 +1950,104 @@ class Handler(BaseHTTPRequestHandler):
                 question = (data.get("question") or "").strip()
                 answer = (data.get("answer") or "").strip()
                 scene = (data.get("scene") or "general").strip() or "general"
+                tags = data.get("tags")
+                if isinstance(tags, str):
+                    tags = [tags]
+                kind = (data.get("kind") or "").strip() or None
+                facts = data.get("facts") if isinstance(data.get("facts"), dict) else None
                 if not question or not answer:
                     _json_response(self, 400, {"error": "question/answer 不能为空"})
                     return
-                msg = STATE.sandbox.remember(question, answer, scene=scene)
+                msg = STATE.sandbox.remember(
+                    question, answer, scene=scene, tags=tags, kind=kind, facts=facts
+                )
                 _json_response(
                     self,
                     200,
                     {"message": msg, "status_line": STATE.status_line()},
                 )
+                return
+            if path == "/api/extract":
+                text = data.get("text") or ""
+                if not str(text).strip():
+                    _json_response(self, 400, {"error": "text 不能为空"})
+                    return
+                tags = data.get("tags")
+                if isinstance(tags, str):
+                    tags = [tags]
+                try:
+                    max_n = int(data.get("max_n") or 3)
+                except (TypeError, ValueError):
+                    max_n = 3
+                payload = STATE.sandbox.extract_candidates(
+                    str(text), max_n=max(1, min(max_n, 8)), tags=tags
+                )
+                payload["status_line"] = STATE.status_line()
+                _json_response(self, 200, payload)
+                return
+            if path == "/api/export_pack":
+                filter_tags = data.get("filter_tags") or data.get("tags")
+                if isinstance(filter_tags, str):
+                    filter_tags = [filter_tags]
+                try:
+                    limit = int(data.get("limit") or 500)
+                except (TypeError, ValueError):
+                    limit = 500
+                msg = STATE.sandbox.export_pack(
+                    name=(data.get("name") or "memory-pack").strip() or "memory-pack",
+                    dest=(data.get("dest") or "").strip() or None,
+                    description=(data.get("description") or "").strip(),
+                    filter_tags=filter_tags,
+                    filter_scene=(data.get("filter_scene") or data.get("scene") or "").strip()
+                    or None,
+                    limit=max(1, min(limit, 5000)),
+                )
+                _json_response(
+                    self, 200, {"message": msg, "status_line": STATE.status_line()}
+                )
+                return
+            if path == "/api/import_pack":
+                path_in = (data.get("path") or "").strip()
+                if not path_in:
+                    _json_response(self, 400, {"error": "path 不能为空"})
+                    return
+                merge = data.get("merge")
+                if merge is None:
+                    merge = True
+                msg = STATE.sandbox.import_pack(
+                    path_in, merge=bool(merge), confirm=bool(data.get("confirm"))
+                )
+                _json_response(
+                    self, 200, {"message": msg, "status_line": STATE.status_line()}
+                )
+                return
+            if path == "/api/archive":
+                msg = STATE.sandbox.archive_stale(
+                    min_hits=data.get("min_hits"),
+                    older_than_days=data.get("older_than_days"),
+                    confirm=bool(data.get("confirm")),
+                )
+                _json_response(
+                    self, 200, {"message": msg, "status_line": STATE.status_line()}
+                )
+                return
+            if path == "/api/git_check":
+                try:
+                    limit = int(data.get("limit") or 8)
+                except (TypeError, ValueError):
+                    limit = 8
+                payload = STATE.sandbox.check_git_changes(
+                    cwd=(data.get("cwd") or "").strip() or None,
+                    since_ref=(data.get("since_ref") or "HEAD~20").strip() or "HEAD~20",
+                    limit=max(1, min(limit, 30)),
+                )
+                payload["status_line"] = STATE.status_line()
+                _json_response(self, 200, payload)
+                return
+            if path == "/api/list_packs":
+                payload = STATE.sandbox.list_packs()
+                payload["status_line"] = STATE.status_line()
+                _json_response(self, 200, payload)
                 return
             if path == "/api/delete_memory":
                 memory_id = (data.get("id") or data.get("memory_id") or "").strip()

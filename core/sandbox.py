@@ -5,7 +5,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, Optional, Sequence
 
 from .config import AppConfig, load_config
 from .embedding import LocalHasherEmbedder
@@ -13,6 +13,8 @@ from .llm import BaseLLM, ProgressCallback, build_llm
 from .long_term import LongTermMemory
 from .paths import default_config_path, default_persist_dir, is_frozen, resource_root
 from .sensory import SensoryMemory
+from .extract import extract_memory_candidates, suggest_tags_from_text
+from .tags import merge_tags, parse_tags_from_text
 from .utils import extract_keywords
 from .working import WorkingMemory
 
@@ -57,12 +59,21 @@ class MemorySandbox:
             # 打包态默认写到 Application Support；开发态写到项目 data/
             persist_dir = (default_persist_dir() if is_frozen() else _PROJECT_ROOT / persist_dir)
 
+        lt = self.config.long_term
         self.long_term = LongTermMemory(
             persist_dir=str(persist_dir),
-            similarity_threshold=self.config.long_term.similarity_threshold,
-            top_k=self.config.long_term.top_k,
-            reinforce_boost=self.config.long_term.reinforce_boost,
+            similarity_threshold=lt.similarity_threshold,
+            top_k=lt.top_k,
+            reinforce_boost=lt.reinforce_boost,
             embedder=self.embedder,
+            bm25_enabled=getattr(lt, "bm25_enabled", True),
+            vector_weight=getattr(lt, "vector_weight", 0.55),
+            keyword_weight=getattr(lt, "keyword_weight", 0.20),
+            bm25_weight=getattr(lt, "bm25_weight", 0.25),
+            aging_enabled=getattr(lt, "aging_enabled", True),
+            aging_days=getattr(lt, "aging_days", 90.0),
+            aging_min_hits=getattr(lt, "aging_min_hits", 0),
+            aging_decay=getattr(lt, "aging_decay", 0.15),
         )
         self.llm: Optional[BaseLLM] = build_llm(self.config.llm)
 
@@ -117,17 +128,35 @@ class MemorySandbox:
             return ChatResult(answer=proc, source="procedural")
 
         _p(f"长时记忆：向量检索（场景 {self.working.scene}）…")
-        long_res = self.long_term.search(text, query_vec=vec, scene=self.working.scene)
-        if long_res:
+        query_tags = parse_tags_from_text(text)
+        hits = self.long_term.search_hits(
+            text,
+            query_vec=vec,
+            scene=self.working.scene,
+            tags=query_tags or None,
+        )
+        if hits:
             from .working import is_non_reusable_answer
 
+            long_res = self.long_term.format_hit_answers(hits)
             if is_non_reusable_answer(long_res):
                 _p("长时命中为失败类答复，忽略并继续")
+                hits = []
                 long_res = None
-        if long_res:
-            self._write_back(text, keywords, vec, long_res, persist_long=False)
-            _p("命中长时记忆")
-            return ChatResult(answer=long_res, source="long_term")
+            else:
+                self.long_term.reinforce_hits(hits)
+                hit_meta = [h.as_dict() for h in hits]
+                self._write_back(text, keywords, vec, long_res, persist_long=False)
+                _p("命中长时记忆")
+                return ChatResult(
+                    answer=long_res,
+                    source="long_term",
+                    meta={
+                        "hit_local": True,
+                        "hits": hit_meta,
+                        "explain": hit_meta[0]["reasons"] if hit_meta else [],
+                    },
+                )
 
         _p("本地三级记忆未命中")
         return ChatResult(
@@ -215,21 +244,199 @@ class MemorySandbox:
             stream_callback(result.answer)
         return result
 
-    def remember(self, question: str, answer: str, scene: Optional[str] = None) -> str:
+    def remember(
+        self,
+        question: str,
+        answer: str,
+        scene: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        kind: Optional[str] = None,
+        facts: Optional[dict] = None,
+    ) -> str:
         from .question_optimize import optimize_question
 
         scene = scene or self.working.scene
         opt = optimize_question(question)
+        # 正文里的 #tag + 显式 tags 合并
+        merged = merge_tags(parse_tags_from_text(question), parse_tags_from_text(answer), tags)
         # 向量交给 save_memory 用 embed_text 生成，覆盖更多口语变体
-        rec = self.long_term.save_memory(question, answer, scene=scene)
+        rec = self.long_term.save_memory(
+            question,
+            answer,
+            scene=scene,
+            tags=merged,
+            kind=kind,
+            facts=facts,
+        )
         self.working.add_context(opt.canonical, opt.keywords, rec.vector, role="user")
-        self.working.add_context(answer, extract_keywords(answer), role="assistant")
+        self.working.add_context(rec.answer, extract_keywords(rec.answer), role="assistant")
         alias_hint = ""
         if opt.canonical != opt.original:
             alias_hint = f"；已优化为「{opt.canonical}」"
+        tag_hint = f"；tags={','.join(rec.tags)}" if rec.tags else ""
+        kind_hint = f"；kind={rec.kind}" if rec.kind and rec.kind != "qa" else ""
+        scrub_hint = "；已脱敏" if (rec.meta or {}).get("scrubbed") else ""
         return (
-            f"已写入长时记忆 [{rec.id}]（场景: {rec.scene}{alias_hint}；"
+            f"已写入长时记忆 [{rec.id}]（场景: {rec.scene}{alias_hint}{tag_hint}{kind_hint}{scrub_hint}；"
             f"别名 {len(rec.meta.get('aliases') or [])} 条）"
+        )
+
+    def extract_candidates(
+        self,
+        text: str,
+        *,
+        max_n: int = 3,
+        tags: Optional[Sequence[str]] = None,
+    ) -> dict:
+        """从终端/日志文本提炼候选记忆（不写盘）。"""
+        cands = extract_memory_candidates(text, max_n=max_n, tags=tags)
+        suggested = suggest_tags_from_text(text)
+        return {
+            "candidates": [c.as_dict() for c in cands],
+            "suggested_tags": suggested,
+            "hint": "请确认后再 memory_remember；密钥类内容写入时会自动脱敏。",
+        }
+
+    def export_pack(
+        self,
+        *,
+        name: str = "memory-pack",
+        dest: Optional[str] = None,
+        description: str = "",
+        tags: Optional[Sequence[str]] = None,
+        filter_tags: Optional[Sequence[str]] = None,
+        filter_scene: Optional[str] = None,
+        limit: int = 500,
+    ) -> str:
+        """导出可分享知识包（无向量，已脱敏）。"""
+        from .pack import build_pack, write_pack
+
+        self.long_term.reload()
+        pack = build_pack(
+            self.long_term.records,
+            name=name,
+            description=description,
+            tags=tags,
+            filter_tags=filter_tags,
+            filter_scene=filter_scene,
+            scrub=True,
+            limit=limit,
+        )
+        out_dir = dest or str(self.long_term.persist_dir / "packs")
+        path = write_pack(pack, out_dir)
+        return f"已导出知识包 {pack.name}（{len(pack.records)} 条）→ {path}"
+
+    def import_pack(
+        self,
+        path: str,
+        *,
+        merge: bool = True,
+        confirm: bool = False,
+    ) -> str:
+        """导入知识包。merge=False 会清空现有长时记忆，需 confirm=True。"""
+        from .pack import load_pack
+
+        if not merge and not confirm:
+            return "覆盖导入需 confirm=true（将清空现有长时记忆后再导入）。"
+        pack = load_pack(path)
+        stats = self.long_term.import_pack_records(
+            pack.records, merge=merge, default_scene=self.working.scene
+        )
+        mode = "合并" if merge else "覆盖"
+        return (
+            f"已{mode}导入知识包「{pack.name}」：写入 {stats['imported']} 条，"
+            f"当前共 {stats['total']} 条"
+        )
+
+    def archive_stale(
+        self,
+        *,
+        min_hits: Optional[int] = None,
+        older_than_days: Optional[float] = None,
+        confirm: bool = False,
+    ) -> str:
+        """归档久未命中的长时记忆。"""
+        if not confirm:
+            days = older_than_days if older_than_days is not None else self.long_term.aging_days
+            hits = min_hits if min_hits is not None else self.long_term.aging_min_hits
+            return (
+                f"将归档 hit_count≤{hits} 且超过 {days} 天未更新的条目。"
+                "请再次调用并传 confirm=true。"
+            )
+        n = self.long_term.archive_low_access(
+            min_hits=min_hits, older_than_days=older_than_days
+        )
+        return f"已归档 {n} 条低访问记忆 → {self.long_term.persist_dir / 'declarative_archive.jsonl'}"
+
+    def list_packs(self) -> dict:
+        """列出本地已导出的知识包。"""
+        from .pack import list_local_packs, packs_dir
+
+        items = list_local_packs(self.long_term.persist_dir)
+        return {
+            "packs": items,
+            "dir": str(packs_dir(self.long_term.persist_dir)),
+            "hint": "把 JSON 文件发给同事后，用 memory_import_pack / pack-import 合并导入。",
+        }
+
+    def check_git_changes(
+        self,
+        cwd: Optional[str] = None,
+        *,
+        since_ref: str = "HEAD~20",
+        max_files: int = 80,
+        limit: int = 8,
+    ) -> dict:
+        """对照 Git 变更，找出可能过时的记忆（只读 git）。"""
+        from .git_sense import find_stale_memories, list_changed_paths, resolve_git_root
+
+        root = resolve_git_root(cwd)
+        if root is None:
+            return {
+                "git_root": None,
+                "changed_paths": [],
+                "stale": [],
+                "hint": "当前目录不是 git 仓库（或找不到 git）。可传 cwd 为项目根路径。",
+            }
+        self.long_term.reload()
+        changed = list_changed_paths(
+            str(root), since_ref=since_ref, max_files=max_files
+        )
+        stale = find_stale_memories(self.long_term.records, changed, limit=limit)
+        return {
+            "git_root": str(root),
+            "changed_paths": changed,
+            "stale": [h.as_dict() for h in stale],
+            "hint": (
+                "若 stale 非空，请核对后更新或 forget 对应记忆；"
+                "确认仍有效可用 memory_remember 强化。"
+                if stale
+                else "未发现与近期变更强相关的记忆，或仓库暂无匹配文件变更。"
+            ),
+        }
+
+    def suggest_review_notes(
+        self,
+        cwd: Optional[str] = None,
+        *,
+        max_hints: int = 3,
+    ) -> dict:
+        """从近期 commit 提炼可沉淀的协作习惯候选（不写盘）。"""
+        from .git_sense import suggest_review_habits
+
+        hints = suggest_review_habits(cwd, max_hints=max_hints)
+        return {
+            "candidates": [h.as_dict() for h in hints],
+            "hint": "确认后请 memory_remember；适合记团队约定 / Review 偏好。",
+        }
+
+    def bookmark_feishu(self, text: str) -> dict:
+        """拉取飞书链接正文，生成待确认记忆候选（不写盘）。"""
+        from .feishu_bookmark import build_feishu_bookmark_candidates
+
+        cfg = getattr(self.config, "feishu", None)
+        return build_feishu_bookmark_candidates(
+            cfg, text, config_path=self.config_path
         )
 
     def forget(self, keyword: Optional[str] = None, layer: str = "all") -> str:
@@ -374,6 +581,9 @@ class MemorySandbox:
                 "question": rec.question,
                 "answer": rec.answer,
                 "scene": rec.scene,
+                "tags": list(rec.tags or []),
+                "kind": rec.kind or "qa",
+                "facts": dict(rec.facts or {}),
                 "weight": round(rec.weight, 3),
                 "hit_count": rec.hit_count,
                 "keywords": rec.keywords,
@@ -407,8 +617,10 @@ class MemorySandbox:
                 parts.append("  （空）")
             else:
                 for i, rec in enumerate(data["declarative"], 1):
+                    tag_s = f" #{' #'.join(rec['tags'])}" if rec.get("tags") else ""
+                    kind_s = f"/{rec['kind']}" if rec.get("kind") and rec["kind"] != "qa" else ""
                     parts.append(
-                        f"  {i}. [{rec['scene']}] Q: {rec['question']}\n"
+                        f"  {i}. [{rec['scene']}{kind_s}{tag_s}] Q: {rec['question']}\n"
                         f"     A: {rec['answer']}  "
                         f"(命中{rec['hit_count']} 权重{rec['weight']})"
                     )
@@ -448,7 +660,7 @@ class MemorySandbox:
         # 高频短问答沉淀进工作记忆 FAQ，进一步减少模型调用
         if persist_long and len(question) <= 20 and len(answer) <= 80:
             hits = self.long_term.search_hits(question, query_vec=vec, threshold=0.9, top_k=1)
-            if hits and hits[0][0].hit_count >= 3:
+            if hits and hits[0].record.hit_count >= 3:
                 self.working.rule_engine.add_faq(question, answer)
 
     def _handle_command(self, raw: str) -> Optional[ChatResult]:

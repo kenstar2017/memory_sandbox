@@ -40,6 +40,12 @@ alwaysApply: true
 - `question`：精简问法或用户 `original`（不要只写「帮我看看」）
 - `answer`：稳定结论（原因 + 做法 + 关键路径/命令）
 - `scene`：可用 `dev`
+- `tags`：可选，如 `["feishu","frontend"]`；也可在 question 写 `#tag`
+- `kind` / `facts`：可选结构化类型（command/path/env/pitfall/decision）
+- 命中时可读 `hits` / `explain`（分数与别名/场景/标签原因），便于纠错或 `forget`
+- 终端/日志可先 `memory_extract` 得候选，确认后再 `memory_remember`（写入自动脱敏）
+- 知识包分享：`memory_export_pack` / `memory_import_pack`；很久不用的用 `memory_archive`
+- 改完代码可 `memory_git_check` 扫过时记忆；飞书文档可用 `memory_feishu_bookmark` 再确认写入
 
 例外（可不写）：
 

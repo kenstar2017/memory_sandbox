@@ -107,11 +107,21 @@ class LongTermConfig:
     top_k: int = 3
     persist_dir: str = "data/memory"
     reinforce_boost: float = 0.05
+    # 混合检索权重（vector + keyword + bm25，建议和为 1）
+    bm25_enabled: bool = True
+    vector_weight: float = 0.55
+    keyword_weight: float = 0.20
+    bm25_weight: float = 0.25
+    # 很久未命中时检索降权；归档命令用同一天数阈值
+    aging_enabled: bool = True
+    aging_days: float = 90.0
+    aging_min_hits: int = 0
+    aging_decay: float = 0.15  # 最高再扣 15% 分数
 
 
 @dataclass
 class EmbeddingConfig:
-    dim: int = 256
+    dim: int = 256  # 改维度后需 reoptimize 刷新向量
 
 
 @dataclass

@@ -53,13 +53,39 @@ Agent 会调用这些工具：
 
 | 工具 | 作用 |
 |------|------|
-| `memory_ask` | 先查本地三级记忆 |
-| `memory_remember` | 固化可复用结论 |
+| `memory_prepare` | **每轮首选**：拼接「记录到长期记忆」后检索本地三级记忆 |
+| `memory_ask` | 原样检索（不自动拼后缀） |
+| `memory_remember` | 固化可复用结论（可带 `tags`） |
 | `memory_forget` | 主动遗忘 |
 | `memory_status` | 查看记忆统计 |
 | `memory_set_scene` | 切换场景（如 `dev`） |
 
-项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_ask`，命中则直接用；未命中再推理，并把稳定结论 `memory_remember`。**
+项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_prepare`，命中则直接用；未命中再推理，并把稳定结论 `memory_remember`。**
+
+### 标签与类型（更好找）
+
+- 写入时可带标签，如 `feishu`、`frontend`；问题里写 `#tag` 也可以
+- 可标明类型：普通问答 / 命令 / 路径 / 环境变量 / 踩坑 / 决策
+- 命中时会带上分数和原因（为什么会命中），方便核对或删除
+
+### 省事与安全
+
+- 粘贴终端/日志可先「提炼候选」，确认后再记住
+- 写入时自动遮盖 token、密钥、私钥等敏感内容
+- 网页左侧可按标签筛选，并编辑标签与类型
+
+### 搜得更准、能分享
+
+- 检索同时看语义向量、关键词和 BM25（权重可在 `config.yaml` 调）
+- 很久没用的条目会在检索时降权，也可一键归档
+- 可导出「知识包」发给同事，对方合并导入即可（不含向量、已脱敏）
+
+### 跟着代码变、和飞书联动
+
+- `git-check`：对照 Git 变更，提示哪些记忆可能过时
+- `review-suggest`：从近期提交提示可沉淀的协作习惯
+- `feishu-bookmark`：把飞书文档拉成待确认记忆（需先登录飞书）
+- `pack-list`：查看本机已导出的知识包
 
 记忆数据与桌面 App 共用：
 
@@ -109,7 +135,7 @@ python3 app_web.py
 ./scripts/memory ask "revenue 怎么本地启动"
 ./scripts/memory ask --local "PK组件"          # 只查本地，不调沙箱 LLM
 ./scripts/memory prepare "revenue怎么启动"     # 拼接「记录到长期记忆」后查本地
-./scripts/memory remember "问" "答" --scene dev
+./scripts/memory remember "问" "答" --scene dev --tag feishu
 ./scripts/memory list --layer long_term
 ./scripts/memory status
 ./scripts/memory backup

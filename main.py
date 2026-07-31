@@ -125,7 +125,8 @@ def build_parser() -> argparse.ArgumentParser:
   %(prog)s ask "revenue 怎么本地启动"
   %(prog)s ask --local "PK组件"          # 只查本地，不调沙箱 LLM
   %(prog)s prepare "revenue怎么启动"     # 拼接「记录到长期记忆」后查本地
-  %(prog)s remember "问" "答" --scene dev
+  %(prog)s remember "问" "答" --scene dev --tag feishu --kind command --fact "pnpm build"
+  %(prog)s extract "\$ pnpm build\\nError: missing env"
   %(prog)s list --layer long_term
   %(prog)s status
   %(prog)s backup
@@ -173,6 +174,31 @@ def build_parser() -> argparse.ArgumentParser:
     sp.add_argument("question", help="问题 / 检索键")
     sp.add_argument("answer", help="答案 / 知识")
     sp.add_argument("--scene", default="dev", help="场景标签，默认 dev")
+    sp.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        dest="tags",
+        help="标签，可重复：--tag feishu --tag frontend",
+    )
+    sp.add_argument(
+        "--kind",
+        default="qa",
+        choices=["qa", "command", "path", "env", "pitfall", "decision"],
+        help="结构化类型，默认 qa",
+    )
+    sp.add_argument("--fact", default="", help="对应 kind 的结构化值，如命令或路径")
+
+    sp = sub.add_parser("extract", help="从终端/日志文本提炼候选记忆（不写盘）")
+    sp.add_argument("text", nargs="?", default="", help="文本；省略则从 stdin 读")
+    sp.add_argument("--max", dest="max_n", type=int, default=3, help="最多条数")
+    sp.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        dest="tags",
+        help="建议标签",
+    )
 
     # list
     sp = sub.add_parser("list", help="列出记忆内容")
@@ -186,9 +212,47 @@ def build_parser() -> argparse.ArgumentParser:
     # status
     sub.add_parser("status", help="打印各层统计")
 
-    # backup / restore
+    # backup / restore / pack / archive
     sp = sub.add_parser("backup", help="备份长时记忆")
     sp.add_argument("--dest", default=None, help="备份文件或目录路径")
+
+    sp = sub.add_parser("pack-export", help="导出可分享知识包（无向量、已脱敏）")
+    sp.add_argument("--name", default="memory-pack", help="包名")
+    sp.add_argument("--dest", default=None, help="输出文件或目录")
+    sp.add_argument("--description", default="", help="说明")
+    sp.add_argument(
+        "--tag",
+        action="append",
+        default=[],
+        dest="filter_tags",
+        help="按标签过滤，可重复",
+    )
+    sp.add_argument("--scene", default="", dest="filter_scene", help="按场景过滤")
+    sp.add_argument("--limit", type=int, default=500)
+
+    sp = sub.add_parser("pack-import", help="导入知识包（默认合并）")
+    sp.add_argument("path", help="知识包 JSON 路径")
+    sp.add_argument("--replace", action="store_true", help="覆盖导入（先清空）")
+    sp.add_argument("--yes", action="store_true", help="覆盖时跳过确认")
+
+    sp = sub.add_parser("archive", help="把很久没用的记忆挪到归档")
+    sp.add_argument("--days", type=float, default=None, help="超过多少天未更新")
+    sp.add_argument("--min-hits", type=int, default=None, help="命中次数上限")
+    sp.add_argument("--yes", action="store_true", help="确认执行")
+
+    sub.add_parser("pack-list", help="列出本机已导出的知识包")
+
+    sp = sub.add_parser("git-check", help="对照 Git 变更，找出可能过时的记忆")
+    sp.add_argument("--cwd", default=None, help="项目目录")
+    sp.add_argument("--since", default="HEAD~20", help="对比起点，默认 HEAD~20")
+    sp.add_argument("--limit", type=int, default=8)
+
+    sp = sub.add_parser("review-suggest", help="从近期 commit 提示可沉淀的协作习惯")
+    sp.add_argument("--cwd", default=None, help="项目目录")
+    sp.add_argument("--max", dest="max_hints", type=int, default=3)
+
+    sp = sub.add_parser("feishu-bookmark", help="把飞书链接拉成待确认记忆候选")
+    sp.add_argument("text", nargs="+", help="含飞书链接的文本")
 
     sp = sub.add_parser("restore", help="从备份恢复长时记忆（覆盖）")
     sp.add_argument("--path", default=None, help="备份文件；省略则用最新一份")
@@ -329,7 +393,104 @@ def main(argv=None) -> int:
         return 0
 
     if cmd == "remember":
-        print(sb.remember(args.question, args.answer, scene=args.scene))
+        kind = getattr(args, "kind", None) or "qa"
+        fact = (getattr(args, "fact", None) or "").strip()
+        facts = {kind: fact} if fact and kind != "qa" else None
+        print(
+            sb.remember(
+                args.question,
+                args.answer,
+                scene=args.scene,
+                tags=getattr(args, "tags", None) or None,
+                kind=kind,
+                facts=facts,
+            )
+        )
+        return 0
+
+    if cmd == "extract":
+        text = (getattr(args, "text", None) or "").strip()
+        if not text:
+            text = sys.stdin.read()
+        payload = sb.extract_candidates(
+            text,
+            max_n=getattr(args, "max_n", 3) or 3,
+            tags=getattr(args, "tags", None) or None,
+        )
+        print(json.dumps(payload, ensure_ascii=False, indent=2))
+        return 0
+
+    if cmd == "pack-export":
+        print(
+            sb.export_pack(
+                name=getattr(args, "name", None) or "memory-pack",
+                dest=getattr(args, "dest", None),
+                description=getattr(args, "description", "") or "",
+                filter_tags=getattr(args, "filter_tags", None) or None,
+                filter_scene=(getattr(args, "filter_scene", None) or "").strip() or None,
+                limit=getattr(args, "limit", 500) or 500,
+            )
+        )
+        return 0
+
+    if cmd == "pack-import":
+        merge = not bool(getattr(args, "replace", False))
+        if not merge and not getattr(args, "yes", False):
+            print("覆盖导入会清空现有长时记忆。请加 --yes 确认。", file=sys.stderr)
+            return 2
+        print(
+            sb.import_pack(
+                args.path,
+                merge=merge,
+                confirm=bool(getattr(args, "yes", False)) or merge,
+            )
+        )
+        return 0
+
+    if cmd == "archive":
+        print(
+            sb.archive_stale(
+                min_hits=getattr(args, "min_hits", None),
+                older_than_days=getattr(args, "days", None),
+                confirm=bool(getattr(args, "yes", False)),
+            )
+        )
+        return 0
+
+    if cmd == "pack-list":
+        print(json.dumps(sb.list_packs(), ensure_ascii=False, indent=2))
+        return 0
+
+    if cmd == "git-check":
+        print(
+            json.dumps(
+                sb.check_git_changes(
+                    cwd=getattr(args, "cwd", None),
+                    since_ref=getattr(args, "since", None) or "HEAD~20",
+                    limit=getattr(args, "limit", 8) or 8,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if cmd == "review-suggest":
+        print(
+            json.dumps(
+                sb.suggest_review_notes(
+                    cwd=getattr(args, "cwd", None),
+                    max_hints=getattr(args, "max_hints", 3) or 3,
+                ),
+                ensure_ascii=False,
+                indent=2,
+            )
+        )
+        return 0
+
+    if cmd == "feishu-bookmark":
+        text = " ".join(getattr(args, "text", []) or []).strip()
+        print(json.dumps(sb.bookmark_feishu(text), ensure_ascii=False, indent=2))
         return 0
 
     if cmd == "list":

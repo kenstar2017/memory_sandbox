@@ -23,7 +23,7 @@ from core.utils import assemble_long_term_query
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-sandbox"
-SERVER_VERSION = "0.1.5"
+SERVER_VERSION = "0.1.9"
 
 # 懒加载：initialize / tools/list 不触盘，避免多窗口 createClient 卡在启动
 _SANDBOX: Optional[MemorySandbox] = None
@@ -58,7 +58,12 @@ TOOLS: List[Dict[str, Any]] = [
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "用户原话 / 想解决的问题（不必手写「记录到长期记忆」）",
+                    "description": "用户原话 / 想解决的问题（不必手写「记录到长期记忆」；可用 #tag 过滤）",
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选：仅在这些标签内检索",
                 },
             },
             "required": ["query"],
@@ -74,7 +79,12 @@ TOOLS: List[Dict[str, Any]] = [
         "inputSchema": {
             "type": "object",
             "properties": {
-                "query": {"type": "string", "description": "用户问题或检索语句"},
+                "query": {"type": "string", "description": "用户问题或检索语句（可用 #tag）"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选：仅在这些标签内检索",
+                },
             },
             "required": ["query"],
         },
@@ -82,8 +92,9 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "memory_remember",
         "description": (
-            "把一条问答/知识点写入长时记忆，供后续 memory_ask 命中。"
+            "把一条问答/知识点写入长时记忆，供后续 memory_prepare / memory_ask 命中。"
             "适合固化：启动命令、环境注意点、踩坑结论、团队约定。"
+            "可用 tags / kind / facts；写入前自动脱敏 token/.env/密钥。"
         ),
         "inputSchema": {
             "type": "object",
@@ -95,8 +106,46 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": "场景标签，如 dev / agency / general",
                     "default": "dev",
                 },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选标签列表，如 [\"feishu\", \"frontend\"]",
+                },
+                "kind": {
+                    "type": "string",
+                    "enum": ["qa", "command", "path", "env", "pitfall", "decision"],
+                    "description": "结构化类型，默认 qa",
+                },
+                "facts": {
+                    "type": "object",
+                    "description": "可选结构化字段：command/path/env/pitfall/decision",
+                },
             },
             "required": ["question", "answer"],
+        },
+    },
+    {
+        "name": "memory_extract",
+        "description": (
+            "从终端输出 / diff / 日志文本中启发式提炼 1~3 条候选记忆（不写盘）。"
+            "确认后请对选中项调用 memory_remember。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "终端或日志原文"},
+                "max_n": {
+                    "type": "integer",
+                    "description": "最多返回条数，默认 3",
+                    "default": 3,
+                },
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "建议打上的标签",
+                },
+            },
+            "required": ["text"],
         },
     },
     {
@@ -138,6 +187,122 @@ TOOLS: List[Dict[str, Any]] = [
                     "description": "可选：备份文件或目录路径；默认写到记忆目录 backups/",
                 },
             },
+        },
+    },
+    {
+        "name": "memory_export_pack",
+        "description": (
+            "导出一份可发给同事的知识包（去掉向量、遮盖密钥）。可按标签/场景过滤。"
+            "默认写到记忆目录 packs/。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "name": {"type": "string", "description": "知识包名称", "default": "memory-pack"},
+                "dest": {"type": "string", "description": "输出文件或目录"},
+                "description": {"type": "string", "description": "包说明"},
+                "filter_tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "只导出带这些标签的记忆",
+                },
+                "filter_scene": {"type": "string", "description": "只导出该 scene"},
+                "limit": {"type": "integer", "default": 500},
+            },
+        },
+    },
+    {
+        "name": "memory_import_pack",
+        "description": "导入同事发来的知识包。默认合并；若要清空再导入需 merge=false 且 confirm=true。",
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "知识包 JSON 路径"},
+                "merge": {"type": "boolean", "default": True},
+                "confirm": {
+                    "type": "boolean",
+                    "description": "merge=false 时必须为 true",
+                    "default": False,
+                },
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "name": "memory_archive",
+        "description": (
+            "把很久没用过的长时记忆挪到归档文件，避免主库越堆越乱。"
+            "需 confirm=true；默认天数见配置 aging_days。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "older_than_days": {"type": "number", "description": "超过多少天未更新"},
+                "min_hits": {"type": "integer", "description": "命中次数上限（含）"},
+                "confirm": {"type": "boolean", "default": False},
+            },
+        },
+    },
+    {
+        "name": "memory_list_packs",
+        "description": "列出本机已导出的知识包文件，方便发给同事或再次导入。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "memory_git_check",
+        "description": (
+            "对照当前 Git 变更，找出可能已经过时的本地记忆（只读 git，不改仓库）。"
+            "适合改完代码后扫一眼「旧经验还对不对」。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cwd": {
+                    "type": "string",
+                    "description": "项目目录；省略则用当前进程目录",
+                },
+                "since_ref": {
+                    "type": "string",
+                    "description": "对比起点，默认 HEAD~20",
+                    "default": "HEAD~20",
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "最多返回多少条可疑记忆",
+                    "default": 8,
+                },
+            },
+        },
+    },
+    {
+        "name": "memory_review_suggest",
+        "description": (
+            "根据近期 git commit 信息，提示可沉淀的协作习惯/约定（不写盘）。"
+            "确认后再 memory_remember。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "cwd": {"type": "string", "description": "项目目录"},
+                "max_hints": {"type": "integer", "default": 3},
+            },
+        },
+    },
+    {
+        "name": "memory_feishu_bookmark",
+        "description": (
+            "把飞书文档链接拉成「待确认记忆」候选（需已配置并登录飞书）。"
+            "确认后再 memory_remember；不会自动写入。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "含飞书 wiki/docx 链接的文本",
+                },
+            },
+            "required": ["text"],
         },
     },
     {
@@ -220,15 +385,48 @@ def _scrub_mock_working() -> None:
     ]
 
 
-def _ask_payload(query: str) -> Dict[str, Any]:
+def _ask_payload(query: str, tags: Optional[List[str]] = None) -> Dict[str, Any]:
     """MCP 专用：只读本地记忆，不调用沙箱内 LLM。"""
     _scrub_mock_working()
-    result = _sandbox().ask_local(query)
+    sb = _sandbox()
+    # 显式 tags：走长时检索并附带可解释命中；否则走完整三级 ask_local
+    if tags:
+        from core.tags import merge_tags, parse_tags_from_text
+
+        merged = merge_tags(parse_tags_from_text(query), tags)
+        hits = sb.long_term.search_hits(query, scene=sb.working.scene, tags=merged)
+        if hits:
+            sb.long_term.reinforce_hits(hits)
+            hit_meta = [h.as_dict() for h in hits]
+            return {
+                "answer": sb.long_term.format_hit_answers(hits),
+                "source": "long_term",
+                "hit_local": True,
+                "hits": hit_meta,
+                "explain": hit_meta[0]["reasons"],
+                "hint": "已命中本地记忆，可直接采用答案，无需再大段推理。",
+            }
+        return {
+            "answer": "",
+            "source": "miss",
+            "hit_local": False,
+            "hits": [],
+            "explain": [],
+            "hint": (
+                "本地记忆未命中（未调用沙箱 LLM）；请用当前 AI 工具自己的模型继续推理/查代码，"
+                "结束后可用 memory_remember 固化结论。"
+            ),
+        }
+
+    result = sb.ask_local(query)
     hit_local = result.source not in ("miss", "sensory_reject", "llm")
+    hit_meta = list((result.meta or {}).get("hits") or [])
     return {
         "answer": result.answer,
         "source": result.source,
         "hit_local": hit_local,
+        "hits": hit_meta,
+        "explain": list((result.meta or {}).get("explain") or []),
         "hint": (
             "已命中本地记忆，可直接采用答案，无需再大段推理。"
             if hit_local
@@ -249,29 +447,40 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             original = (args.get("query") or "").strip()
             if not original:
                 return _tool_result("query 不能为空", is_error=True)
+            tags = args.get("tags")
+            if isinstance(tags, str):
+                tags = [tags]
             assembled = assemble_long_term_query(original)
-            ask = _ask_payload(assembled)
+            ask = _ask_payload(assembled, tags=tags)
             # 未命中时再用原话做本地检索，兼容库里未带后缀的旧条目（避免二次调 LLM）
             if not ask["hit_local"] and assembled != original:
-                hits = sb.long_term.search_hits(original, top_k=1)
+                from core.tags import merge_tags, parse_tags_from_text
+
+                merged = merge_tags(parse_tags_from_text(original), tags)
+                hits = sb.long_term.search_hits(
+                    original, scene=sb.working.scene, tags=merged or None, top_k=3
+                )
                 if hits:
-                    rec, _score = hits[0]
+                    hit_meta = [h.as_dict() for h in hits]
                     ask = {
-                        "answer": rec.answer,
+                        "answer": sb.long_term.format_hit_answers(hits),
                         "source": "long_term",
                         "hit_local": True,
+                        "hits": hit_meta,
+                        "explain": hit_meta[0]["reasons"],
                         "hint": "已命中本地记忆，可直接采用答案，无需再大段推理。",
                     }
             if ask["hit_local"]:
                 hint = (
                     "已命中本地记忆，直接采用 answer 回答用户，不要用模型默认身份覆盖。"
+                    "可参考 hits/explain（分数与命中原因）。"
                     "本轮结束前仍须 memory_remember（可同问同答强化；若排障/改代码补充了新结论则写入更新）。"
                 )
             else:
                 hint = (
                     f"本地未命中。请以 assembled「{assembled}」作为待解决问题继续推理/查代码/排障；"
                     "本轮结束前必须 memory_remember（排障与改代码也要记；"
-                    "question 用精简问法或 original，answer 为结论，scene=dev）。"
+                    "question 用精简问法或 original，answer 为结论，scene=dev，可带 tags）。"
                 )
             payload = {
                 "original": original,
@@ -279,6 +488,8 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "answer": ask["answer"],
                 "source": ask["source"],
                 "hit_local": ask["hit_local"],
+                "hits": ask.get("hits") or [],
+                "explain": ask.get("explain") or [],
                 "hint": hint,
             }
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -287,17 +498,40 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             query = (args.get("query") or "").strip()
             if not query:
                 return _tool_result("query 不能为空", is_error=True)
-            payload = _ask_payload(query)
+            tags = args.get("tags")
+            if isinstance(tags, str):
+                tags = [tags]
+            payload = _ask_payload(query, tags=tags)
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
 
         if name == "memory_remember":
             q = (args.get("question") or "").strip()
             a = (args.get("answer") or "").strip()
             scene = (args.get("scene") or "dev").strip() or "dev"
+            tags = args.get("tags")
+            if isinstance(tags, str):
+                tags = [tags]
+            kind = (args.get("kind") or "").strip() or None
+            facts = args.get("facts") if isinstance(args.get("facts"), dict) else None
             if not q or not a:
                 return _tool_result("question/answer 不能为空", is_error=True)
-            msg = sb.remember(q, a, scene=scene)
+            msg = sb.remember(q, a, scene=scene, tags=tags, kind=kind, facts=facts)
             return _tool_result(msg)
+
+        if name == "memory_extract":
+            text = args.get("text") or ""
+            if not str(text).strip():
+                return _tool_result("text 不能为空", is_error=True)
+            tags = args.get("tags")
+            if isinstance(tags, str):
+                tags = [tags]
+            max_n = args.get("max_n", 3)
+            try:
+                max_n = int(max_n)
+            except (TypeError, ValueError):
+                max_n = 3
+            payload = sb.extract_candidates(str(text), max_n=max(1, min(max_n, 8)), tags=tags)
+            return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
 
         if name == "memory_forget":
             keyword = args.get("keyword")
@@ -331,6 +565,89 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
         if name == "memory_backup":
             dest = (args.get("dest") or "").strip() or None
             return _tool_result(sb.backup_long_term(dest))
+
+        if name == "memory_export_pack":
+            filter_tags = args.get("filter_tags")
+            if isinstance(filter_tags, str):
+                filter_tags = [filter_tags]
+            try:
+                limit = int(args.get("limit") or 500)
+            except (TypeError, ValueError):
+                limit = 500
+            msg = sb.export_pack(
+                name=(args.get("name") or "memory-pack").strip() or "memory-pack",
+                dest=(args.get("dest") or "").strip() or None,
+                description=(args.get("description") or "").strip(),
+                filter_tags=filter_tags,
+                filter_scene=(args.get("filter_scene") or "").strip() or None,
+                limit=max(1, min(limit, 5000)),
+            )
+            return _tool_result(msg)
+
+        if name == "memory_import_pack":
+            path = (args.get("path") or "").strip()
+            if not path:
+                return _tool_result("path 不能为空", is_error=True)
+            merge = args.get("merge")
+            if merge is None:
+                merge = True
+            msg = sb.import_pack(
+                path, merge=bool(merge), confirm=bool(args.get("confirm"))
+            )
+            err = msg.startswith("覆盖导入需")
+            return _tool_result(msg, is_error=err)
+
+        if name == "memory_archive":
+            older = args.get("older_than_days")
+            min_hits = args.get("min_hits")
+            try:
+                older_f = float(older) if older is not None else None
+            except (TypeError, ValueError):
+                older_f = None
+            try:
+                hits_i = int(min_hits) if min_hits is not None else None
+            except (TypeError, ValueError):
+                hits_i = None
+            msg = sb.archive_stale(
+                min_hits=hits_i,
+                older_than_days=older_f,
+                confirm=bool(args.get("confirm")),
+            )
+            needs = msg.startswith("将归档")
+            return _tool_result(msg, is_error=needs)
+
+        if name == "memory_list_packs":
+            return _tool_result(json.dumps(sb.list_packs(), ensure_ascii=False, indent=2))
+
+        if name == "memory_git_check":
+            try:
+                limit = int(args.get("limit") or 8)
+            except (TypeError, ValueError):
+                limit = 8
+            payload = sb.check_git_changes(
+                cwd=(args.get("cwd") or "").strip() or None,
+                since_ref=(args.get("since_ref") or "HEAD~20").strip() or "HEAD~20",
+                limit=max(1, min(limit, 30)),
+            )
+            return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        if name == "memory_review_suggest":
+            try:
+                max_hints = int(args.get("max_hints") or 3)
+            except (TypeError, ValueError):
+                max_hints = 3
+            payload = sb.suggest_review_notes(
+                cwd=(args.get("cwd") or "").strip() or None,
+                max_hints=max(1, min(max_hints, 10)),
+            )
+            return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        if name == "memory_feishu_bookmark":
+            text = (args.get("text") or "").strip()
+            if not text:
+                return _tool_result("text 不能为空", is_error=True)
+            payload = sb.bookmark_feishu(text)
+            return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
 
         if name == "memory_restore":
             if not bool(args.get("confirm")):

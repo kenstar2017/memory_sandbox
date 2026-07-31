@@ -373,6 +373,16 @@ def main(argv=None) -> int:
             result2 = sb.ask_local(original)
             if result2.source != "miss":
                 result = result2
+        # 软召回参考：assembled + 原话合并去重
+        hits = sb.collect_references(assembled, top_k=5)
+        if assembled != original:
+            seen = {h.record.id for h in hits}
+            for h in sb.collect_references(original, top_k=5):
+                if h.record.id not in seen:
+                    hits.append(h)
+                    seen.add(h.record.id)
+            hits = hits[:5]
+        context_pack = sb.long_term.format_context_pack(hits)
         if as_json:
             print(
                 json.dumps(
@@ -381,7 +391,11 @@ def main(argv=None) -> int:
                         "assembled": assembled,
                         "answer": result.answer,
                         "source": result.source,
-                        "hit_local": result.source not in ("miss", "sensory_reject", "llm"),
+                        "hit_local": result.source
+                        not in ("miss", "sensory_reject", "llm"),
+                        "references": [h.as_dict() for h in hits],
+                        "context_pack": context_pack,
+                        "ref_threshold": sb.long_term.soft_threshold(),
                     },
                     ensure_ascii=False,
                     indent=2,
@@ -390,6 +404,8 @@ def main(argv=None) -> int:
         else:
             print(f"assembled: {assembled}", file=sys.stderr)
             _print_result(result, False)
+            if context_pack:
+                print(context_pack, file=sys.stderr)
         return 0
 
     if cmd == "remember":

@@ -23,7 +23,7 @@ from core.utils import assemble_long_term_query
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-sandbox"
-SERVER_VERSION = "0.1.9"
+SERVER_VERSION = "0.1.10"
 
 # 懒加载：initialize / tools/list 不触盘，避免多窗口 createClient 卡在启动
 _SANDBOX: Optional[MemorySandbox] = None
@@ -50,7 +50,8 @@ TOOLS: List[Dict[str, Any]] = [
         "description": (
             "每轮对话的首选入口：把用户问题拼成「xxxx，记录到长期记忆。」并只检索本地三级记忆"
             "（感觉/工作/长时），绝不调用记忆沙箱内的 LLM。"
-            "命中则直接采用 answer；未命中（hit_local=false）由当前 AI 工具自己的模型继续推理，"
+            "始终返回 references/context_pack（多条软召回参考问答）供结合当前项目上下文使用；"
+            "hit_local=true 时另有 answer。改代码/做功能时以仓库为准、沙箱仅作参考；"
             "结束后 memory_remember。纯管理指令可跳过本工具。"
         ),
         "inputSchema": {
@@ -65,6 +66,11 @@ TOOLS: List[Dict[str, Any]] = [
                     "items": {"type": "string"},
                     "description": "可选：仅在这些标签内检索",
                 },
+                "ref_top_k": {
+                    "type": "integer",
+                    "description": "软召回参考问答条数，默认 5，最大 20",
+                    "default": 5,
+                },
             },
             "required": ["query"],
         },
@@ -73,7 +79,7 @@ TOOLS: List[Dict[str, Any]] = [
         "name": "memory_ask",
         "description": (
             "向本地记忆沙箱提问：仅检索感觉/工作/长时记忆，绝不调用沙箱内 LLM。"
-            "命中则直接返回答案；未命中 hit_local=false，由当前 AI 工具自己的模型继续。"
+            "返回 hit_local/answer，并始终附带 references/context_pack 多条参考问答。"
             "一般对话请优先用 memory_prepare（会自动拼接「记录到长期记忆」）。"
         ),
         "inputSchema": {
@@ -84,6 +90,11 @@ TOOLS: List[Dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "string"},
                     "description": "可选：仅在这些标签内检索",
+                },
+                "ref_top_k": {
+                    "type": "integer",
+                    "description": "软召回参考问答条数，默认 5，最大 20",
+                    "default": 5,
                 },
             },
             "required": ["query"],
@@ -385,8 +396,101 @@ def _scrub_mock_working() -> None:
     ]
 
 
-def _ask_payload(query: str, tags: Optional[List[str]] = None) -> Dict[str, Any]:
-    """MCP 专用：只读本地记忆，不调用沙箱内 LLM。"""
+def _parse_ref_top_k(raw: Any, default: int = 5) -> int:
+    try:
+        n = int(raw if raw is not None else default)
+    except (TypeError, ValueError):
+        n = default
+    return max(1, min(n, 20))
+
+
+def _context_pack_from_dicts(
+    refs: List[Dict[str, Any]],
+    *,
+    max_answer_chars: int = 800,
+) -> str:
+    """由 references dict 列表拼 context_pack（不依赖 SearchHit）。"""
+    if not refs:
+        return ""
+    blocks: List[str] = [
+        "【记忆沙箱 · 参考问答】以下为相关历史结论，供结合当前项目上下文使用；"
+        "可能过时，以仓库/现状为准，勿直接当作最终实现。"
+    ]
+    for i, r in enumerate(refs, 1):
+        ans = str(r.get("answer") or "").strip()
+        if max_answer_chars > 0 and len(ans) > max_answer_chars:
+            ans = ans[:max_answer_chars].rstrip() + "…"
+        tags = r.get("tags") or []
+        tag_s = f" tags={','.join(tags)}" if tags else ""
+        reasons = r.get("reasons") or []
+        reason_s = "/".join(reasons[:4]) if reasons else ""
+        score = r.get("score")
+        try:
+            score_s = f"{float(score):.2f}"
+        except (TypeError, ValueError):
+            score_s = str(score or "")
+        meta = f"score={score_s}{tag_s}"
+        if reason_s:
+            meta += f" reasons={reason_s}"
+        blocks.append(
+            f"### 参考问答 {i}\n"
+            f"问：{r.get('question') or ''}\n"
+            f"答：{ans}\n"
+            f"（{meta}）"
+        )
+    return "\n\n".join(blocks)
+
+
+def _attach_references(
+    payload: Dict[str, Any],
+    query: str,
+    *,
+    tags: Optional[List[str]] = None,
+    ref_top_k: int = 5,
+) -> Dict[str, Any]:
+    """始终附带软召回参考问答（供 Cursor 结合项目上下文使用）。"""
+    sb = _sandbox()
+    pack = sb.build_reference_pack(query, tags=tags, top_k=ref_top_k)
+    payload["references"] = pack["references"]
+    payload["context_pack"] = pack["context_pack"]
+    payload["ref_threshold"] = pack["ref_threshold"]
+    return payload
+
+
+def _hint_with_references(
+    *,
+    hit_local: bool,
+    has_refs: bool,
+    assembled: str = "",
+) -> str:
+    ref_note = (
+        "请阅读 references / context_pack：把其中问答当「参考」纳入本轮推理，"
+        "并结合当前仓库/用户上下文解决用户问题；参考可能过时，以仓库为准。"
+        if has_refs
+        else "无相关参考问答。"
+    )
+    if hit_local:
+        return (
+            "已有硬命中 answer。"
+            "若用户只是复述事实、无需改代码，可优先采用 answer（勿用模型默认身份覆盖）。"
+            "若在改功能/查代码/排障：不要因命中而短路，" + ref_note +
+            "结束后 memory_remember。"
+        )
+    base = (
+        f"本地未硬命中。请以 assembled「{assembled}」为待解决问题继续推理/查代码/排障；"
+        if assembled
+        else "本地未硬命中（未调用沙箱 LLM）；请用当前 AI 工具继续推理/查代码；"
+    )
+    return base + ref_note + "本轮结束前必须 memory_remember（scene=dev，可带 tags）。"
+
+
+def _ask_payload(
+    query: str,
+    tags: Optional[List[str]] = None,
+    *,
+    ref_top_k: int = 5,
+) -> Dict[str, Any]:
+    """MCP 专用：只读本地记忆，不调用沙箱内 LLM；始终附带 references。"""
     _scrub_mock_working()
     sb = _sandbox()
     # 显式 tags：走长时检索并附带可解释命中；否则走完整三级 ask_local
@@ -398,42 +502,39 @@ def _ask_payload(query: str, tags: Optional[List[str]] = None) -> Dict[str, Any]
         if hits:
             sb.long_term.reinforce_hits(hits)
             hit_meta = [h.as_dict() for h in hits]
-            return {
+            payload = {
                 "answer": sb.long_term.format_hit_answers(hits),
                 "source": "long_term",
                 "hit_local": True,
                 "hits": hit_meta,
                 "explain": hit_meta[0]["reasons"],
-                "hint": "已命中本地记忆，可直接采用答案，无需再大段推理。",
             }
-        return {
-            "answer": "",
-            "source": "miss",
-            "hit_local": False,
-            "hits": [],
-            "explain": [],
-            "hint": (
-                "本地记忆未命中（未调用沙箱 LLM）；请用当前 AI 工具自己的模型继续推理/查代码，"
-                "结束后可用 memory_remember 固化结论。"
-            ),
+        else:
+            payload = {
+                "answer": "",
+                "source": "miss",
+                "hit_local": False,
+                "hits": [],
+                "explain": [],
+            }
+    else:
+        result = sb.ask_local(query)
+        hit_local = result.source not in ("miss", "sensory_reject", "llm")
+        hit_meta = list((result.meta or {}).get("hits") or [])
+        payload = {
+            "answer": result.answer,
+            "source": result.source,
+            "hit_local": hit_local,
+            "hits": hit_meta,
+            "explain": list((result.meta or {}).get("explain") or []),
         }
 
-    result = sb.ask_local(query)
-    hit_local = result.source not in ("miss", "sensory_reject", "llm")
-    hit_meta = list((result.meta or {}).get("hits") or [])
-    return {
-        "answer": result.answer,
-        "source": result.source,
-        "hit_local": hit_local,
-        "hits": hit_meta,
-        "explain": list((result.meta or {}).get("explain") or []),
-        "hint": (
-            "已命中本地记忆，可直接采用答案，无需再大段推理。"
-            if hit_local
-            else "本地记忆未命中（未调用沙箱 LLM）；请用当前 AI 工具自己的模型继续推理/查代码，"
-            "结束后可用 memory_remember 固化结论。"
-        ),
-    }
+    _attach_references(payload, query, tags=tags, ref_top_k=ref_top_k)
+    payload["hint"] = _hint_with_references(
+        hit_local=bool(payload.get("hit_local")),
+        has_refs=bool(payload.get("references")),
+    )
+    return payload
 
 
 def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -450,8 +551,9 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             tags = args.get("tags")
             if isinstance(tags, str):
                 tags = [tags]
+            ref_top_k = _parse_ref_top_k(args.get("ref_top_k"), 5)
             assembled = assemble_long_term_query(original)
-            ask = _ask_payload(assembled, tags=tags)
+            ask = _ask_payload(assembled, tags=tags, ref_top_k=ref_top_k)
             # 未命中时再用原话做本地检索，兼容库里未带后缀的旧条目（避免二次调 LLM）
             if not ask["hit_local"] and assembled != original:
                 from core.tags import merge_tags, parse_tags_from_text
@@ -468,20 +570,32 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                         "hit_local": True,
                         "hits": hit_meta,
                         "explain": hit_meta[0]["reasons"],
-                        "hint": "已命中本地记忆，可直接采用答案，无需再大段推理。",
                     }
-            if ask["hit_local"]:
-                hint = (
-                    "已命中本地记忆，直接采用 answer 回答用户，不要用模型默认身份覆盖。"
-                    "可参考 hits/explain（分数与命中原因）。"
-                    "本轮结束前仍须 memory_remember（可同问同答强化；若排障/改代码补充了新结论则写入更新）。"
+                    _attach_references(
+                        ask, original, tags=tags, ref_top_k=ref_top_k
+                    )
+            # 原话软召回合并去重（按 id），再截断到 ref_top_k
+            if assembled != original:
+                pack_orig = sb.build_reference_pack(
+                    original, tags=tags, top_k=ref_top_k
                 )
-            else:
-                hint = (
-                    f"本地未命中。请以 assembled「{assembled}」作为待解决问题继续推理/查代码/排障；"
-                    "本轮结束前必须 memory_remember（排障与改代码也要记；"
-                    "question 用精简问法或 original，answer 为结论，scene=dev，可带 tags）。"
+                seen = {r.get("id") for r in (ask.get("references") or [])}
+                for r in pack_orig["references"]:
+                    rid = r.get("id")
+                    if rid and rid not in seen:
+                        ask.setdefault("references", []).append(r)
+                        seen.add(rid)
+                ask["ref_threshold"] = ask.get("ref_threshold") or pack_orig.get(
+                    "ref_threshold"
                 )
+
+            refs = (ask.get("references") or [])[:ref_top_k]
+            context_pack = _context_pack_from_dicts(refs) if refs else ""
+            hint = _hint_with_references(
+                hit_local=bool(ask["hit_local"]),
+                has_refs=bool(refs),
+                assembled=assembled,
+            )
             payload = {
                 "original": original,
                 "assembled": assembled,
@@ -490,6 +604,9 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "hit_local": ask["hit_local"],
                 "hits": ask.get("hits") or [],
                 "explain": ask.get("explain") or [],
+                "references": refs,
+                "context_pack": context_pack,
+                "ref_threshold": ask.get("ref_threshold"),
                 "hint": hint,
             }
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -501,7 +618,8 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             tags = args.get("tags")
             if isinstance(tags, str):
                 tags = [tags]
-            payload = _ask_payload(query, tags=tags)
+            ref_top_k = _parse_ref_top_k(args.get("ref_top_k"), 5)
+            payload = _ask_payload(query, tags=tags, ref_top_k=ref_top_k)
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
 
         if name == "memory_remember":

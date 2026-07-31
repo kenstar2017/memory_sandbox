@@ -76,6 +76,7 @@ class MemorySandbox:
             aging_decay=getattr(lt, "aging_decay", 0.15),
         )
         self.llm: Optional[BaseLLM] = build_llm(self.config.llm)
+        self.last_remembered = None
 
     # ---------- public API ----------
     def ask_local(
@@ -211,6 +212,7 @@ class MemorySandbox:
 
         # 飞书链接：在沙箱内用 OpenAPI 拉正文，注入 LLM 上下文（不依赖 Cursor MCP）
         context = self.working.recent_context_text()
+        feishu_results = []
         feishu_cfg = getattr(self.config, "feishu", None)
         if feishu_cfg is not None:
             from .feishu import extract_feishu_urls, feishu_configured, fetch_feishu_docs_for_text
@@ -223,12 +225,12 @@ class MemorySandbox:
                 else:
                     if on_progress:
                         on_progress(f"飞书文档：拉取 {len(refs)} 篇…")
-                    results, feishu_ctx = fetch_feishu_docs_for_text(
+                    feishu_results, feishu_ctx = fetch_feishu_docs_for_text(
                         feishu_cfg, text, config_path=self.config_path
                     )
-                    ok_n = sum(1 for r in results if r.ok)
+                    ok_n = sum(1 for r in feishu_results if r.ok)
                     if on_progress:
-                        on_progress(f"飞书文档：成功 {ok_n}/{len(results)}")
+                        on_progress(f"飞书文档：成功 {ok_n}/{len(feishu_results)}")
                     if feishu_ctx:
                         context = (
                             (context + "\n\n" if context else "")
@@ -238,8 +240,60 @@ class MemorySandbox:
 
         llm_res = self.llm.generate(text, context=context, on_progress=on_progress)
 
-        self._write_back(text, keywords, vec, llm_res, persist_long=True)
-        result = ChatResult(answer=llm_res, source="llm")
+        store_q = text
+        store_a = llm_res
+        store_tags = None
+        store_facts = None
+        store_meta = None
+        await_confirm = False
+        if feishu_results and any(r.ok for r in feishu_results):
+            from .feishu_question import (
+                ensure_answer_has_feishu_links,
+                rewrite_feishu_memory_question,
+            )
+
+            store_q = rewrite_feishu_memory_question(text, feishu_results, answer=llm_res)
+            store_a = ensure_answer_has_feishu_links(llm_res, feishu_results)
+            store_tags = ["feishu", "docs"]
+            ok_urls = [r.url for r in feishu_results if r.ok and r.url]
+            if ok_urls:
+                store_facts = {"path": ok_urls[0]}
+            store_meta = {
+                "feishu_titles": [
+                    (r.title or "").strip() for r in feishu_results if r.ok and (r.title or "").strip()
+                ],
+                "feishu_urls": ok_urls,
+                "original_question": text,
+            }
+            # 飞书文档：不自动写长时，留给用户改「问」后确认记住（避免一条变多条）
+            await_confirm = True
+            if on_progress:
+                on_progress(
+                    f"已整理待确认记忆「问」：{(store_q or '')[:80]}（未自动入库，请确认记住）"
+                )
+
+        self._write_back(
+            store_q,
+            keywords,
+            vec,
+            store_a,
+            persist_long=not await_confirm,
+            tags=store_tags,
+            facts=store_facts,
+            meta=store_meta,
+        )
+        result = ChatResult(
+            answer=llm_res,
+            source="llm",
+            meta={
+                "awaiting_confirm": await_confirm,
+                "pending_question": store_q if await_confirm else "",
+                "pending_answer": store_a if await_confirm else "",
+                "pending_tags": list(store_tags or []) if await_confirm else [],
+                "pending_facts": dict(store_facts or {}) if await_confirm else {},
+                "pending_kind": "qa",
+            },
+        )
         if stream_callback:
             stream_callback(result.answer)
         return result
@@ -252,27 +306,76 @@ class MemorySandbox:
         tags: Optional[Sequence[str]] = None,
         kind: Optional[str] = None,
         facts: Optional[dict] = None,
+        memory_id: Optional[str] = None,
+        original_question: Optional[str] = None,
+        *,
+        update_only: bool = False,
     ) -> str:
+        from .feishu import extract_feishu_urls
+        from .feishu_question import rewrite_feishu_memory_question
         from .question_optimize import optimize_question
 
         scene = scene or self.working.scene
-        opt = optimize_question(question)
+        q_in = question
+        a_in = answer
+        facts_in = dict(facts) if facts else {}
+        orig_q = (original_question or "").strip() or None
+        # 手动补全/记住：飞书链按标题+语义整理问法
+        # 已是《真实标题》… 时保留；仅占位「飞书文档：」或裸 URL 才重写
+        if extract_feishu_urls(q_in + "\n" + a_in):
+            from .feishu_question import bracket_title_of, is_real_doc_title
+
+            if is_real_doc_title(bracket_title_of(q_in)):
+                rewritten = rewrite_feishu_memory_question(
+                    q_in, answer=a_in, force=False
+                )
+            else:
+                rewritten = rewrite_feishu_memory_question(
+                    q_in, answer=a_in, force=True
+                )
+            if rewritten != q_in:
+                q_in = rewritten
+            refs = extract_feishu_urls(question + "\n" + answer + "\n" + q_in)
+            if refs and not facts_in.get("path"):
+                facts_in["path"] = refs[0].url
+            tags = merge_tags(tags, ["feishu", "docs"])
+
+        opt = optimize_question(q_in)
         # 正文里的 #tag + 显式 tags 合并
-        merged = merge_tags(parse_tags_from_text(question), parse_tags_from_text(answer), tags)
+        merged = merge_tags(parse_tags_from_text(q_in), parse_tags_from_text(a_in), tags)
+        meta = None
+        if q_in != question:
+            meta = {"original_question": question}
+        # 有 id 或明确是「改已有」时，禁止新建
+        must_update = bool((memory_id or "").strip()) or bool(update_only)
+        n_before = len(self.long_term.records)
         # 向量交给 save_memory 用 embed_text 生成，覆盖更多口语变体
+        # original_question 仅在调用方显式传入时用于定位旧条目（勿默认成新问法）
         rec = self.long_term.save_memory(
-            question,
-            answer,
+            q_in,
+            a_in,
             scene=scene,
             tags=merged,
             kind=kind,
-            facts=facts,
+            facts=facts_in or None,
+            meta=meta,
+            record_id=memory_id,
+            original_question=orig_q,
+            require_existing=must_update,
         )
+        self.last_remembered = rec
+        self.last_remembered_updated = len(self.long_term.records) == n_before
         self.working.add_context(opt.canonical, opt.keywords, rec.vector, role="user")
         self.working.add_context(rec.answer, extract_keywords(rec.answer), role="assistant")
         alias_hint = ""
-        if opt.canonical != opt.original:
-            alias_hint = f"；已优化为「{opt.canonical}」"
+        if self.last_remembered_updated:
+            alias_hint = f"；已更新原条目 [{rec.id}]"
+            if opt.canonical != opt.original or q_in != question or (
+                orig_q and orig_q != rec.question
+            ):
+                alias_hint += f"；问法「{rec.question}」"
+        elif opt.canonical != opt.original or q_in != question:
+            alias_hint = f"；已优化为「{rec.question}」"
         tag_hint = f"；tags={','.join(rec.tags)}" if rec.tags else ""
         kind_hint = f"；kind={rec.kind}" if rec.kind and rec.kind != "qa" else ""
         scrub_hint = "；已脱敏" if (rec.meta or {}).get("scrubbed") else ""
@@ -525,6 +628,127 @@ class MemorySandbox:
         }
         return f"已切换为 {labels.get(ui, ui)}{path_hint}"
 
+    def collect_references(
+        self,
+        query: str,
+        *,
+        tags: Optional[Sequence[str]] = None,
+        top_k: int = 5,
+        threshold: Optional[float] = None,
+    ) -> list:
+        """软召回相关长时记忆，返回 SearchHit 列表。"""
+        from .tags import merge_tags, parse_tags_from_text
+
+        merged = merge_tags(parse_tags_from_text(query), tags)
+        return self.long_term.collect_references(
+            query,
+            scene=self.working.scene,
+            tags=merged or None,
+            top_k=top_k,
+            threshold=threshold,
+        )
+
+    def build_reference_pack(
+        self,
+        query: str,
+        *,
+        tags: Optional[Sequence[str]] = None,
+        top_k: int = 5,
+        threshold: Optional[float] = None,
+        max_answer_chars: int = 800,
+    ) -> dict:
+        """供 MCP：references 列表 + context_pack 文本。"""
+        hits = self.collect_references(
+            query, tags=tags, top_k=top_k, threshold=threshold
+        )
+        return {
+            "references": [h.as_dict() for h in hits],
+            "context_pack": self.long_term.format_context_pack(
+                hits, max_answer_chars=max_answer_chars
+            ),
+            "ref_threshold": (
+                threshold
+                if threshold is not None
+                else self.long_term.soft_threshold()
+            ),
+        }
+
+    def get_retrieval_settings(self) -> dict:
+        """当前长时检索设置 + 字段说明（给 Web 表单用）。"""
+        from .config import RETRIEVAL_SETTING_SPECS
+
+        lt = self.config.long_term
+        values = {}
+        for spec in RETRIEVAL_SETTING_SPECS:
+            key = spec["key"]
+            values[key] = getattr(lt, key, getattr(self.long_term, key, None))
+        return {
+            "values": values,
+            "fields": list(RETRIEVAL_SETTING_SPECS),
+            "hint": (
+                "三项权重会自动归一化（不必精确加到 1）。"
+                "保存后立即生效，并写入用户 config.yaml。"
+            ),
+            "config_path": getattr(self, "config_path", None) or "",
+        }
+
+    def set_retrieval_settings(
+        self,
+        updates: Optional[dict] = None,
+        *,
+        persist: bool = True,
+    ) -> str:
+        """热更新长时检索参数，可选持久化到用户配置。"""
+        from .config import RETRIEVAL_SETTING_SPECS, persist_long_term_settings
+
+        if not updates:
+            return "未提供要更新的字段"
+        allowed = {s["key"]: s for s in RETRIEVAL_SETTING_SPECS}
+        applied: Dict[str, Any] = {}
+        for key, raw in updates.items():
+            if key not in allowed:
+                continue
+            spec = allowed[key]
+            typ = spec.get("type")
+            try:
+                if typ == "bool":
+                    if isinstance(raw, str):
+                        val = raw.strip().lower() in {"1", "true", "yes", "on"}
+                    else:
+                        val = bool(raw)
+                elif typ == "int":
+                    val = int(raw)
+                    lo, hi = spec.get("min"), spec.get("max")
+                    if lo is not None:
+                        val = max(int(lo), val)
+                    if hi is not None:
+                        val = min(int(hi), val)
+                else:
+                    val = float(raw)
+                    lo, hi = spec.get("min"), spec.get("max")
+                    if lo is not None:
+                        val = max(float(lo), val)
+                    if hi is not None:
+                        val = min(float(hi), val)
+            except (TypeError, ValueError):
+                continue
+            setattr(self.config.long_term, key, val)
+            if hasattr(self.long_term, key):
+                setattr(self.long_term, key, val)
+            # similarity_threshold / top_k 在 LongTermMemory 上同名
+            applied[key] = val
+
+        if not applied:
+            return "没有可识别的检索设置字段"
+        path_hint = ""
+        if persist:
+            path = persist_long_term_settings(
+                getattr(self, "config_path", None), applied
+            )
+            path_hint = f"；已写入 {path}"
+        parts = [f"{k}={applied[k]}" for k in applied]
+        return f"已更新检索设置：{', '.join(parts)}{path_hint}"
+
     def status(self) -> dict:
         from .config import agent_ui_mode_from_config
 
@@ -642,6 +866,10 @@ class MemorySandbox:
         vec,
         answer: str,
         persist_long: bool,
+        *,
+        tags: Optional[Sequence[str]] = None,
+        facts: Optional[dict] = None,
+        meta: Optional[dict] = None,
     ) -> None:
         # 失败/鉴权类答复不进工作记忆与长时，否则删长时后仍会「命中工作记忆」假复用
         from .working import is_non_reusable_answer
@@ -656,6 +884,9 @@ class MemorySandbox:
                 answer,
                 scene=self.working.scene,
                 vector=vec,
+                tags=tags,
+                facts=facts,
+                meta=meta,
             )
         # 高频短问答沉淀进工作记忆 FAQ，进一步减少模型调用
         if persist_long and len(question) <= 20 and len(answer) <= 80:

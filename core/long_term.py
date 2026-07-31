@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterator, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterator, List, Optional, Sequence, Set, Tuple
 
 from .bm25 import BM25Index
 from .embedding import LocalHasherEmbedder
@@ -333,6 +333,72 @@ class LongTermMemory:
             )
         return "\n".join(parts)
 
+    def soft_threshold(self, hard_threshold: Optional[float] = None) -> float:
+        """软召回阈值：相对硬命中阈值低 0.25，下限 0.35。"""
+        hard = self.similarity_threshold if hard_threshold is None else float(hard_threshold)
+        return max(0.35, hard - 0.25)
+
+    def collect_references(
+        self,
+        query: str,
+        *,
+        query_vec: Optional[List[float]] = None,
+        scene: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        kind: Optional[str] = None,
+        top_k: int = 5,
+        threshold: Optional[float] = None,
+        tag_mode: str = "any",
+    ) -> List[SearchHit]:
+        """
+        软召回相关问答（供 Cursor 等外部 Agent 作参考，不必达硬命中阈值）。
+        飞书 token 等硬过滤仍走 search_hits。
+        """
+        thr = self.soft_threshold() if threshold is None else float(threshold)
+        k = max(1, min(int(top_k or 5), 20))
+        return self.search_hits(
+            query,
+            query_vec=query_vec,
+            scene=scene,
+            tags=tags,
+            kind=kind,
+            threshold=thr,
+            top_k=k,
+            tag_mode=tag_mode,
+        )
+
+    @staticmethod
+    def format_context_pack(
+        hits: Sequence[SearchHit],
+        *,
+        max_answer_chars: int = 800,
+    ) -> str:
+        """拼给外部 Agent 的参考问答纯文本块。"""
+        if not hits:
+            return ""
+        blocks: List[str] = [
+            "【记忆沙箱 · 参考问答】以下为相关历史结论，供结合当前项目上下文使用；"
+            "可能过时，以仓库/现状为准，勿直接当作最终实现。"
+        ]
+        for i, hit in enumerate(hits, 1):
+            rec = hit.record
+            ans = (rec.answer or "").strip()
+            if max_answer_chars > 0 and len(ans) > max_answer_chars:
+                ans = ans[:max_answer_chars].rstrip() + "…"
+            tags = ",".join(rec.tags or [])
+            tag_s = f" tags={tags}" if tags else ""
+            reason_s = "/".join(hit.reasons[:4]) if hit.reasons else ""
+            meta = f"score={hit.score:.2f}{tag_s}"
+            if reason_s:
+                meta += f" reasons={reason_s}"
+            blocks.append(
+                f"### 参考问答 {i}\n"
+                f"问：{rec.question}\n"
+                f"答：{ans}\n"
+                f"（{meta}）"
+            )
+        return "\n\n".join(blocks)
+
     def _record_aliases(self, rec: MemoryRecord) -> List[str]:
         meta = rec.meta or {}
         aliases = list(meta.get("aliases") or [])
@@ -371,6 +437,11 @@ class LongTermMemory:
         q_core_l = q_core.lower()
         vw, kw_w, bw = self._hybrid_weights()
 
+        # 查询含飞书链接时：只允许 token 对得上的记忆命中
+        from .feishu import extract_feishu_tokens, record_matches_feishu_tokens
+
+        required_feishu_tokens = extract_feishu_tokens(query)
+
         # BM25：对当前库重建轻量索引（本地体量可接受）
         bm25_norm = [0.0] * len(self.records)
         if bw > 0 and self.records:
@@ -388,6 +459,19 @@ class LongTermMemory:
                 continue
             if want_kind is not None and normalize_kind(rec.kind) != want_kind:
                 continue
+            if required_feishu_tokens:
+                fact_blob_early = facts_search_blob(rec.facts or {})
+                if not record_matches_feishu_tokens(
+                    [
+                        rec.question or "",
+                        rec.answer or "",
+                        fact_blob_early,
+                        " ".join(rec.tags or []),
+                        " ".join((rec.meta or {}).get("aliases") or []),
+                    ],
+                    required_feishu_tokens,
+                ):
+                    continue
 
             reasons: List[str] = []
             vscore = max(
@@ -406,6 +490,12 @@ class LongTermMemory:
                 reasons.append(f"keywords:{kscore:.2f}")
             if bscore >= 0.35:
                 reasons.append(f"bm25:{bscore:.2f}")
+            if required_feishu_tokens:
+                matched_tok = next(
+                    (t for t in required_feishu_tokens if t in (rec.question or "") + (rec.answer or "")),
+                    next(iter(required_feishu_tokens)),
+                )
+                reasons.append(f"feishu_token:{matched_tok[:16]}")
 
             # 别名 / 包含关系加分（口语问法命中核心词）
             aliases = [a.lower() for a in self._record_aliases(rec) if a]
@@ -472,6 +562,71 @@ class LongTermMemory:
         scored.sort(key=lambda x: x.score, reverse=True)
         return scored[:k]
 
+    def _find_by_feishu_tokens(self, *texts: str) -> Optional[MemoryRecord]:
+        """正文/链接含相同飞书 wiki/docx token 的记忆视为同一文档，合并更新。"""
+        from .feishu import extract_feishu_tokens
+
+        tokens: Set[str] = set()
+        for t in texts:
+            tokens |= extract_feishu_tokens(t or "")
+        if not tokens:
+            return None
+        best: Optional[MemoryRecord] = None
+        for rec in self.records:
+            blob = "\n".join(
+                [
+                    rec.question or "",
+                    rec.answer or "",
+                    facts_search_blob(rec.facts or {}),
+                    " ".join(rec.tags or []),
+                    " ".join((rec.meta or {}).get("aliases") or []),
+                ]
+            )
+            if not any(tok in blob for tok in tokens):
+                continue
+            if best is None or float(rec.updated_at or 0) >= float(best.updated_at or 0):
+                best = rec
+        return best
+
+    def _find_by_question_key(self, *texts: str) -> Optional[MemoryRecord]:
+        """按原问法 / 当前问法 / 别名精确匹配（改问前定位原条目）。"""
+        needles: Set[str] = set()
+        for t in texts:
+            c = clean_text(t or "")
+            if c:
+                needles.add(c.lower())
+        if not needles:
+            return None
+        best: Optional[MemoryRecord] = None
+        for rec in self.records:
+            keys = [rec.question or ""]
+            keys.extend((rec.meta or {}).get("aliases") or [])
+            keys.append((rec.meta or {}).get("original_question") or "")
+            hit = False
+            for k in keys:
+                ck = clean_text(k).lower()
+                if ck and ck in needles:
+                    hit = True
+                    break
+            if not hit:
+                continue
+            if best is None or float(rec.updated_at or 0) >= float(best.updated_at or 0):
+                best = rec
+        return best
+
+    def _find_by_same_answer(self, answer: str) -> Optional[MemoryRecord]:
+        """答案完全相同则视为改问更新（避免同答多问）。"""
+        a = clean_text(answer or "")
+        if not a or len(a) < 8:
+            return None
+        best: Optional[MemoryRecord] = None
+        for rec in self.records:
+            if clean_text(rec.answer or "") != a:
+                continue
+            if best is None or float(rec.updated_at or 0) >= float(best.updated_at or 0):
+                best = rec
+        return best
+
     def save_memory(
         self,
         question: str,
@@ -484,8 +639,16 @@ class LongTermMemory:
         facts: Optional[dict] = None,
         *,
         scrub: bool = True,
+        record_id: Optional[str] = None,
+        original_question: Optional[str] = None,
+        require_existing: bool = False,
     ) -> MemoryRecord:
-        """记忆巩固：写入前优化问题，提升后续口语/Cursor 检索命中。"""
+        """记忆巩固：写入前优化问题，提升后续口语/Cursor 检索命中。
+
+        record_id：指定时原地更新该条（改「问」不会新开一条）。
+        original_question：改问前的旧问法，用于定位原条目。
+        require_existing：为 True 时找不到原条目则报错，绝不新建。
+        """
         q_in, a_in = question, answer
         scrub_meta: Dict[str, Any] = {}
         if scrub:
@@ -504,6 +667,8 @@ class LongTermMemory:
         opt_meta = opt.as_meta()
         if meta:
             opt_meta.update(meta)
+        if original_question and clean_text(original_question) != clean_text(q_in):
+            opt_meta.setdefault("original_question", clean_text(original_question))
         opt_meta.update(scrub_meta)
         new_tags = normalize_tags(tags)
         new_facts = normalize_facts(facts)
@@ -515,21 +680,59 @@ class LongTermMemory:
             new_facts = cleaned
         new_kind = infer_kind(new_facts, kind)
 
-        # 去重检索在锁外只读；真正写入走 _mutate_declarative
-        existing = self.search_hits(opt.original, threshold=0.90, top_k=1)
-        if not existing:
-            existing = self.search_hits(q, threshold=0.90, top_k=1)
-        existing_id = existing[0].record.id if existing else None
+        # 去重：显式 id > 旧问法/别名 > 同飞书 token > 同答案 > 高相似问答
+        fact_blob = facts_search_blob(new_facts)
+        existing_id: Optional[str] = None
+        rid = (record_id or "").strip()
+        if rid:
+            for rec in self.records:
+                if rec.id == rid:
+                    existing_id = rid
+                    break
+            if existing_id is None and require_existing:
+                raise ValueError(f"未找到要更新的记忆 id={rid}")
+        if existing_id is None:
+            keyed = self._find_by_question_key(
+                original_question or "", opt.original, q_in, q
+            )
+            existing_id = keyed.id if keyed else None
+        if existing_id is None:
+            feishu_dup = self._find_by_feishu_tokens(
+                opt.original, q, a, fact_blob, " ".join(new_tags)
+            )
+            existing_id = feishu_dup.id if feishu_dup else None
+        # 同答案合并 / 软相似：仅在显式更新时启用（有 id / update_only）
+        editing = bool(rid or require_existing)
+        if existing_id is None and editing:
+            same_ans = self._find_by_same_answer(a)
+            existing_id = same_ans.id if same_ans else None
+        if existing_id is None:
+            existing = self.search_hits(opt.original, threshold=0.90, top_k=1)
+            if not existing:
+                existing = self.search_hits(q, threshold=0.90, top_k=1)
+            # 改问场景：答案相同且相似度尚可时也合并
+            if not existing and editing and a:
+                soft = self.search_hits(
+                    original_question or opt.original, threshold=0.55, top_k=3
+                )
+                for h in soft:
+                    if clean_text(h.record.answer or "") == clean_text(a):
+                        existing = [h]
+                        break
+            existing_id = existing[0].record.id if existing else None
+
+        if require_existing and not existing_id:
+            raise ValueError("未找到要更新的原记忆（请从「已记住」点开再保存）")
 
         embed_src = opt.embed_text
         if new_facts:
-            embed_src = (embed_src + " " + facts_search_blob(new_facts)).strip()
+            embed_src = (embed_src + " " + fact_blob).strip()
         vec = vector or self.embedder.embed(embed_src)
         keywords = list(
             dict.fromkeys(
                 opt.keywords
                 + extract_keywords(a, top_k=8)
-                + extract_keywords(facts_search_blob(new_facts), top_k=6)
+                + extract_keywords(fact_blob, top_k=6)
             )
         )
 
@@ -542,6 +745,16 @@ class LongTermMemory:
                     if rec.id == existing_id:
                         hit = rec
                         break
+            if hit is None:
+                hit = self._find_by_question_key(
+                    original_question or "", opt.original, q_in, q
+                )
+            if hit is None:
+                hit = self._find_by_feishu_tokens(
+                    opt.original, q, a, fact_blob, " ".join(new_tags)
+                )
+            if hit is None and editing:
+                hit = self._find_by_same_answer(a)
             if hit is None:
                 # 回退：同问题精确匹配
                 for rec in self.records:

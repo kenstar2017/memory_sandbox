@@ -53,14 +53,14 @@ The Agent will call these tools:
 
 | Tool | Role |
 |------|------|
-| `memory_prepare` | **Preferred each turn**: append “record to long-term memory” then search local layers |
+| `memory_prepare` | **Preferred each turn**: append “record to long-term…” then search; returns `references` / `context_pack` |
 | `memory_ask` | Search as-is (no suffix assembly) |
 | `memory_remember` | Persist reusable conclusions (optional `tags`) |
 | `memory_forget` | Active forgetting |
 | `memory_status` | Memory stats |
 | `memory_set_scene` | Switch scene (e.g. `dev`) |
 
-Project rule `.cursor/rules/memory-sandbox.mdc` guides the Agent: **`memory_prepare` first; use the hit directly; on miss, reason then `memory_remember` stable conclusions.**
+Project rule `.cursor/rules/memory-sandbox.mdc` guides the Agent: **`memory_prepare` first**; treat `references` / `context_pack` as background and combine with the current repo; for feature work do not short-circuit on a hard hit; only reuse `answer` for pure factual Q&A when `hit_local`; always `memory_remember` stable conclusions.
 
 ### Tags & types (easier to find)
 
@@ -76,7 +76,7 @@ Project rule `.cursor/rules/memory-sandbox.mdc` guides the Agent: **`memory_prep
 
 ### Better search & sharing
 
-- Hybrid retrieval: vectors + keywords + BM25 (weights in `config.yaml`)
+- Hybrid retrieval: vectors + keywords + BM25 (Web toolbar “Retrieval settings”, with per-field help; also saved to user `config.yaml`)
 - Soft-decay rarely used items; archive when needed
 - Export scrubbed knowledge packs for teammates to import
 
@@ -229,6 +229,8 @@ Message with Feishu URL
 | When | Web/CLI LLM fallback only; MCP `memory_prepare` does **not** fetch |
 | Working memory | Feishu-URL questions skip reusing prior answers (helps retries) |
 | Failures | Auth/fetch failures are not persisted to working/long-term memory |
+| Stored question | Rewritten from **doc title + user intent** (URL kept for token matching); Web “complete answer” modal lets you edit Q / “optimize question” |
+| No auto-save | After a successful Feishu fetch, long-term is **not** written until you confirm; edit Q then save once (same token / id updates in place) |
 
 ### Config locations
 

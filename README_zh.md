@@ -53,14 +53,14 @@ Agent 会调用这些工具：
 
 | 工具 | 作用 |
 |------|------|
-| `memory_prepare` | **每轮首选**：拼接「记录到长期记忆」后检索本地三级记忆 |
+| `memory_prepare` | **每轮首选**：拼接「记录到长期记忆」后检索；返回 `references`/`context_pack` 多条参考问答 |
 | `memory_ask` | 原样检索（不自动拼后缀） |
 | `memory_remember` | 固化可复用结论（可带 `tags`） |
 | `memory_forget` | 主动遗忘 |
 | `memory_status` | 查看记忆统计 |
 | `memory_set_scene` | 切换场景（如 `dev`） |
 
-项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_prepare`，命中则直接用；未命中再推理，并把稳定结论 `memory_remember`。**
+项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_prepare`**；把返回的 `references` / `context_pack` 当参考并结合当前仓库；改功能时不要因硬命中短路；纯事实复述且 `hit_local` 才可直接用 `answer`；结束前 `memory_remember`。
 
 ### 标签与类型（更好找）
 
@@ -76,7 +76,7 @@ Agent 会调用这些工具：
 
 ### 搜得更准、能分享
 
-- 检索同时看语义向量、关键词和 BM25（权重可在 `config.yaml` 调）
+- 检索同时看语义向量、关键词和 BM25（Web 工具栏「检索设置」可调，每项有说明；也写入用户 `config.yaml`）
 - 很久没用的条目会在检索时降权，也可一键归档
 - 可导出「知识包」发给同事，对方合并导入即可（不含向量、已脱敏）
 
@@ -229,6 +229,8 @@ ln -sf "$(pwd)/scripts/memory" /usr/local/bin/memory-sandbox
 | 何时拉取 | 仅 Web / CLI 回退 LLM 前；MCP 的 `memory_prepare` **不会**拉飞书 |
 | 不复用工作记忆旧答 | 含飞书链接的提问不直接复用上次失败/旧结论，便于重试 |
 | 失败类答复 | 鉴权失败等不写入工作记忆 / 长时记忆 |
+| 入库「问」 | 自动用 **文档标题 + 用户意图** 重写（末尾保留链接）；Web「补全答案」里「问」可编辑，也可点「优化问法」 |
+| 不自动入库 | 飞书拉取成功后**不立刻写长时**，放入「待补全答」供你改问再确认；同文档 token / 指定 id 更新不会新开多条 |
 
 ### 配置位置
 

@@ -519,6 +519,23 @@ class LongTermMemory:
                 score = min(1.0, score + contain_boost)
                 reasons.append(f"alias:{matched_alias[:40]}")
 
+            # 短主题词：整词出现在问句/别名中且 BM25 有信号时再抬一档，
+            # 避免长标题技术文档卡在阈值下（0.66 < 0.70）而本地未命中。
+            title_l = (rec.question or "").lower()
+            short_topic = (
+                2 <= len(q_core_l) <= 8
+                and bscore >= 0.45
+                and (
+                    q_core_l in title_l
+                    or any(q_core_l in a for a in aliases if a)
+                )
+            )
+            if short_topic:
+                # 越短的主题词越依赖字面包含，加分略高
+                topic_boost = 0.14 if len(q_core_l) <= 4 else 0.08
+                score = min(1.0, score + topic_boost)
+                reasons.append("title_topic")
+
             # facts 文本包含
             if fact_blob and (q_core_l in fact_blob.lower() or any(w in fact_blob.lower() for w in qkw[:4])):
                 score = min(1.0, score + 0.08)

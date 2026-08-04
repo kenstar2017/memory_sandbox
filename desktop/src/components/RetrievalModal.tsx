@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { getRetrievalSettings, setRetrievalSettings } from '../api/client'
+import { alertDialog } from '../dialogs'
 
 type Props = {
   open: boolean
@@ -41,7 +42,7 @@ export function RetrievalModal({ open, onClose, onSaved }: Props) {
           aging_decay: Number(s.aging_decay ?? prev.aging_decay),
         }))
       })
-      .catch((e) => alert(String(e)))
+      .catch((e) => void alertDialog(String(e)))
       .finally(() => setLoading(false))
   }, [open])
 
@@ -114,7 +115,7 @@ export function RetrievalModal({ open, onClose, onSaved }: Props) {
                 onSaved(typeof data.status_line === 'string' ? data.status_line : undefined)
                 onClose()
               } catch (e) {
-                alert(String(e))
+                void alertDialog(String(e))
               } finally {
                 setSaving(false)
               }

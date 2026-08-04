@@ -240,11 +240,12 @@ cd desktop && npm run tauri:dev
 - `long_term.persist_dir`：持久化目录（默认 `data/memory`）
 - `llm.provider`：`mock`（离线占位）| `cursor` | `openai_compatible`
 - `llm.runtime`（仅 cursor）：`local`（本机 `agent` CLI，可读盘）| `cloud`（Cloud 无仓库，不能扫本机源码）
-- `feishu.*`：飞书 wiki/docx 读取（见下方「飞书文档读取」）
+- `feishu.*`：飞书 wiki/docx 读写（见下方「飞书文档读写」）
 
-## 飞书文档读取
+## 飞书文档读写
 
-对话中出现飞书 wiki/docx 链接时，沙箱可在回退 LLM 前 **自动拉取正文**。
+对话中出现飞书 wiki/docx 链接时，沙箱可在回退 LLM 前 **自动拉取正文**；另有三个**写**能力
+（改 wiki 标题、新建文档、改正文），见下方「写飞书文档」，**每次都需本人确认**。
 
 - **不依赖** Cursor MCP、Trae MCP；**不改** `~/.cursor/mcp.json`
 - 密钥只写本机用户配置，**勿提交 git**
@@ -280,7 +281,7 @@ cd desktop && npm run tauri:dev
 
 ### 接入步骤
 
-1. 在 [飞书开放平台](https://open.feishu.cn/) 创建应用，记下 App ID / App Secret。建议权限：`offline_access`、`docs:document.content:read`、`wiki:wiki:readonly` / `wiki:node:read`。
+1. 在 [飞书开放平台](https://open.feishu.cn/) 创建应用，记下 App ID / App Secret。只读所需权限：`offline_access`、`docs:document.content:read`、`wiki:wiki:readonly` / `wiki:node:read`；要用写能力再按需加 `wiki:node:update`（改标题）、`docx:document`（新建文档并写正文）。
 2. 「安全设置 → 重定向 URL」添加（须与配置完全一致）：
 
 ```text
@@ -322,6 +323,8 @@ python3 scripts/feishu_login.py
 | `app_id` / `app_secret` | 开放平台应用凭证 |
 | `redirect_uri` | 须与开放平台重定向 URL 一致 |
 | `user_access_token` / `refresh_token` | OAuth 写入；后者用于续期 |
+| `oauth_scope` | 申请的权限；新增权限后**必须重新登录**才生效（scope 固定在 token 里） |
+| `doc_host` | 文档域名（如 `bytedance.larkoffice.com`），用于把新建文档的 `document_id` 拼成可点链接；留空只输出 id |
 | `api_base` / `timeout` / `max_chars` | API 根、超时、注入截断长度 |
 
 ### 相关指令
@@ -332,13 +335,68 @@ python3 scripts/feishu_login.py
 | `重试` / `再试一次` / `重新分析` | 跳过工作记忆复用 |
 | `清空工作记忆` | 清掉短时旧结论 |
 
+### 写飞书文档（每次需本人确认）
+
+飞书文档多是团队共享内容，改动别人看得见且不易回滚，所以写能力做了**默认拒绝**的门禁：
+
+- `core/feishu.py` 的写函数 `confirmed` 默认 `False`，未显式传 `True` 时**直接返回错误、不发任何请求**
+- CLI 默认交互二次确认，答 `n` 即取消；`--yes` 仅供本人使用
+- 约定见 `.cursor/rules/memory-sandbox.mdc`：AI 不得自行发起写操作，「上一轮批准过」不构成本次确认
+
+改 wiki 节点标题：
+
+```bash
+python3 main.py feishu-set-title <飞书 wiki 链接> "<新标题>"
+```
+
+只支持 wiki 链接——docx 直链没有 `space_id` / `node_token`，拿不到就改不了。需权限 `wiki:node:update`。
+
+新建文档（建在本人云空间，可带正文）：
+
+```bash
+python3 main.py feishu-create-doc "<标题>" --content-file notes.md
+python3 main.py feishu-create-doc "<标题>" --folder <文件夹 token>   # 省略则建在根目录
+```
+
+需权限 `docx:document`（含创建与编辑；只建空文档也可只开 `docx:document:create`）。
+
+改已有文档的正文（wiki 与 docx 链接都行；`--append` / `--replace` **必须显式选一个**）：
+
+```bash
+python3 main.py feishu-edit-body <链接> --append  --content-file notes.md   # 追加到末尾
+python3 main.py feishu-edit-body <链接> --replace --content-file notes.md   # 删原正文再写
+```
+
+同样只需 `docx:document`，没有额外权限。确认前会先**只读**拉一次目标文档，打印标题与现有块数，
+`--replace` 还会明说「将删除原有 N 个块」——改错篇的代价比改错内容大得多。
+
+- `--append` 不动原有内容，最安全
+- `--replace` 会真的删掉原有块。飞书侧可用「历史版本」恢复，但别把它当撤销键
+- 正文为空一律拒绝：不希望「文件恰好读空」变成把文档清空
+- wiki 链接会先 `get_node` 换成 docx 的 `obj_token`，再按块操作
+
+正文支持 Markdown 子集：`#`~`######` 标题、`-`/`*` 无序列表、`1.` 有序列表、``` 代码块、
+`>` 引用、`---` 分割线，其余非空行作普通段落；**行内语法（粗体、链接）不解析**，按纯文本写入。
+
+飞书接口本身的限制，实现里已处理，但值得知道：
+
+| 限制 | 说明 |
+|------|------|
+| 创建接口只能给标题 | 正文得在建好后另调「创建块」接口写入，所以要编辑权限而非仅 create |
+| 单次最多 50 个块 | 写入与删除都会自动分批，并按 3 次/秒限频加间隔 |
+| 删除按索引区间 | `[start_index, end_index)` 左闭右开；分批时每轮都删最前面一批，因为删完后面的块会前移 |
+| 新建时正文写一半失败 | 文档已经建出来了，错误信息里会带 `document_id` 供你去清理 |
+| 替换时删完写失败 | 原正文已删，错误信息会提示去「历史版本」恢复 |
+
 ### 排障
 
 | 现象 | 处理 |
 |------|------|
 | `99991668` Invalid access token | 再跑 `feishu_login.py` |
-| `131006` node permission denied | 个人文档靠 user token；或把文档授权给应用 |
+| `131006` node permission denied | 个人文档靠 user token；或把文档授权给应用；写操作还需该节点的容器编辑权限 |
+| `1770040` / `1770032` no folder permission | 新建文档时目标文件夹没有编辑权限，或未开通 `docx:document` |
 | 缺 wiki scope | 开放平台开通 wiki 读权限 |
+| 开了新权限仍报无权限 | scope 固定在 token 里，改完权限要重跑 `python3 scripts/feishu_login.py` |
 | 回调失败 / 超时 | 重定向 URL 完全一致；`18765` 未被占用 |
 | 只回旧答案 | 「清空工作记忆」或加「重试」；改代码后重启 Web |
 | 改仓库 `config.yaml` 不生效 | 改 Application Support 用户配置 |

@@ -23,9 +23,11 @@ import {
 import type { ChatMessage, MemoryRecord } from './api/types'
 import { AnswerModal, type ModalSeed } from './components/AnswerModal'
 import { Chat, sourceLabel } from './components/Chat'
+import { DialogHost } from './components/DialogHost'
 import { RetrievalModal } from './components/RetrievalModal'
 import { SideList } from './components/SideList'
 import { StatusBar } from './components/StatusBar'
+import { alertDialog, confirmDialog } from './dialogs'
 import { useTheme } from './hooks/useTheme'
 import { applyTheme, loadThemePreference } from './theme'
 import './App.css'
@@ -203,7 +205,7 @@ export default function App() {
         update_only: payload.updateOnly,
       })
       if (data.error) {
-        alert(data.error)
+        void alertDialog(data.error)
         return
       }
       const seed = modal
@@ -229,7 +231,7 @@ export default function App() {
       if (data.status_line) setStatusLine(data.status_line)
       await refreshSaved()
     } catch (e) {
-      alert(String(e))
+      void alertDialog(String(e))
     } finally {
       setModalBusy(false)
     }
@@ -475,7 +477,7 @@ export default function App() {
         })
         if (data.status_line) setStatusLine(data.status_line)
       } else if (id === 'archive') {
-        if (!confirm('确认归档久未命中的长时记忆？')) return
+        if (!(await confirmDialog('确认归档久未命中的长时记忆？', { title: '归档记忆' }))) return
         const data = await archiveStale()
         push({ id: uid(), role: 'sys', text: data.message || '已归档' })
         if (data.status_line) setStatusLine(data.status_line)
@@ -490,8 +492,17 @@ export default function App() {
         const data = await openDataDir()
         push({ id: uid(), role: 'sys', text: data.message || '已打开数据目录' })
       } else if (id === 'clear_l') {
-        if (!confirm('确定清空全部长时记忆？建议勾选先备份。')) return
-        const backupFirst = confirm('清空前先备份长时记忆？（推荐：确定=备份）')
+        const sure = await confirmDialog('确定清空全部长时记忆？此操作不可撤销。', {
+          title: '清空长时记忆',
+          confirmText: '清空',
+          danger: true,
+        })
+        if (!sure) return
+        const backupFirst = await confirmDialog('清空前先备份长时记忆？', {
+          title: '先备份吗',
+          confirmText: '先备份',
+          cancelText: '不备份',
+        })
         const data = await clearLongTerm({ confirm: true, backup_first: backupFirst })
         push({ id: uid(), role: 'sys', text: data.message || '长时记忆已清空' })
         if (data.status_line) setStatusLine(data.status_line)
@@ -518,25 +529,35 @@ export default function App() {
         onTab={setTab}
         onOpenPending={openPending}
         onOpenSaved={openSaved}
-        onDeletePending={(idx) => {
-          if (!confirm('删除这条待补全的问题？')) return
+        onDeletePending={async (idx) => {
+          const sure = await confirmDialog('删除这条待补全的问题？', {
+            title: '删除待补全',
+            confirmText: '删除',
+            danger: true,
+          })
+          if (!sure) return
           const next = [...pending]
           next.splice(idx, 1)
           persistPending(next)
         }}
         onDeleteSaved={async (rec) => {
-          if (!confirm(`确定删除已记住的「${rec.question}」？`)) return
+          const sure = await confirmDialog(`确定删除已记住的「${rec.question}」？`, {
+            title: '删除记忆',
+            confirmText: '删除',
+            danger: true,
+          })
+          if (!sure) return
           try {
             const data = await deleteMemory(rec.id, rec.question)
             if (data.error) {
-              alert(data.error)
+              void alertDialog(data.error)
               return
             }
             if (data.status_line) setStatusLine(data.status_line)
             await refreshSaved()
             push({ id: uid(), role: 'sys', text: `已删除：${rec.question}` })
           } catch (e) {
-            alert(String(e))
+            void alertDialog(String(e))
           }
         }}
       />
@@ -559,7 +580,7 @@ export default function App() {
                 if (data.status_line) setStatusLine(data.status_line)
                 if (data.message) push({ id: uid(), role: 'sys', text: data.message })
               })
-              .catch((e) => alert(String(e)))
+              .catch((e) => void alertDialog(String(e)))
           }}
           onToolAction={(id) => void onToolAction(id)}
         />
@@ -584,6 +605,7 @@ export default function App() {
           push({ id: uid(), role: 'sys', text: '检索设置已保存' })
         }}
       />
+      <DialogHost />
     </div>
   )
 }

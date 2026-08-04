@@ -26,11 +26,21 @@ _NON_REUSABLE_ANS = re.compile(
 )
 
 
+# 排障笔记必然引用错误码与失败文本（如「强刷只匹配 99991668/Invalid access token」），
+# 但它带的是修复结论、属于要复用的知识，不能和纯错误回显一起丢掉。
+_TROUBLESHOOTING_NOTE = re.compile(
+    r"(?:根因|修法|已修|改法|修复|解决办法|解决方法|处理步骤|排查步骤|规避)",
+)
+
+
 def is_non_reusable_answer(answer: str) -> bool:
     text = (answer or "").strip()
     if not text:
         return True
-    return bool(_NON_REUSABLE_ANS.search(text))
+    if not _NON_REUSABLE_ANS.search(text):
+        return False
+    # 命中失败特征后再看是不是排障笔记：错误回显只陈述失败，不给修复结论
+    return not (len(text) >= 120 and _TROUBLESHOOTING_NOTE.search(text))
 
 
 class WorkingMemory:

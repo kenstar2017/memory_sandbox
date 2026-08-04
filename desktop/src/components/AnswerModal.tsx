@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { suggestQuestion } from '../api/client'
+import { alertDialog } from '../dialogs'
 
 export type ModalSeed = {
   question: string
@@ -79,7 +80,7 @@ export function AnswerModal({ open, seed, busy, onClose, onConfirm }: Props) {
               try {
                 const data = await suggestQuestion(question, answer)
                 if (data.error) {
-                  alert(data.error)
+                  void alertDialog(data.error)
                   return
                 }
                 if (data.question && data.question !== question) {
@@ -88,10 +89,10 @@ export function AnswerModal({ open, seed, busy, onClose, onConfirm }: Props) {
                     setTags(data.tags.join(', '))
                   }
                 } else {
-                  alert(data.hint || '当前问法已较合适，无需改动。')
+                  void alertDialog(data.hint || '当前问法已较合适，无需改动。')
                 }
               } catch (e) {
-                alert(String(e))
+                void alertDialog(String(e))
               } finally {
                 setSuggesting(false)
               }
@@ -139,7 +140,7 @@ export function AnswerModal({ open, seed, busy, onClose, onConfirm }: Props) {
             disabled={busy}
             onClick={() => {
               if (!question.trim() || !answer.trim()) {
-                alert('问题和答案都不能为空')
+                void alertDialog('问题和答案都不能为空')
                 return
               }
               onConfirm({

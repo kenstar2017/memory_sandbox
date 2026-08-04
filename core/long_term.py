@@ -137,6 +137,11 @@ class LongTermMemory:
 
         self.records: List[MemoryRecord] = []
         self.procedural: Dict[str, str] = {}
+        # declarative.json 的 (mtime_ns, size)：未变则跳过重新解析
+        self._decl_stamp: Optional[Tuple[int, int]] = None
+        # records 文本内容的版本号，BM25 索引据此判断能否复用
+        self._records_version: int = 0
+        self._bm25_cache: Optional[Tuple[int, BM25Index]] = None
         self._load()
 
     def _hybrid_weights(self) -> Tuple[float, float, float]:
@@ -147,6 +152,16 @@ class LongTermMemory:
         if total <= 0:
             return 0.70, 0.30, 0.0
         return vw / total, kw / total, bw / total
+
+    def _bm25_index(self) -> BM25Index:
+        """按 records 版本复用 BM25 索引；reinforce 只改权重不动文本，无需重建。"""
+        cached = self._bm25_cache
+        if cached is not None and cached[0] == self._records_version:
+            return cached[1]
+        index = BM25Index()
+        index.rebuild([self._record_doc_text(r) for r in self.records])
+        self._bm25_cache = (self._records_version, index)
+        return index
 
     @staticmethod
     def _record_doc_text(rec: MemoryRecord) -> str:
@@ -202,14 +217,29 @@ class LongTermMemory:
         """从磁盘重新加载（多进程：App / MCP / CLI 共用同一记忆文件时必需）。"""
         self._load(declarative_only=False)
 
+    def _decl_stamp_now(self) -> Optional[Tuple[int, int]]:
+        """declarative.json 的 (mtime_ns, size)；不存在时 None。"""
+        try:
+            st = self.declarative_path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
     def _load(self, declarative_only: bool = False) -> None:
         with self._file_lock(self._declarative_lock_path, exclusive=False):
-            if self.declarative_path.is_file():
+            stamp = self._decl_stamp_now()
+            # 原子写会更新 mtime/size，据此判断别的进程有没有改过盘
+            if stamp is None:
+                if self.records or self._decl_stamp is not None:
+                    self.records = []
+                    self._records_version += 1
+                self._decl_stamp = None
+            elif stamp != self._decl_stamp:
                 with open(self.declarative_path, "r", encoding="utf-8") as f:
                     raw = json.load(f) or []
                 self.records = [_record_from_dict(item) for item in raw]
-            else:
-                self.records = []
+                self._decl_stamp = stamp
+                self._records_version += 1
 
         if declarative_only:
             return
@@ -233,6 +263,8 @@ class LongTermMemory:
         data = [asdict(r) for r in self.records]
         with self._file_lock(self._declarative_lock_path, exclusive=True):
             self._atomic_write_json(self.declarative_path, data)
+            self._decl_stamp = self._decl_stamp_now()
+            self._records_version += 1
 
     def _save_procedural(self) -> None:
         with self._file_lock(self._procedural_lock_path, exclusive=True):
@@ -249,6 +281,8 @@ class LongTermMemory:
                 self.records = []
             result = mutator()
             self._atomic_write_json(self.declarative_path, [asdict(r) for r in self.records])
+            self._decl_stamp = self._decl_stamp_now()
+            self._records_version += 1
             return result
 
     # ---------- procedural ----------
@@ -442,12 +476,10 @@ class LongTermMemory:
 
         required_feishu_tokens = extract_feishu_tokens(query)
 
-        # BM25：对当前库重建轻量索引（本地体量可接受）
+        # BM25：索引随记忆版本缓存，避免每次检索都重建
         bm25_norm = [0.0] * len(self.records)
         if bw > 0 and self.records:
-            bm25 = BM25Index()
-            bm25.rebuild([self._record_doc_text(r) for r in self.records])
-            raw_bm25 = bm25.score(q_raw + " " + q_core)
+            raw_bm25 = self._bm25_index().score(q_raw + " " + q_core)
             mx_b = max(raw_bm25) if raw_bm25 else 0.0
             if mx_b > 0:
                 bm25_norm = [s / mx_b for s in raw_bm25]

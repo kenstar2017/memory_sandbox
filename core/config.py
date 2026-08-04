@@ -275,8 +275,12 @@ class FeishuConfig:
     # OAuth 回调，需与开放平台「重定向 URL」一致
     redirect_uri: str = "http://127.0.0.1:18765/feishu/callback"
     oauth_scope: str = (
-        "offline_access docs:document.content:read wiki:wiki:readonly wiki:node:read"
+        "offline_access docs:document.content:read wiki:wiki:readonly "
+        "wiki:node:read wiki:node:update docx:document"
     )
+    # 文档域名（如 bytedance.larkoffice.com），用于把 document_id 拼成可点链接；
+    # api_base 是 open.feishu.cn，推不出企业实际域名，所以单独配
+    doc_host: str = ""
     # 开放平台 API 根；国内一般 https://open.feishu.cn
     api_base: str = "https://open.feishu.cn"
     timeout: float = 30.0

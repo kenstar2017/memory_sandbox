@@ -9,14 +9,21 @@ type Props = {
   onTab: (t: 'pending' | 'saved') => void
   onOpenPending: (q: string, index: number) => void
   onOpenSaved: (rec: MemoryRecord) => void
-  onDeletePending: (index: number) => void
-  onDeleteSaved: (rec: MemoryRecord) => void
+  onDeletePending: (index: number) => void | Promise<void>
+  onDeleteSaved: (rec: MemoryRecord) => void | Promise<void>
 }
+
+const MAX_VISIBLE_TAGS = 3
 
 function allTags(saved: MemoryRecord[]): string[] {
   const set = new Set<string>()
   saved.forEach((r) => (r.tags || []).forEach((t) => set.add(t)))
   return Array.from(set).sort()
+}
+
+/** 正文超过两行左右就折叠，提示去 modal 看全文。 */
+function isLong(text: string): boolean {
+  return text.length > 56 || text.includes('\n')
 }
 
 export function SideList({
@@ -89,13 +96,16 @@ export function SideList({
                 onClick={() => onOpenPending(q, idx)}
               >
                 <div className="qa-top">
-                  <span className="badge pending">待补全答</span>
+                  <div className="qa-badges">
+                    <span className="badge pending">待补全答</span>
+                  </div>
                   <button
                     type="button"
                     className="qa-del"
+                    title="删除这条待补全"
                     onClick={(e) => {
                       e.stopPropagation()
-                      onDeletePending(idx)
+                      void onDeletePending(idx)
                     }}
                   >
                     删除
@@ -112,37 +122,52 @@ export function SideList({
           ) : filtered.length === 0 ? (
             <div className="qa-empty">当前标签下无记忆。</div>
           ) : (
-            filtered.map((rec) => (
-              <div
-                key={rec.id}
-                className="qa-item"
-                onClick={() => onOpenSaved(rec)}
-              >
-                <div className="qa-top">
-                  <span className="badge">{rec.scene || 'general'}</span>
-                  {rec.kind && rec.kind !== 'qa' ? (
-                    <span className="badge kind">{rec.kind}</span>
+            filtered.map((rec) => {
+              const recTags = rec.tags || []
+              const extraTags = recTags.length - MAX_VISIBLE_TAGS
+              return (
+                <div
+                  key={rec.id}
+                  className="qa-item"
+                  onClick={() => onOpenSaved(rec)}
+                >
+                  <div className="qa-top">
+                    <div className="qa-badges">
+                      <span className="badge">{rec.scene || 'general'}</span>
+                      {rec.kind && rec.kind !== 'qa' ? (
+                        <span className="badge kind">{rec.kind}</span>
+                      ) : null}
+                      {recTags.slice(0, MAX_VISIBLE_TAGS).map((t) => (
+                        <span key={t} className="badge tag" title={`#${t}`}>
+                          #{t}
+                        </span>
+                      ))}
+                      {extraTags > 0 ? (
+                        <span className="badge tag" title={recTags.join(', ')}>
+                          +{extraTags}
+                        </span>
+                      ) : null}
+                    </div>
+                    <button
+                      type="button"
+                      className="qa-del"
+                      title="删除这条记忆"
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        void onDeleteSaved(rec)
+                      }}
+                    >
+                      删除
+                    </button>
+                  </div>
+                  <p className="qa-q">{rec.question}</p>
+                  <p className="qa-a">{rec.answer}</p>
+                  {isLong(rec.answer || '') ? (
+                    <span className="qa-more">点击查看全文</span>
                   ) : null}
-                  {(rec.tags || []).slice(0, 3).map((t) => (
-                    <span key={t} className="badge tag">
-                      #{t}
-                    </span>
-                  ))}
-                  <button
-                    type="button"
-                    className="qa-del"
-                    onClick={(e) => {
-                      e.stopPropagation()
-                      onDeleteSaved(rec)
-                    }}
-                  >
-                    删除
-                  </button>
                 </div>
-                <p className="qa-q">{rec.question}</p>
-                <p className="qa-a">{rec.answer}</p>
-              </div>
-            ))
+              )
+            })
           ))}
       </div>
     </aside>

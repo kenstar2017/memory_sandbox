@@ -69,6 +69,18 @@ def _print_result(result, as_json: bool, ui: Optional[CliUi] = None) -> None:
     print(f"(source={result.source})", file=sys.stderr)
 
 
+def _feishu_content_arg(args) -> Optional[str]:
+    """取飞书正文：--content-file 优先于 --content；读失败返回 None。"""
+    if args.content_file:
+        try:
+            with open(args.content_file, "r", encoding="utf-8") as f:
+                return f.read()
+        except OSError as e:
+            print(f"读正文文件失败：{e}", file=sys.stderr)
+            return None
+    return args.content or ""
+
+
 def interactive(sandbox: MemorySandbox, as_json: bool = False, local_only: bool = False) -> None:
     ui = CliUi()
     mode = "仅本地记忆" if local_only else "本地记忆 → 可选 LLM"
@@ -253,6 +265,39 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("feishu-bookmark", help="把飞书链接拉成待确认记忆候选")
     sp.add_argument("text", nargs="+", help="含飞书链接的文本")
+
+    sp = sub.add_parser("feishu-set-title", help="改飞书 wiki 节点标题（写操作）")
+    sp.add_argument("url", help="飞书 wiki 链接")
+    sp.add_argument("title", help="新标题")
+    sp.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过交互确认；仅限本人执行，AI 不得自行使用",
+    )
+
+    sp = sub.add_parser("feishu-create-doc", help="在云空间新建飞书文档（写操作）")
+    sp.add_argument("title", help="文档标题")
+    sp.add_argument("--content", default=None, help="正文（Markdown 子集）")
+    sp.add_argument("--content-file", default=None, help="从文件读正文，优先于 --content")
+    sp.add_argument("--folder", default="", help="目标文件夹 token；省略则建在云空间根目录")
+    sp.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过交互确认；仅限本人执行，AI 不得自行使用",
+    )
+
+    sp = sub.add_parser("feishu-edit-body", help="改飞书文档正文（写操作）")
+    sp.add_argument("url", help="飞书 wiki 或 docx 链接")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--append", action="store_true", help="追加到正文末尾")
+    g.add_argument("--replace", action="store_true", help="删掉原正文再写入（破坏性）")
+    sp.add_argument("--content", default=None, help="正文（Markdown 子集）")
+    sp.add_argument("--content-file", default=None, help="从文件读正文，优先于 --content")
+    sp.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过交互确认；仅限本人执行，AI 不得自行使用",
+    )
 
     sp = sub.add_parser("restore", help="从备份恢复长时记忆（覆盖）")
     sp.add_argument("--path", default=None, help="备份文件；省略则用最新一份")
@@ -507,6 +552,123 @@ def main(argv=None) -> int:
     if cmd == "feishu-bookmark":
         text = " ".join(getattr(args, "text", []) or []).strip()
         print(json.dumps(sb.bookmark_feishu(text), ensure_ascii=False, indent=2))
+        return 0
+
+    if cmd == "feishu-set-title":
+        from core.feishu import extract_feishu_urls, update_wiki_node_title
+
+        refs = extract_feishu_urls(args.url)
+        if not refs:
+            print("不是有效的飞书文档链接", file=sys.stderr)
+            return 2
+        ref = refs[0]
+        new_title = (args.title or "").strip()
+        # 改的是团队共享文档，默认二次确认
+        if not args.yes:
+            print(f"将把 {ref.url}")
+            print(f"的标题改为：{new_title}")
+            if input("确认？(y/N) ").strip().lower() not in {"y", "yes"}:
+                print("已取消")
+                return 1
+        res = update_wiki_node_title(
+            sb.config.feishu,
+            ref,
+            new_title,
+            config_path=args.config or str(default_config_path()),
+            confirmed=True,
+        )
+        if not res.ok:
+            print(f"改标题失败：{res.error}", file=sys.stderr)
+            return 2
+        print(f"已改标题：{res.old_title or '(原标题未知)'} → {res.new_title}")
+        return 0
+
+    if cmd == "feishu-create-doc":
+        from core.feishu import create_docx_document, markdown_to_docx_blocks
+
+        content = _feishu_content_arg(args)
+        if content is None:
+            return 2
+        title = (args.title or "").strip()
+        # 新建也是飞书侧写操作，默认二次确认
+        if not args.yes:
+            blocks = markdown_to_docx_blocks(content)
+            where = f"文件夹 {args.folder}" if args.folder else "云空间根目录"
+            print(f"将在{where}新建文档：{title}")
+            print(f"正文：{len(blocks)} 个块（{len(content)} 字）" if blocks else "正文：空")
+            if input("确认？(y/N) ").strip().lower() not in {"y", "yes"}:
+                print("已取消")
+                return 1
+        res = create_docx_document(
+            sb.config.feishu,
+            title,
+            content=content,
+            folder_token=args.folder or "",
+            config_path=args.config or str(default_config_path()),
+            confirmed=True,
+        )
+        if not res.ok:
+            print(f"创建失败：{res.error}", file=sys.stderr)
+            if res.document_id:
+                print(f"已产生半成品文档：document_id={res.document_id}", file=sys.stderr)
+            return 2
+        print(f"已创建：{res.title}（写入 {res.blocks_written} 块）")
+        print(res.url or f"document_id={res.document_id}（配置 feishu.doc_host 可输出链接）")
+        return 0
+
+    if cmd == "feishu-edit-body":
+        from core.feishu import (
+            extract_feishu_urls,
+            markdown_to_docx_blocks,
+            preview_docx_body,
+            update_docx_body,
+        )
+
+        refs = extract_feishu_urls(args.url)
+        if not refs:
+            print("不是有效的飞书文档链接", file=sys.stderr)
+            return 2
+        ref = refs[0]
+        content = _feishu_content_arg(args)
+        if content is None:
+            return 2
+        blocks = markdown_to_docx_blocks(content)
+        if not blocks:
+            print("正文为空，不做改动", file=sys.stderr)
+            return 2
+        mode = "replace" if args.replace else "append"
+        config_path = args.config or str(default_config_path())
+        # 改的是已有内容，确认前先只读看清目标文档，避免改错篇
+        if not args.yes:
+            pre = preview_docx_body(sb.config.feishu, ref, config_path=config_path)
+            if not pre.ok:
+                print(f"读取目标文档失败：{pre.error}", file=sys.stderr)
+                return 2
+            print(f"目标文档：{pre.title or '(标题未知)'}")
+            print(f"链接：{pre.url}")
+            if mode == "replace":
+                print(f"将删除原有 {pre.block_count} 个块，再写入 {len(blocks)} 个块")
+                print("（删除可在飞书「历史版本」里恢复，但请先确认改的是这一篇）")
+            else:
+                print(f"将在末尾追加 {len(blocks)} 个块（现有 {pre.block_count} 块保持不动）")
+            if input("确认？(y/N) ").strip().lower() not in {"y", "yes"}:
+                print("已取消")
+                return 1
+        res = update_docx_body(
+            sb.config.feishu,
+            ref,
+            content,
+            mode=mode,
+            config_path=config_path,
+            confirmed=True,
+        )
+        if not res.ok:
+            print(f"改正文失败：{res.error}", file=sys.stderr)
+            return 2
+        if res.blocks_deleted:
+            print(f"已替换正文：删除 {res.blocks_deleted} 块，写入 {res.blocks_written} 块")
+        else:
+            print(f"已追加正文：写入 {res.blocks_written} 块")
         return 0
 
     if cmd == "list":

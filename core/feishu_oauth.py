@@ -6,6 +6,7 @@ user_access_token 不能在管理后台查看明文，只能通过授权码换�
 from __future__ import annotations
 
 import json
+import secrets
 import threading
 import time
 import urllib.parse
@@ -25,8 +26,26 @@ DEFAULT_SCOPES = (
     "offline_access "
     "docs:document.content:read "
     "wiki:wiki:readonly "
-    "wiki:node:read"
+    "wiki:node:read "
+    "wiki:node:update "
+    # 建文档只需 docx:document:create，但写正文要编辑权限，docx:document 已含创建
+    "docx:document"
 )
+
+
+def _merged_scopes(cfg: FeishuConfig) -> str:
+    """
+    用户配置的 scope 与内置必需 scope 取并集。
+
+    用户配置会覆盖默认值，所以新增权限（如 wiki:node:update）时只改
+    DEFAULT_SCOPES 不够——旧配置会把它挤掉，授权后仍然不可写。
+    """
+    parts = (cfg.oauth_scope or "").split() + DEFAULT_SCOPES.split()
+    merged: list[str] = []
+    for p in parts:
+        if p and p not in merged:
+            merged.append(p)
+    return " ".join(merged)
 
 
 def persist_feishu_auth(
@@ -81,20 +100,23 @@ def apply_tokens_to_config(
         cfg.user_token_expires_at = int(time.time()) + int(expires_in) - 60
 
 
-def build_authorize_url(cfg: FeishuConfig) -> str:
+def build_authorize_url(cfg: FeishuConfig, *, state: str = "") -> str:
     app_id, _, _, _ = _resolve_credentials(cfg)
     if not app_id:
         raise RuntimeError("缺少 feishu.app_id")
     redirect = (cfg.redirect_uri or DEFAULT_REDIRECT).strip()
-    scope = (cfg.oauth_scope or DEFAULT_SCOPES).strip()
+    scope = _merged_scopes(cfg)
     # 与 @byted/mcp-lark-docs 一致：accounts 域 authorize
-    q = urllib.parse.urlencode(
-        {
-            "client_id": app_id,
-            "redirect_uri": redirect,
-            "scope": scope,
-        }
-    )
+    # response_type 必填：缺失时飞书可能忽略 scope，导致换票不下发 refresh_token
+    params = {
+        "client_id": app_id,
+        "redirect_uri": redirect,
+        "scope": scope,
+        "response_type": "code",
+    }
+    if state:
+        params["state"] = state
+    q = urllib.parse.urlencode(params)
     return f"https://accounts.feishu.cn/open-apis/authen/v1/authorize?{q}"
 
 
@@ -279,6 +301,7 @@ def run_oauth_login(
 
     holder: Dict[str, Any] = {}
     event = threading.Event()
+    state = secrets.token_urlsafe(16)
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, fmt, *args):
@@ -294,6 +317,9 @@ def run_oauth_login(
             if qs.get("error"):
                 holder["error"] = qs.get("error", ["unknown"])[0]
                 body = "<h3>授权失败</h3><p>可关闭此页回到终端。</p>".encode("utf-8")
+            elif not secrets.compare_digest((qs.get("state") or [""])[0], state):
+                holder["error"] = "state 不匹配，疑似伪造回调"
+                body = "<h3>回调校验失败</h3>".encode("utf-8")
             else:
                 code = (qs.get("code") or [""])[0]
                 if not code:
@@ -317,7 +343,7 @@ def run_oauth_login(
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
 
-    auth_url = build_authorize_url(cfg)
+    auth_url = build_authorize_url(cfg, state=state)
     print("请在飞书开放平台「安全设置 → 重定向 URL」添加：")
     print(f"  {redirect}")
     print("权限建议包含：offline_access、wiki/docx 读权限")
@@ -340,6 +366,14 @@ def run_oauth_login(
     expires_in = int(data.get("expires_in") or 7200)
     if not access:
         raise RuntimeError(f"换票结果无 access_token: {data}")
+    if not refresh:
+        # 没有 refresh_token 意味着 token 到期（默认 2 小时）后只能再次手动授权，
+        # 静默通过会让人误以为已长期可用，所以这里必须显式提示。
+        print(
+            "警告：本次授权未下发 refresh_token，"
+            f"token 将在约 {expires_in // 60} 分钟后失效且无法自动续期。\n"
+            "  请在开放平台为应用开通 offline_access 权限，然后重新执行本登录流程。"
+        )
 
     apply_tokens_to_config(
         cfg,

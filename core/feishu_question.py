@@ -36,6 +36,10 @@ _INTENT_KEEP = re.compile(
     r"(技术细节|技术储备|前端|后端|客服|架构|接入|工单|IM|迭代|总结|要点|方案|踩坑|配置|部署)"
 )
 
+# 截断优先落在这些字符上，避免切碎专有名词
+_BOUNDARY_CHARS = " \t，,。.;；、（(【[《"
+_OPEN_TO_CLOSE = {"（": "）", "(": ")", "【": "】", "[": "]", "《": "》"}
+
 
 def strip_feishu_urls(text: str) -> str:
     t = _URL_STRIP_RE.sub(" ", text or "")
@@ -80,6 +84,28 @@ def resolve_doc_title(result: FeishuFetchResult) -> str:
     return fallback or title or "飞书文档"
 
 
+def _drop_unclosed_bracket(text: str) -> str:
+    """截断可能留下不配对的开括号（…方案（【FE），连同其后内容一起去掉。"""
+    cut = len(text)
+    for op, close in _OPEN_TO_CLOSE.items():
+        i = text.rfind(op)
+        if i != -1 and text.find(close, i) == -1:
+            cut = min(cut, i)
+    return text[:cut]
+
+
+def _truncate_on_boundary(text: str, limit: int) -> str:
+    """超长时在最近的标点/空格处断开，避免把专有名词切成半截。"""
+    if len(text) <= limit:
+        return text
+    head = text[:limit]
+    cut = max(head.rfind(c) for c in _BOUNDARY_CHARS)
+    # 边界太靠前会丢掉大半内容，这种情况直接硬截
+    if cut >= limit // 2:
+        head = head[:cut]
+    return _drop_unclosed_bracket(head).rstrip(_BOUNDARY_CHARS)
+
+
 def _compress_intent(intent: str, title: str) -> str:
     t = clean_text(intent)
     for p in _WEAK_PHRASES:
@@ -90,18 +116,19 @@ def _compress_intent(intent: str, title: str) -> str:
         t = t.replace(title, " ").strip(" ，,")
     if not t:
         return ""
-    # 若仍很长，优先保留关键语义词拼一句
     if len(t) > 36:
-        keys = _INTENT_KEEP.findall(t)
-        if keys:
-            # 保序去重
-            seen = []
-            for k in keys:
-                if k not in seen:
-                    seen.append(k)
+        # 保序去重
+        seen: List[str] = []
+        for k in _INTENT_KEEP.findall(t):
+            if k not in seen:
+                seen.append(k)
+        # 词表压缩是有损的：zIndex / backstage 这类专有主题词不在表里，
+        # 命中少时压缩会把整句只剩一个「方案」，正好丢掉检索最需要的词。
+        # 因此只在命中够多（原句多为套话堆砌）时压缩，否则截断保留原文。
+        if len(seen) >= 3:
             t = "、".join(seen[:6])
         else:
-            t = t[:36].rstrip("，, ")
+            t = _truncate_on_boundary(t, 36)
     return t
 
 

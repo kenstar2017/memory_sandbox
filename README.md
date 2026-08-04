@@ -209,11 +209,13 @@ See `config.yaml`:
 - `long_term.persist_dir`: persistence dir (default `data/memory`)
 - `llm.provider`: `mock` (offline stub) | `cursor` | `openai_compatible`
 - `llm.runtime` (cursor only): `local` (local `agent` CLI, can read disk) | `cloud` (no repo; cannot scan local source)
-- `feishu.*`: Feishu wiki/docx reading (see “Feishu / Lark document reading” below)
+- `feishu.*`: Feishu wiki/docx read & write (see “Feishu / Lark documents” below)
 
-## Feishu / Lark document reading
+## Feishu / Lark documents (read & write)
 
 When a message contains a Feishu wiki/docx URL, the sandbox can **fetch the body** before LLM fallback.
+Three **write** capabilities also exist (rename a wiki node, create a doc, edit a doc body) — see
+“Writing to Feishu” below; all of them **require your confirmation every time**.
 
 - Does **not** depend on Cursor/Trae MCP; does **not** change `~/.cursor/mcp.json`
 - Secrets stay in the local user config — **do not commit**
@@ -249,7 +251,7 @@ Env (optional): `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_USER_ACCESS_TOKE
 
 ### Setup
 
-1. Create an app in the [Feishu Open Platform](https://open.feishu.cn/). Suggested scopes: `offline_access`, `docs:document.content:read`, `wiki:wiki:readonly` / `wiki:node:read`.
+1. Create an app in the [Feishu Open Platform](https://open.feishu.cn/). Read-only scopes: `offline_access`, `docs:document.content:read`, `wiki:wiki:readonly` / `wiki:node:read`. For writes add `wiki:node:update` (rename) and/or `docx:document` (create a doc and write its body).
 2. Add redirect URL (must match config exactly):
 
 ```text
@@ -289,13 +291,52 @@ Stores `user_access_token` + `refresh_token`; auto-refresh on expiry.
 | `重试` / `再试一次` / `重新分析` | Skip working-memory reuse |
 | `清空工作记忆` | Clear short-term window |
 
+### Writing to Feishu (confirmation required every time)
+
+Feishu docs are usually shared with the team and edits are hard to roll back, so writes are
+**deny-by-default**:
+
+- Write functions in `core/feishu.py` take `confirmed=False` by default and **return an error
+  without issuing any request** unless `True` is passed explicitly
+- The CLI asks for confirmation interactively; `--yes` is for you only
+- See `.cursor/rules/memory-sandbox.mdc`: the agent must not initiate writes, and a previous
+  approval never counts as approval for the current change
+
+```bash
+python3 main.py feishu-set-title <wiki URL> "<new title>"             # needs wiki:node:update
+python3 main.py feishu-create-doc "<title>" --content-file notes.md   # needs docx:document
+python3 main.py feishu-edit-body <URL> --append  --content-file notes.md   # append to the end
+python3 main.py feishu-edit-body <URL> --replace --content-file notes.md   # wipe body, rewrite
+```
+
+Renaming only works on wiki links — a docx direct link carries no `space_id` / `node_token`.
+Body edits accept both wiki and docx links, and `--append` / `--replace` must be chosen
+explicitly. Before asking for confirmation the CLI does a **read-only** fetch and prints the
+target title plus its current block count; `--replace` also spells out how many blocks it will
+delete, because editing the wrong document costs more than writing the wrong text. Empty content
+is always rejected, so a file that happens to read empty can never wipe a document.
+
+Document bodies accept a Markdown subset: `#`–`######` headings, `-`/`*` bullets, `1.` ordered
+items, ``` code fences, `>` quotes, `---` dividers; everything else non-blank becomes a paragraph.
+**Inline syntax (bold, links) is not parsed** and is written as plain text.
+
+API limits handled for you, but worth knowing: the create API sets the title only (the body needs
+a second “create blocks” call, hence the edit scope); a single request handles at most 50 blocks,
+so writes and deletes are batched and throttled to 3 requests/second; deletes take a half-open
+`[start_index, end_index)` range, and each batch removes the frontmost slice because later blocks
+shift down. If a create’s body write fails mid-way the doc already exists and the error carries
+its `document_id`; if a `--replace` deletes and then fails to write, the error points you at
+Feishu’s version history.
+
 ### Troubleshooting
 
 | Symptom | Fix |
 |---------|-----|
 | `99991668` | Re-run `feishu_login.py` |
-| `131006` | Need user token for personal docs, or authorize the doc to the app |
+| `131006` | Need user token for personal docs, or authorize the doc to the app; writes also need container edit permission |
+| `1770040` / `1770032` | No edit permission on the target folder, or `docx:document` not enabled |
 | Missing wiki scope | Enable wiki read scopes on the app |
+| New scope still denied | Scopes are baked into the token — re-run `python3 scripts/feishu_login.py` |
 | Callback timeout | Redirect URL must match; port `18765` free |
 | Stale answer | Clear working memory or say「重试」; restart Web after code changes |
 | Repo config ignored | Edit Application Support user config |

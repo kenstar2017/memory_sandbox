@@ -276,7 +276,8 @@ class FeishuConfig:
     redirect_uri: str = "http://127.0.0.1:18765/feishu/callback"
     oauth_scope: str = (
         "offline_access docs:document.content:read wiki:wiki:readonly "
-        "wiki:node:read wiki:node:update docx:document"
+        "wiki:node:read wiki:node:update docx:document:create "
+        "docx:document:readonly docx:document:write_only"
     )
     # 文档域名（如 bytedance.larkoffice.com），用于把 document_id 拼成可点链接；
     # api_base 是 open.feishu.cn，推不出企业实际域名，所以单独配

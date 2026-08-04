@@ -28,14 +28,21 @@ DEFAULT_SCOPES = (
     "wiki:wiki:readonly "
     "wiki:node:read "
     "wiki:node:update "
-    # 建文档只需 docx:document:create，但写正文要编辑权限，docx:document 已含创建
-    "docx:document"
+    # 云文档写能力：API 文档统称 docx:document，但开放平台后台只能勾这三项细分权限，
+    # 分别对应「创建文档」「获取所有子块」「创建块 / 删除块」
+    "docx:document:create "
+    "docx:document:readonly "
+    "docx:document:write_only"
 )
+
+# 已被开放平台拆分、后台再也勾不到的聚合权限。请求它会让整个授权页报
+# 20027「当前应用权限不足」，所以必须从旧配置里剔掉，而不是跟着并进去。
+_RETIRED_SCOPES = {"docx:document"}
 
 
 def _merged_scopes(cfg: FeishuConfig) -> str:
     """
-    用户配置的 scope 与内置必需 scope 取并集。
+    用户配置的 scope 与内置必需 scope 取并集，并剔除已废弃的聚合权限。
 
     用户配置会覆盖默认值，所以新增权限（如 wiki:node:update）时只改
     DEFAULT_SCOPES 不够——旧配置会把它挤掉，授权后仍然不可写。
@@ -43,7 +50,7 @@ def _merged_scopes(cfg: FeishuConfig) -> str:
     parts = (cfg.oauth_scope or "").split() + DEFAULT_SCOPES.split()
     merged: list[str] = []
     for p in parts:
-        if p and p not in merged:
+        if p and p not in merged and p not in _RETIRED_SCOPES:
             merged.append(p)
     return " ".join(merged)
 

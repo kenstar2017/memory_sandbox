@@ -251,7 +251,7 @@ Env (optional): `FEISHU_APP_ID` / `FEISHU_APP_SECRET` / `FEISHU_USER_ACCESS_TOKE
 
 ### Setup
 
-1. Create an app in the [Feishu Open Platform](https://open.feishu.cn/). Read-only scopes: `offline_access`, `docs:document.content:read`, `wiki:wiki:readonly` / `wiki:node:read`. For writes add `wiki:node:update` (rename) and/or `docx:document` (create a doc and write its body).
+1. Create an app in the [Feishu Open Platform](https://open.feishu.cn/). Read-only scopes: `offline_access`, `docs:document.content:read`, `wiki:wiki:readonly` / `wiki:node:read`. For writes add `wiki:node:update` (rename) and/or `docx:document:create` + `docx:document:readonly` + `docx:document:write_only` (create a doc, edit a body). **The console has no `docx:document` entry** — the API docs use that umbrella name, but only the three granular scopes are selectable. Scopes are also split into “app identity (tenant_access_token)” and “user identity (user_access_token)” tabs; this project uses the user token, so **enable them under user identity**.
 2. Add redirect URL (must match config exactly):
 
 ```text
@@ -304,7 +304,7 @@ Feishu docs are usually shared with the team and edits are hard to roll back, so
 
 ```bash
 python3 main.py feishu-set-title <wiki URL> "<new title>"             # needs wiki:node:update
-python3 main.py feishu-create-doc "<title>" --content-file notes.md   # needs docx:document
+python3 main.py feishu-create-doc "<title>" --content-file notes.md   # needs :create + :write_only
 python3 main.py feishu-edit-body <URL> --append  --content-file notes.md   # append to the end
 python3 main.py feishu-edit-body <URL> --replace --content-file notes.md   # wipe body, rewrite
 ```
@@ -334,9 +334,10 @@ Feishu’s version history.
 |---------|-----|
 | `99991668` | Re-run `feishu_login.py` |
 | `131006` | Need user token for personal docs, or authorize the doc to the app; writes also need container edit permission |
-| `1770040` / `1770032` | No edit permission on the target folder, or `docx:document` not enabled |
+| `1770040` / `1770032` | No edit permission on the target folder, or `docx:document:write_only` not enabled |
 | Missing wiki scope | Enable wiki read scopes on the app |
 | New scope still denied | Scopes are baked into the token — re-run `python3 scripts/feishu_login.py` |
+| Consent screen says `20027` “insufficient permission: docx:document” | That umbrella scope no longer exists in the console, so it can never be granted. We now request `docx:document:create` / `:readonly` / `:write_only`, and `_RETIRED_SCOPES` strips a stale `docx:document` from old configs. Also check that (1) the scopes are enabled under the **user identity** tab, (2) `:write_only` needs admin review, and (3) scope changes require publishing a new app version |
 | Callback timeout | Redirect URL must match; port `18765` free |
 | Stale answer | Clear working memory or say「重试」; restart Web after code changes |
 | Repo config ignored | Edit Application Support user config |

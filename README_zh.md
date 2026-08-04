@@ -281,7 +281,7 @@ cd desktop && npm run tauri:dev
 
 ### 接入步骤
 
-1. 在 [飞书开放平台](https://open.feishu.cn/) 创建应用，记下 App ID / App Secret。只读所需权限：`offline_access`、`docs:document.content:read`、`wiki:wiki:readonly` / `wiki:node:read`；要用写能力再按需加 `wiki:node:update`（改标题）、`docx:document`（新建文档并写正文）。
+1. 在 [飞书开放平台](https://open.feishu.cn/) 创建应用，记下 App ID / App Secret。只读所需权限：`offline_access`、`docs:document.content:read`、`wiki:wiki:readonly` / `wiki:node:read`；要用写能力再按需加 `wiki:node:update`（改标题）、`docx:document:create` + `docx:document:readonly` + `docx:document:write_only`（新建文档、改正文）。**注意后台没有 `docx:document` 这一项**，虽然 API 文档统称它，实际只能勾这三项细分权限；另外权限分「应用身份 tenant_access_token」和「用户身份 user_access_token」两个 Tab，本项目用 user token，**必须在用户身份那一栏开通**。
 2. 「安全设置 → 重定向 URL」添加（须与配置完全一致）：
 
 ```text
@@ -358,7 +358,7 @@ python3 main.py feishu-create-doc "<标题>" --content-file notes.md
 python3 main.py feishu-create-doc "<标题>" --folder <文件夹 token>   # 省略则建在根目录
 ```
 
-需权限 `docx:document`（含创建与编辑；只建空文档也可只开 `docx:document:create`）。
+需权限 `docx:document:create`（建文档）+ `docx:document:write_only`（写正文；只建空文档不需要它）。
 
 改已有文档的正文（wiki 与 docx 链接都行；`--append` / `--replace` **必须显式选一个**）：
 
@@ -367,7 +367,7 @@ python3 main.py feishu-edit-body <链接> --append  --content-file notes.md   # 
 python3 main.py feishu-edit-body <链接> --replace --content-file notes.md   # 删原正文再写
 ```
 
-同样只需 `docx:document`，没有额外权限。确认前会先**只读**拉一次目标文档，打印标题与现有块数，
+需 `docx:document:readonly`（数现有块）+ `docx:document:write_only`（增删块）。确认前会先**只读**拉一次目标文档，打印标题与现有块数，
 `--replace` 还会明说「将删除原有 N 个块」——改错篇的代价比改错内容大得多。
 
 - `--append` 不动原有内容，最安全
@@ -394,9 +394,10 @@ python3 main.py feishu-edit-body <链接> --replace --content-file notes.md   # 
 |------|------|
 | `99991668` Invalid access token | 再跑 `feishu_login.py` |
 | `131006` node permission denied | 个人文档靠 user token；或把文档授权给应用；写操作还需该节点的容器编辑权限 |
-| `1770040` / `1770032` no folder permission | 新建文档时目标文件夹没有编辑权限，或未开通 `docx:document` |
+| `1770040` / `1770032` no folder permission | 新建文档时目标文件夹没有编辑权限，或未开通 `docx:document:write_only` |
 | 缺 wiki scope | 开放平台开通 wiki 读权限 |
 | 开了新权限仍报无权限 | scope 固定在 token 里，改完权限要重跑 `python3 scripts/feishu_login.py` |
+| 授权页报 `20027`「当前应用权限不足：docx:document」 | 后台没有 `docx:document` 这个聚合权限，勾不到也就请求不到。已改为请求 `docx:document:create` / `:readonly` / `:write_only` 三项细分权限；旧配置里残留的 `docx:document` 会被 `_RETIRED_SCOPES` 自动剔除。同时确认：①「用户身份权限 user_access_token」Tab 也开通了（本项目用 user token，光开应用身份无效）②`:write_only` 属**需审核权限**，要等管理员批准 ③权限变更后要**创建版本并发布**才生效 |
 | 回调失败 / 超时 | 重定向 URL 完全一致；`18765` 未被占用 |
 | 只回旧答案 | 「清空工作记忆」或加「重试」；改代码后重启 Web |
 | 改仓库 `config.yaml` 不生效 | 改 Application Support 用户配置 |

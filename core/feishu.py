@@ -739,7 +739,11 @@ def create_docx_document(
     def _permission_hint(err: str) -> str:
         low = err.lower()
         if "1770040" in err or "1770032" in err or "permission" in low:
-            return "；创建/写入需应用开通 docx:document，指定文件夹时还需该文件夹的编辑权限"
+            return (
+                "；创建需 docx:document:create、写正文需 docx:document:write_only"
+                "（后台没有 docx:document 这一项，只能勾细分权限），"
+                "指定文件夹时还需该文件夹的编辑权限"
+            )
         return ""
 
     try:
@@ -969,7 +973,10 @@ def update_docx_body(
         err = str(e)
         hint = ""
         if "1770032" in err or "131006" in err or "permission" in err.lower():
-            hint = "；改正文需要该文档的编辑权限，并确认应用已开通 docx:document"
+            hint = (
+                "；改正文需要该文档的编辑权限，并确认应用已开通 "
+                "docx:document:readonly + docx:document:write_only"
+            )
         return FeishuBodyUpdateResult(url=ref.url, ok=False, error=err + hint)
 
     deleted = 0

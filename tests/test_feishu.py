@@ -3,6 +3,7 @@
 import shutil
 import tempfile
 import unittest
+import urllib.parse
 from unittest import mock
 
 from core import MemorySandbox
@@ -321,6 +322,36 @@ class FeishuWriteScopeTests(unittest.TestCase):
         cfg = FeishuConfig(app_id="cli_x", oauth_scope="wiki:node:read")
         self.assertIn("wiki%3Anode%3Aupdate", build_authorize_url(cfg))
 
+    def test_docx_scopes_are_the_granular_ones(self):
+        """后台只有 create/readonly/write_only 三项，请求聚合名 docx:document 会报 20027。"""
+        from core.feishu_oauth import _merged_scopes
+
+        merged = _merged_scopes(FeishuConfig(app_id="cli_x")).split()
+        self.assertIn("docx:document:create", merged)
+        self.assertIn("docx:document:readonly", merged)
+        self.assertIn("docx:document:write_only", merged)
+        self.assertNotIn("docx:document", merged)
+
+    def test_retired_scope_dropped_from_stale_config(self):
+        """旧配置里残留的 docx:document 会让整个授权页失败，必须剔掉而不是并进去。"""
+        from core.feishu_oauth import _merged_scopes
+
+        cfg = FeishuConfig(
+            app_id="cli_x", oauth_scope="offline_access docx:document"
+        )
+        merged = _merged_scopes(cfg).split()
+        self.assertNotIn("docx:document", merged)
+        self.assertIn("docx:document:write_only", merged)
+
+    def test_authorize_url_has_no_retired_scope(self):
+        from core.feishu_oauth import build_authorize_url
+
+        cfg = FeishuConfig(app_id="cli_x", oauth_scope="docx:document")
+        url = build_authorize_url(cfg)
+        scope = urllib.parse.parse_qs(urllib.parse.urlparse(url).query)["scope"][0]
+        self.assertNotIn("docx:document", scope.split())
+        self.assertIn("docx:document:create", scope.split())
+
 
 class FeishuTitleUpdateTests(unittest.TestCase):
     def _cfg(self):
@@ -465,7 +496,7 @@ class FeishuCreateDocTests(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertEqual(res.document_id, "doc999")
         self.assertIn("已创建", res.error)
-        self.assertIn("docx:document", res.error)
+        self.assertIn("docx:document:write_only", res.error)
 
 
 class FeishuEditBodyTests(unittest.TestCase):

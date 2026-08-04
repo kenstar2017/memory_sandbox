@@ -44,6 +44,30 @@ def _sandbox() -> MemorySandbox:
     return _SANDBOX
 
 
+def _fresh_feishu_cfg(sb: MemorySandbox) -> Any:
+    """
+    每次飞书调用都从磁盘重读凭据。
+
+    MCP 是常驻进程、sandbox 是启动时建的单例，而 scripts/feishu_login.py 把新 token
+    写在用户配置里。用缓存的话重新登录后工具会一直报「token 失效」，直到重启 MCP，
+    而调用方根本看不出这是缓存问题。
+    """
+    try:
+        fresh = load_config(str(default_config_path())).feishu
+    except Exception:  # noqa: BLE001
+        return sb.config.feishu
+    sb.config.feishu = fresh
+    return fresh
+
+
+_MARKDOWN_HELP = (
+    "Markdown 子集：#~###### 标题、-/* 无序列表、1. 有序列表、``` 代码块、> 引用、"
+    "--- 分割线、GFM 表格（| a | b | 加 |---|---| 分隔行）；"
+    "行内支持 **粗体**、*斜体*、~~删除线~~、`代码`、[文字](链接)。"
+    "表格直接按 Markdown 写就行，会转成真表格；代码块里的 ** 和 | 保持字面量。"
+    "不支持图片、脚注、任务列表、单元格内换行。"
+)
+
 TOOLS: List[Dict[str, Any]] = [
     {
         "name": "memory_prepare",
@@ -317,6 +341,189 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_feishu_read",
+        "description": (
+            "读飞书文档正文纯文本（需已配置并登录飞书）。要看/分析/引用文档内容就用这个。"
+            "超长文档按 max_chars 截断，返回 next_offset，用同一 url 带 offset 接着读。"
+            "区分：要正文用本工具；只想确认「是哪一篇、多少块」用 memory_feishu_preview；"
+            "想把文档存成记忆候选用 memory_feishu_bookmark。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 或 docx 链接"},
+                "max_chars": {
+                    "type": "integer",
+                    "description": "单次返回正文上限字符数，默认 30000",
+                    "default": 30000,
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "从第几个字符开始读，配合 next_offset 续读，默认 0",
+                    "default": 0,
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "memory_feishu_preview",
+        "description": (
+            "只读查看飞书文档的标题与当前正文块数（需已配置并登录飞书）。**不返回正文**，"
+            "要正文请用 memory_feishu_read。"
+            "改正文前先用它确认「改的是哪一篇、会动多少内容」，再拿给用户确认。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 或 docx 链接"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "memory_feishu_list_comments",
+        "description": (
+            "只读：拉飞书文档的全部评论（含别人在客户端里加的局部评论，看 is_whole / quote 区分）。"
+            "适合看「评审意见都提了什么」。需已开通 docs:document.comment:read。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 或 docx 链接"},
+                "max_comments": {
+                    "type": "integer",
+                    "description": "最多返回多少条评论，默认 200",
+                    "default": 200,
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "memory_feishu_comment",
+        "description": (
+            "给飞书文档加评论（写操作，会通知文档协作者）。三种模式："
+            "传 anchor_text 或 block_id = **局部评论（划词评论）**，锚定到具体段落、"
+            "在正文旁边显示并带引用；传 comment_id = 回复已有评论；"
+            "都不传 = 全文评论，显示在文档底部。"
+            "**审阅/逐条指出问题时优先用 anchor_text 做局部评论**，别把多个问题"
+            "合并成一条全文评论。anchor_text 命中多个段落会报错，这时换更独特的"
+            "片段或改用 block_id。"
+            "【硬性约定】必须先在对话里说明「评论哪一篇、评论在哪段、评论什么内容」，"
+            "取得用户本轮明确同意后才能传 confirmed=true；上一轮批准过不算本次的确认。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 或 docx 链接"},
+                "text": {"type": "string", "description": "评论内容（纯文本）"},
+                "anchor_text": {
+                    "type": "string",
+                    "description": (
+                        "要评论的原文片段（取一小段连续且独特的文字即可），"
+                        "命中的那个段落会成为评论锚点"
+                    ),
+                },
+                "block_id": {
+                    "type": "string",
+                    "description": "已知块 ID 时直接锚定；与 anchor_text 二选一",
+                },
+                "comment_id": {
+                    "type": "string",
+                    "description": "填则视为回复该条评论；不能与 anchor_text/block_id 同时用",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "必须为 true 才执行；仅在用户本轮明确同意后传",
+                    "default": False,
+                },
+            },
+            "required": ["url", "text", "confirmed"],
+        },
+    },
+    {
+        "name": "memory_feishu_create_doc",
+        "description": (
+            "在本人云空间新建飞书文档，可带 Markdown 正文（写操作）。"
+            "【硬性约定】必须先在对话里说明「要建什么标题、建在哪、正文大意」，"
+            "取得用户本轮明确同意后才能传 confirmed=true；用户没说就不要自行调用。"
+            "上一轮批准过不算本次的确认。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "title": {"type": "string", "description": "文档标题"},
+                "content": {
+                    "type": "string",
+                    "description": f"正文。{_MARKDOWN_HELP}",
+                },
+                "folder_token": {
+                    "type": "string",
+                    "description": "目标文件夹 token；省略则建在云空间根目录",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "必须为 true 才执行；仅在用户本轮明确同意后传",
+                    "default": False,
+                },
+            },
+            "required": ["title", "confirmed"],
+        },
+    },
+    {
+        "name": "memory_feishu_edit_body",
+        "description": (
+            "改飞书文档正文（写操作）。mode=append 追加到末尾；mode=replace 删掉原正文再写入。"
+            "【硬性约定】必须先用 memory_feishu_preview 确认目标文档，在对话里说明"
+            "「改哪一篇、追加还是替换、会删多少块」，取得用户本轮明确同意后才能传 confirmed=true。"
+            "replace 会真的删除原有块（飞书侧可用历史版本恢复），尤其不可自行发起。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 或 docx 链接"},
+                "content": {
+                    "type": "string",
+                    "description": f"新正文。{_MARKDOWN_HELP}",
+                },
+                "mode": {
+                    "type": "string",
+                    "enum": ["append", "replace"],
+                    "description": "append=追加到末尾（安全）；replace=删原正文再写（破坏性）",
+                    "default": "append",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "必须为 true 才执行；仅在用户本轮明确同意后传",
+                    "default": False,
+                },
+            },
+            "required": ["url", "content", "confirmed"],
+        },
+    },
+    {
+        "name": "memory_feishu_set_title",
+        "description": (
+            "改飞书 wiki 节点标题（写操作）。只支持 wiki 链接，docx 直链没有 space_id/node_token。"
+            "【硬性约定】必须先在对话里说明「改哪一篇、从什么改成什么」，"
+            "取得用户本轮明确同意后才能传 confirmed=true。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 链接"},
+                "title": {"type": "string", "description": "新标题"},
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "必须为 true 才执行；仅在用户本轮明确同意后传",
+                    "default": False,
+                },
+            },
+            "required": ["url", "title", "confirmed"],
+        },
+    },
+    {
         "name": "memory_restore",
         "description": "从备份恢复长时记忆（覆盖当前）。不传 path 则恢复最新一份备份。",
         "inputSchema": {
@@ -535,6 +742,287 @@ def _ask_payload(
         has_refs=bool(payload.get("references")),
     )
     return payload
+
+
+def _feishu_ref(url: str):
+    """从入参里取第一个飞书链接；取不到返回 None。"""
+    from core.feishu import extract_feishu_urls
+
+    refs = extract_feishu_urls(url or "")
+    return refs[0] if refs else None
+
+
+def _call_feishu_tool(
+    sb: MemorySandbox, name: str, args: Dict[str, Any]
+) -> Dict[str, Any]:
+    """
+    飞书读写工具。写操作一律要求显式 confirmed=true。
+
+    这里的门禁和 CLI 是同一层（core.feishu 的写函数默认拒绝），MCP 只是再挡一次，
+    好让「未确认」直接以工具错误的形式回给调用方，而不是发出请求后才失败。
+    """
+    from core.feishu import (
+        create_docx_comment,
+        create_docx_document,
+        fetch_feishu_document,
+        list_docx_comments,
+        preview_docx_body,
+        update_docx_body,
+        update_wiki_node_title,
+    )
+
+    cfg = _fresh_feishu_cfg(sb)
+    config_path = str(default_config_path())
+
+    def _remember(**kw: Any) -> str:
+        """
+        落库失败绝不能盖掉「文档已经写成功」这件事：否则调用方看到 isError
+        可能重试，于是又建一篇重复文档。出错就把原因塞回 payload。
+        """
+        try:
+            return sb.remember_feishu_write(**kw) or "未落库（飞书侧无实际改动）"
+        except Exception as e:  # noqa: BLE001
+            return f"落库失败（飞书侧改动已生效，请手动 memory_remember）：{e}"
+
+    def _need_confirm() -> Dict[str, Any]:
+        return _tool_result(
+            "未确认：改动飞书文档需用户本轮明确同意。请先在对话里说明要改哪一篇、"
+            "怎么改，得到用户同意后再带 confirmed=true 调用。",
+            is_error=True,
+        )
+
+    if name == "memory_feishu_read":
+        ref = _feishu_ref(args.get("url") or "")
+        if ref is None:
+            return _tool_result("不是有效的飞书文档链接", is_error=True)
+        res = fetch_feishu_document(cfg, ref, config_path=config_path)
+        if not res.ok:
+            return _tool_result(
+                json.dumps(
+                    {"ok": False, "url": res.url, "error": res.error},
+                    ensure_ascii=False,
+                    indent=2,
+                ),
+                is_error=True,
+            )
+        content = res.content or ""
+        total = len(content)
+        try:
+            offset = max(0, int(args.get("offset") or 0))
+            max_chars = int(args.get("max_chars") or 30000)
+        except (TypeError, ValueError):
+            return _tool_result("offset / max_chars 必须是整数", is_error=True)
+        max_chars = max(1, max_chars)
+        chunk = content[offset : offset + max_chars]
+        end = offset + len(chunk)
+        payload = {
+            "ok": True,
+            "url": res.url,
+            "title": res.title,
+            "document_id": res.document_id,
+            "total_chars": total,
+            "offset": offset,
+            "returned_chars": len(chunk),
+            "truncated": end < total,
+            "next_offset": end if end < total else None,
+            "content": chunk,
+        }
+        return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    if name == "memory_feishu_preview":
+        ref = _feishu_ref(args.get("url") or "")
+        if ref is None:
+            return _tool_result("不是有效的飞书文档链接", is_error=True)
+        pre = preview_docx_body(cfg, ref, config_path=config_path)
+        payload = {
+            "ok": pre.ok,
+            "url": pre.url,
+            "title": pre.title,
+            "document_id": pre.document_id,
+            "block_count": pre.block_count,
+            "error": pre.error,
+        }
+        return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
+
+    if name == "memory_feishu_list_comments":
+        ref = _feishu_ref(args.get("url") or "")
+        if ref is None:
+            return _tool_result("不是有效的飞书文档链接", is_error=True)
+        try:
+            cap = int(args.get("max_comments") or 200)
+        except (TypeError, ValueError):
+            return _tool_result("max_comments 必须是整数", is_error=True)
+        res = list_docx_comments(cfg, ref, config_path=config_path, max_comments=cap)
+        payload = {
+            "ok": res.ok,
+            "url": res.url,
+            "title": res.title,
+            "document_id": res.document_id,
+            "count": len(res.comments),
+            "truncated": res.truncated,
+            "error": res.error,
+            "comments": [
+                {
+                    "comment_id": c.comment_id,
+                    "user_id": c.user_id,
+                    "created_at": c.created_at,
+                    "is_whole": c.is_whole,
+                    "is_solved": c.is_solved,
+                    "quote": c.quote,
+                    "replies": c.replies,
+                }
+                for c in res.comments
+            ],
+        }
+        return _tool_result(
+            json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+        )
+
+    if name == "memory_feishu_comment":
+        if not bool(args.get("confirmed")):
+            return _need_confirm()
+        ref = _feishu_ref(args.get("url") or "")
+        if ref is None:
+            return _tool_result("不是有效的飞书文档链接", is_error=True)
+        res = create_docx_comment(
+            cfg,
+            ref,
+            args.get("text") or "",
+            comment_id=(args.get("comment_id") or "").strip(),
+            block_id=(args.get("block_id") or "").strip(),
+            anchor_text=(args.get("anchor_text") or "").strip(),
+            config_path=config_path,
+            confirmed=True,
+        )
+        payload = {
+            "ok": res.ok,
+            "url": res.url,
+            "title": res.title,
+            "document_id": res.document_id,
+            "comment_id": res.comment_id,
+            "replied_to": res.replied_to,
+            "block_id": res.block_id,
+            "is_whole": not res.block_id,
+            "error": res.error,
+        }
+        payload["remembered"] = _remember(
+            action="comment",
+            url=res.url,
+            title=res.title,
+            document_id=res.document_id,
+            content=args.get("text") or "",
+            ok=res.ok,
+            error=res.error,
+        )
+        return _tool_result(
+            json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+        )
+
+    if name == "memory_feishu_create_doc":
+        if not bool(args.get("confirmed")):
+            return _need_confirm()
+        res = create_docx_document(
+            cfg,
+            (args.get("title") or "").strip(),
+            content=args.get("content") or "",
+            folder_token=(args.get("folder_token") or "").strip(),
+            config_path=config_path,
+            confirmed=True,
+        )
+        payload = {
+            "ok": res.ok,
+            "title": res.title,
+            "url": res.url,
+            "document_id": res.document_id,
+            "blocks_written": res.blocks_written,
+            "error": res.error,
+        }
+        payload["remembered"] = _remember(
+            action="create",
+            url=res.url,
+            title=res.title,
+            document_id=res.document_id,
+            content=args.get("content") or "",
+            blocks_written=res.blocks_written,
+            ok=res.ok,
+            error=res.error,
+        )
+        return _tool_result(
+            json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+        )
+
+    if name == "memory_feishu_edit_body":
+        if not bool(args.get("confirmed")):
+            return _need_confirm()
+        ref = _feishu_ref(args.get("url") or "")
+        if ref is None:
+            return _tool_result("不是有效的飞书文档链接", is_error=True)
+        res = update_docx_body(
+            cfg,
+            ref,
+            args.get("content") or "",
+            mode=(args.get("mode") or "append").strip() or "append",
+            config_path=config_path,
+            confirmed=True,
+        )
+        payload = {
+            "ok": res.ok,
+            "url": res.url,
+            "title": res.title,
+            "mode": res.mode,
+            "document_id": res.document_id,
+            "blocks_written": res.blocks_written,
+            "blocks_deleted": res.blocks_deleted,
+            "error": res.error,
+        }
+        payload["remembered"] = _remember(
+            action=res.mode or (args.get("mode") or "append"),
+            url=res.url,
+            title=res.title,
+            document_id=res.document_id,
+            content=args.get("content") or "",
+            blocks_written=res.blocks_written,
+            blocks_deleted=res.blocks_deleted,
+            ok=res.ok,
+            error=res.error,
+        )
+        return _tool_result(
+            json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+        )
+
+    if name == "memory_feishu_set_title":
+        if not bool(args.get("confirmed")):
+            return _need_confirm()
+        ref = _feishu_ref(args.get("url") or "")
+        if ref is None:
+            return _tool_result("不是有效的飞书文档链接", is_error=True)
+        res = update_wiki_node_title(
+            cfg,
+            ref,
+            (args.get("title") or "").strip(),
+            config_path=config_path,
+            confirmed=True,
+        )
+        payload = {
+            "ok": res.ok,
+            "url": res.url,
+            "old_title": res.old_title,
+            "new_title": res.new_title,
+            "error": res.error,
+        }
+        payload["remembered"] = _remember(
+            action="title",
+            url=res.url,
+            title=res.new_title,
+            old_title=res.old_title,
+            ok=res.ok,
+            error=res.error,
+        )
+        return _tool_result(
+            json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+        )
+
+    return _tool_result(f"未知工具: {name}", is_error=True)
 
 
 def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
@@ -766,6 +1254,17 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 return _tool_result("text 不能为空", is_error=True)
             payload = sb.bookmark_feishu(text)
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        if name in {
+            "memory_feishu_read",
+            "memory_feishu_preview",
+            "memory_feishu_list_comments",
+            "memory_feishu_comment",
+            "memory_feishu_create_doc",
+            "memory_feishu_edit_body",
+            "memory_feishu_set_title",
+        }:
+            return _call_feishu_tool(sb, name, args)
 
         if name == "memory_restore":
             if not bool(args.get("confirm")):

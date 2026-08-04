@@ -310,6 +310,7 @@ class MemorySandbox:
         original_question: Optional[str] = None,
         *,
         update_only: bool = False,
+        dedup_facet: str = "",
     ) -> str:
         from .feishu import extract_feishu_urls
         from .feishu_question import rewrite_feishu_memory_question
@@ -362,6 +363,7 @@ class MemorySandbox:
             record_id=memory_id,
             original_question=orig_q,
             require_existing=must_update,
+            dedup_facet=dedup_facet,
         )
         self.last_remembered = rec
         self.last_remembered_updated = len(self.long_term.records) == n_before
@@ -540,6 +542,56 @@ class MemorySandbox:
         cfg = getattr(self.config, "feishu", None)
         return build_feishu_bookmark_candidates(
             cfg, text, config_path=self.config_path
+        )
+
+    def remember_feishu_write(
+        self,
+        *,
+        action: str,
+        url: str,
+        title: str = "",
+        document_id: str = "",
+        content: str = "",
+        blocks_written: int = 0,
+        blocks_deleted: int = 0,
+        old_title: str = "",
+        ok: bool = True,
+        error: str = "",
+        scene: Optional[str] = None,
+    ) -> str:
+        """
+        把一次飞书写操作落库到长时记忆。
+
+        飞书侧没有实际改动时不写（返回空串），避免把「未确认被拒」这类
+        无副作用的调用也记成一条改动史。
+        """
+        from .feishu_memory import build_write_memory
+
+        mem = build_write_memory(
+            action=action,
+            url=url,
+            title=title,
+            document_id=document_id,
+            content=content,
+            blocks_written=blocks_written,
+            blocks_deleted=blocks_deleted,
+            old_title=old_title,
+            ok=ok,
+            error=error,
+        )
+        if mem is None:
+            return ""
+        # 评论与正文是同一篇文档的两个侧面：同 token 会被去重合并，
+        # 不分侧面的话一条评论就把正文的大纲与摘录冲掉了
+        facet = "feishu-comment" if action == "comment" else ""
+        tag = "doc-comment" if action == "comment" else "doc-write"
+        return self.remember(
+            mem.question,
+            mem.answer,
+            scene=scene,
+            tags=["feishu", "docs", tag],
+            facts=mem.facts,
+            dedup_facet=facet,
         )
 
     def forget(self, keyword: Optional[str] = None, layer: str = "all") -> str:

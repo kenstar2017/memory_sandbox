@@ -611,8 +611,18 @@ class LongTermMemory:
         scored.sort(key=lambda x: x.score, reverse=True)
         return scored[:k]
 
-    def _find_by_feishu_tokens(self, *texts: str) -> Optional[MemoryRecord]:
-        """正文/链接含相同飞书 wiki/docx token 的记忆视为同一文档，合并更新。"""
+    def _record_facet(self, rec: MemoryRecord) -> str:
+        return str((rec.meta or {}).get("facet") or "")
+
+    def _find_by_feishu_tokens(
+        self, *texts: str, facet: str = ""
+    ) -> Optional[MemoryRecord]:
+        """
+        正文/链接含相同飞书 wiki/docx token 的记忆视为同一文档，合并更新。
+
+        facet 区分同一篇文档的不同侧面（如正文 vs 评论）：只有同一侧面才合并，
+        否则一条评论会把整篇正文的记录覆盖掉。
+        """
         from .feishu import extract_feishu_tokens
 
         tokens: Set[str] = set()
@@ -622,6 +632,8 @@ class LongTermMemory:
             return None
         best: Optional[MemoryRecord] = None
         for rec in self.records:
+            if self._record_facet(rec) != facet:
+                continue
             blob = "\n".join(
                 [
                     rec.question or "",
@@ -691,12 +703,15 @@ class LongTermMemory:
         record_id: Optional[str] = None,
         original_question: Optional[str] = None,
         require_existing: bool = False,
+        dedup_facet: str = "",
     ) -> MemoryRecord:
         """记忆巩固：写入前优化问题，提升后续口语/Cursor 检索命中。
 
         record_id：指定时原地更新该条（改「问」不会新开一条）。
         original_question：改问前的旧问法，用于定位原条目。
         require_existing：为 True 时找不到原条目则报错，绝不新建。
+        dedup_facet：同一来源的不同侧面（如飞书文档的正文 vs 评论）。只在同侧面内
+            去重合并，避免评论覆盖正文记录；留空即历史行为。
         """
         q_in, a_in = question, answer
         scrub_meta: Dict[str, Any] = {}
@@ -718,6 +733,8 @@ class LongTermMemory:
             opt_meta.update(meta)
         if original_question and clean_text(original_question) != clean_text(q_in):
             opt_meta.setdefault("original_question", clean_text(original_question))
+        if dedup_facet:
+            opt_meta["facet"] = dedup_facet
         opt_meta.update(scrub_meta)
         new_tags = normalize_tags(tags)
         new_facts = normalize_facts(facts)
@@ -731,6 +748,11 @@ class LongTermMemory:
 
         # 去重：显式 id > 旧问法/别名 > 同飞书 token > 同答案 > 高相似问答
         fact_blob = facts_search_blob(new_facts)
+
+        def _facet_ok(rec: Optional[MemoryRecord]) -> bool:
+            """跨侧面不合并（评论不该盖掉正文），显式指定 id 时不受此限。"""
+            return rec is not None and self._record_facet(rec) == dedup_facet
+
         existing_id: Optional[str] = None
         rid = (record_id or "").strip()
         if rid:
@@ -744,17 +766,17 @@ class LongTermMemory:
             keyed = self._find_by_question_key(
                 original_question or "", opt.original, q_in, q
             )
-            existing_id = keyed.id if keyed else None
+            existing_id = keyed.id if _facet_ok(keyed) else None
         if existing_id is None:
             feishu_dup = self._find_by_feishu_tokens(
-                opt.original, q, a, fact_blob, " ".join(new_tags)
+                opt.original, q, a, fact_blob, " ".join(new_tags), facet=dedup_facet
             )
             existing_id = feishu_dup.id if feishu_dup else None
         # 同答案合并 / 软相似：仅在显式更新时启用（有 id / update_only）
         editing = bool(rid or require_existing)
         if existing_id is None and editing:
             same_ans = self._find_by_same_answer(a)
-            existing_id = same_ans.id if same_ans else None
+            existing_id = same_ans.id if _facet_ok(same_ans) else None
         if existing_id is None:
             existing = self.search_hits(opt.original, threshold=0.90, top_k=1)
             if not existing:
@@ -768,6 +790,7 @@ class LongTermMemory:
                     if clean_text(h.record.answer or "") == clean_text(a):
                         existing = [h]
                         break
+            existing = [h for h in existing if _facet_ok(h.record)]
             existing_id = existing[0].record.id if existing else None
 
         if require_existing and not existing_id:
@@ -795,19 +818,21 @@ class LongTermMemory:
                         hit = rec
                         break
             if hit is None:
-                hit = self._find_by_question_key(
+                keyed = self._find_by_question_key(
                     original_question or "", opt.original, q_in, q
                 )
+                hit = keyed if _facet_ok(keyed) else None
             if hit is None:
                 hit = self._find_by_feishu_tokens(
-                    opt.original, q, a, fact_blob, " ".join(new_tags)
+                    opt.original, q, a, fact_blob, " ".join(new_tags), facet=dedup_facet
                 )
             if hit is None and editing:
-                hit = self._find_by_same_answer(a)
+                same = self._find_by_same_answer(a)
+                hit = same if _facet_ok(same) else None
             if hit is None:
                 # 回退：同问题精确匹配
                 for rec in self.records:
-                    if rec.question == q:
+                    if rec.question == q and _facet_ok(rec):
                         hit = rec
                         break
 

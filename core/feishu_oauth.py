@@ -32,7 +32,11 @@ DEFAULT_SCOPES = (
     # 分别对应「创建文档」「获取所有子块」「创建块 / 删除块」
     "docx:document:create "
     "docx:document:readonly "
-    "docx:document:write_only"
+    "docx:document:write_only "
+    # 评论：read 拉评论列表，create 加评论/回复评论。聚合权限 docs:doc、drive:drive
+    # 也能调通，但范围大到整个云空间，且聚合名有被拆分后报 20027 的先例
+    "docs:document.comment:read "
+    "docs:document.comment:create"
 )
 
 # 已被开放平台拆分、后台再也勾不到的聚合权限。请求它会让整个授权页报
@@ -105,6 +109,36 @@ def apply_tokens_to_config(
         cfg.refresh_token = refresh_token
     if expires_in:
         cfg.user_token_expires_at = int(time.time()) + int(expires_in) - 60
+
+
+def missing_granted_scopes(cfg: FeishuConfig, token_payload: Dict[str, Any]) -> list:
+    """
+    对比「申请的 scope」与换票响应里「实际授予的 scope」，返回没批下来的那些。
+
+    响应不带 scope 字段时返回空列表——无法判断，不能当成全部失败。
+    """
+    granted = str(token_payload.get("scope") or "").split()
+    if not granted:
+        return []
+    return [s for s in _merged_scopes(cfg).split() if s not in granted]
+
+
+def report_granted_scopes(cfg: FeishuConfig, token_payload: Dict[str, Any]) -> None:
+    """把未获授予的权限打给用户看，避免等到调用 API 才发现。"""
+    granted = str(token_payload.get("scope") or "").split()
+    if not granted:
+        return
+    missing = missing_granted_scopes(cfg, token_payload)
+    if not missing:
+        print(f"已授予全部 {len(granted)} 项权限。")
+        return
+    print("注意：以下权限申请了但本次未获授予，相关功能仍会报权限不足：")
+    for s in missing:
+        print(f"  - {s}")
+    print(
+        "  常见原因：需审核权限尚未批准；只在「应用身份 tenant_access_token」栏开通而漏了"
+        "「用户身份 user_access_token」栏；权限改动后没发布版本。"
+    )
 
 
 def build_authorize_url(cfg: FeishuConfig, *, state: str = "") -> str:
@@ -373,13 +407,18 @@ def run_oauth_login(
     expires_in = int(data.get("expires_in") or 7200)
     if not access:
         raise RuntimeError(f"换票结果无 access_token: {data}")
+    # 换票响应会带回实际授予的 scope。需审核权限没批下来时这里就能看出，
+    # 否则要等真正调用 API 才发现「明明申请过却仍报权限不足」。
+    report_granted_scopes(cfg, data)
     if not refresh:
         # 没有 refresh_token 意味着 token 到期（默认 2 小时）后只能再次手动授权，
         # 静默通过会让人误以为已长期可用，所以这里必须显式提示。
         print(
             "警告：本次授权未下发 refresh_token，"
-            f"token 将在约 {expires_in // 60} 分钟后失效且无法自动续期。\n"
-            "  请在开放平台为应用开通 offline_access 权限，然后重新执行本登录流程。"
+            f"token 将在约 {expires_in // 60} 分钟后失效且无法自动续期。需三步：\n"
+            "  1) 开放平台「权限管理」开通 offline_access\n"
+            "  2) 开放平台「安全设置」打开「刷新 user_access_token」开关（易漏，缺它会报 20074）\n"
+            "  3) 发布版本生效后重跑本登录流程"
         )
 
     apply_tokens_to_config(

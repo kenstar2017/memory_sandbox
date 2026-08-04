@@ -65,7 +65,7 @@ cd desktop && npm run tauri:dev
 | `npm run dev` | Vite 开发服（5173） |
 | `npm run tauri:dev` | Tauri 窗口 + Vite |
 | `npm run build` | 构建前端到 `dist/` |
-| `npm run sync-api` | 把 `app_web.py` / `core/` 等同步到 `src-tauri/resources/api` |
+| `npm run sync-api` | 把 `app_web.py` / `core/` / `cursor_hooks/` 等同步到 `src-tauri/resources/api` |
 | `npm run tauri:build` | sync-api + 打包可安装桌面应用 |
 
 ## 生成可安装应用（macOS）
@@ -86,6 +86,16 @@ src-tauri/target/release/bundle/dmg/BloomBox_0.1.0_*.dmg
 
 - 直接用：把 `BloomBox.app` 拖到「应用程序」
 - 或打开 `.dmg` 再拖进去安装
+
+## AI 记忆门禁（装机后可用）
+
+别人装了这个包，首次启动会被问一次是否开启「AI 记忆门禁」（给 Cursor 装 hook，让所有项目里的
+AI 动手前先查记忆、结束前落库）；同意即装，拒绝后可在工具栏「AI 门禁」里随时开关。
+
+- 前端：`src/components/CursorHooksModal.tsx`，走 `/api/cursor_hooks/{status,install,uninstall}`
+- 后端：`core/cursor_hooks.py`（合并写入 `~/.cursor/hooks.json`，不动用户已有 hook）
+- 脚本源：仓库 `cursor_hooks/`，由 `npm run sync-api` 打进 `resources/api/cursor_hooks/`
+  ——**漏了这步装机后会提示「安装包里缺少 hook 脚本」**
 
 说明：打包时会把 API 源码打进 `Resources`；启动时自动执行 `--api-only`。请确保系统有可用的 `python3` 与依赖。
 

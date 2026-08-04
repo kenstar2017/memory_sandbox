@@ -6,10 +6,11 @@ import json
 import os
 import re
 import time
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, Iterable, List, Optional, Set, Tuple
 
 from .config import FeishuConfig
@@ -73,9 +74,46 @@ class FeishuBodyUpdateResult:
     url: str
     ok: bool
     document_id: str = ""
+    title: str = ""
     mode: str = ""
     blocks_written: int = 0
     blocks_deleted: int = 0
+    error: str = ""
+
+
+@dataclass
+class FeishuComment:
+    comment_id: str = ""
+    user_id: str = ""
+    created_at: str = ""
+    is_whole: bool = True
+    is_solved: bool = False
+    # 局部评论选中的原文；API 加不了局部评论，但客户端里加的能读到
+    quote: str = ""
+    replies: List[str] = field(default_factory=list)
+
+
+@dataclass
+class FeishuCommentListResult:
+    url: str
+    ok: bool
+    document_id: str = ""
+    title: str = ""
+    comments: List[FeishuComment] = field(default_factory=list)
+    truncated: bool = False
+    error: str = ""
+
+
+@dataclass
+class FeishuCommentResult:
+    url: str
+    ok: bool
+    document_id: str = ""
+    title: str = ""
+    comment_id: str = ""
+    replied_to: str = ""
+    # 非空表示这是锚定到该块的局部评论（划词评论）
+    block_id: str = ""
     error: str = ""
 
 
@@ -533,6 +571,18 @@ _BLOCK_ORDERED = 13
 _BLOCK_CODE = 14
 _BLOCK_QUOTE = 15
 _BLOCK_DIVIDER = 22
+_BLOCK_TABLE = 31
+_BLOCK_TABLE_CELL = 32
+# 单元格文本暂存在这个私有键上，写入时展开成嵌套块，不会发给接口
+_TABLE_CELLS = "_ms_table_cells"
+# 列宽分配。飞书正文区宽度约 800px；接口下限是 50px，但 50px 放不下几个字，
+# 所以自己按 100px 保底。MAX 只封顶「需求量」，避免一段长文本把权重拉到别的列几乎为零；
+# 按预算缩放后单列实际宽度仍可能超过它
+_TABLE_TOTAL_WIDTH = 800
+_TABLE_MIN_WIDTH = 100
+_TABLE_MAX_WIDTH = 420
+_TABLE_PX_PER_UNIT = 8
+_TABLE_CELL_PADDING = 24
 # Markdown 一级标题对应 heading1(3)，逐级递增到 heading6(8)
 _HEADING_BLOCK = {1: 3, 2: 4, 3: 5, 4: 6, 5: 7, 6: 8}
 _BLOCK_FIELD: Dict[int, str] = {
@@ -559,14 +609,186 @@ _BULLET_RE = re.compile(r"^[-*+]\s+(.*)$")
 _ORDERED_RE = re.compile(r"^\d+[.)]\s+(.*)$")
 _QUOTE_RE = re.compile(r"^>\s?(.*)$")
 
+# 表格：以 | 分隔的行，且第二行是 |---|:--:| 这样的分隔行才认作表格，
+# 免得正文里偶然出现一个竖线就被当成表
+_TABLE_ROW_RE = re.compile(r"^\|.*\|$")
+_TABLE_SEP_RE = re.compile(r"^\|(?:\s*:?-{1,}:?\s*\|)+$")
 
-def _text_block(block_type: int, content: str) -> dict:
+# 行内语法。优先级：行内代码 > 链接 > 粗体 > 删除线 > 斜体
+# （代码里的 * 不该再当粗体解析）
+_INLINE_PATTERNS = (
+    ("code", re.compile(r"`([^`\n]+)`")),
+    ("link", re.compile(r"\[([^\]\n]*)\]\(([^)\s]+)\)")),
+    ("bold", re.compile(r"\*\*(\S(?:.*?\S)?)\*\*|__(\S(?:.*?\S)?)__")),
+    ("strike", re.compile(r"~~(\S(?:.*?\S)?)~~")),
+    # 分隔符内侧不能是空白，否则「2 * 3 * 4」会被当成斜体
+    (
+        "italic",
+        re.compile(
+            r"(?<![*\w])\*(\S(?:[^*\n]*\S)?)\*(?![*\w])"
+            r"|(?<![_\w])_(\S(?:[^_\n]*\S)?)_(?![_\w])"
+        ),
+    ),
+)
+_STYLE_KEY = {
+    "bold": "bold",
+    "italic": "italic",
+    "strike": "strikethrough",
+    "code": "inline_code",
+}
+
+
+def _element(content: str, style: Optional[dict] = None) -> dict:
+    run: Dict[str, object] = {"content": content}
+    if style:
+        run["text_element_style"] = style
+    return {"text_run": run}
+
+
+def _inline_elements(text: str, base: Optional[dict] = None) -> List[dict]:
+    """
+    把行内 Markdown 拆成带样式的 text_run 列表。
+
+    不解析的话 **粗体** 会原样写成字面量，表格里尤其明显。
+    """
+    src = text or ""
+    if not src:
+        return [_element("", base)]
+    out: List[dict] = []
+    pos = 0
+    while pos < len(src):
+        best: Optional[Tuple[int, str, "re.Match[str]"]] = None
+        for kind, pat in _INLINE_PATTERNS:
+            m = pat.search(src, pos)
+            if m and (best is None or m.start() < best[0]):
+                best = (m.start(), kind, m)
+        if best is None:
+            out.append(_element(src[pos:], base))
+            break
+        start, kind, m = best
+        if start > pos:
+            out.append(_element(src[pos:start], base))
+        style = dict(base or {})
+        if kind == "link":
+            inner = m.group(1)
+            # 飞书按 element 挂链接；URL 要转义，否则中文/特殊字符会丢
+            style["link"] = {"url": urllib.parse.quote(m.group(2), safe="")}
+            out.extend(_inline_elements(inner, style) if inner else [_element(m.group(2), style)])
+        elif kind == "code":
+            # 代码内容不再往下解析
+            style[_STYLE_KEY[kind]] = True
+            out.append(_element(m.group(1), style))
+        else:
+            style[_STYLE_KEY[kind]] = True
+            inner = next(g for g in m.groups() if g is not None)
+            out.extend(_inline_elements(inner, style))
+        pos = m.end()
+    return [e for e in out if e["text_run"]["content"] != ""] or [_element("", base)]
+
+
+def _text_block(block_type: int, content: str, *, parse_inline: bool = True) -> dict:
+    elements = (
+        _inline_elements(content)
+        if parse_inline
+        else [_element(content)]
+    )
     return {
         "block_type": block_type,
-        _BLOCK_FIELD[block_type]: {
-            "elements": [{"text_run": {"content": content}}],
-            "style": {},
+        _BLOCK_FIELD[block_type]: {"elements": elements, "style": {}},
+    }
+
+
+def _split_table_row(line: str) -> List[str]:
+    """拆一行表格；\\| 是转义的竖线，不当分隔符。"""
+    body = line.strip().strip("|")
+    cells: List[str] = []
+    buf: List[str] = []
+    escaped = False
+    for ch in body:
+        if escaped:
+            buf.append(ch)
+            escaped = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if ch == "|":
+            cells.append("".join(buf).strip())
+            buf = []
+            continue
+        buf.append(ch)
+    cells.append("".join(buf).strip())
+    return cells
+
+
+def _display_units(text: str) -> int:
+    """按显示宽度计长度：中日韩文字与全角标点占两格。"""
+    units = 0
+    for ch in text:
+        units += 2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1
+    return units
+
+
+def _cell_plain_text(cell: str) -> str:
+    """单元格渲染后的纯文本：`code`、**粗体**、[文字](链接) 的标记不占宽度。"""
+    return "".join(
+        str(e["text_run"]["content"]) for e in _inline_elements(cell)
+    )
+
+
+def _column_widths(grid: List[List[str]]) -> List[int]:
+    """
+    按每列最长内容分配列宽。
+
+    不给 column_width 的话飞书会用一个偏小的固定默认值平分，像
+    `modules/account/src/pages/Settlement/index.tsx` 这种长路径会被挤成一列一个字。
+    """
+    cols = len(grid[0]) if grid else 0
+    if cols <= 0:
+        return []
+
+    demand: List[int] = []
+    for c in range(cols):
+        units = max(_display_units(_cell_plain_text(row[c])) for row in grid)
+        raw = units * _TABLE_PX_PER_UNIT + _TABLE_CELL_PADDING
+        demand.append(min(max(raw, _TABLE_MIN_WIDTH), _TABLE_MAX_WIDTH))
+
+    # 列太多时正文宽度肯定放不下，宁可让飞书横向滚动，也不要把每列压到看不清
+    budget = max(_TABLE_TOTAL_WIDTH, cols * _TABLE_MIN_WIDTH)
+    total = sum(demand)
+    widths = [max(_TABLE_MIN_WIDTH, round(d * budget / total)) for d in demand]
+
+    # 保底可能把总宽顶超预算，从最宽的列里一点点扣回来
+    while sum(widths) > budget:
+        widest = max(widths)
+        if widest <= _TABLE_MIN_WIDTH:
+            break
+        widths[widths.index(widest)] -= 1
+    drift = budget - sum(widths)
+    if drift > 0:
+        widths[widths.index(max(widths))] += drift
+    return widths
+
+
+def _table_block(rows: List[List[str]]) -> dict:
+    """
+    表格块。真正的嵌套结构在写入时用「创建嵌套块」接口展开，
+    这里先把单元格文本挂在私有字段上。
+    """
+    cols = max(len(r) for r in rows)
+    grid = [r + [""] * (cols - len(r)) for r in rows]
+    return {
+        "block_type": _BLOCK_TABLE,
+        "table": {
+            "property": {
+                "row_size": len(grid),
+                "column_size": cols,
+                "column_width": _column_widths(grid),
+                # Markdown 表格第一行就是表头
+                "header_row": True,
+            }
         },
+        _TABLE_CELLS: grid,
     }
 
 
@@ -574,50 +796,79 @@ def markdown_to_docx_blocks(text: str) -> List[dict]:
     """
     把 Markdown 子集转成 docx block 列表。
 
-    支持 #~###### 标题、- / * 无序列表、1. 有序列表、``` 代码块、> 引用、--- 分割线，
-    其余非空行作普通段落。行内语法（粗体、链接）不解析，按纯文本写入。
+    支持 #~###### 标题、- / * 无序列表、1. 有序列表、``` 代码块、> 引用、--- 分割线、
+    GFM 管道表格，以及行内 **粗体** / *斜体* / ~~删除线~~ / `代码` / [文字](链接)。
+    代码块内不解析行内语法。
     """
+    lines = (text or "").splitlines()
     blocks: List[dict] = []
     code_lines: List[str] = []
     in_code = False
-    for raw in (text or "").splitlines():
+    i = 0
+    while i < len(lines):
+        raw = lines[i]
         if _FENCE_RE.match(raw):
             if in_code:
-                blocks.append(_text_block(_BLOCK_CODE, "\n".join(code_lines)))
+                blocks.append(
+                    _text_block(_BLOCK_CODE, "\n".join(code_lines), parse_inline=False)
+                )
                 code_lines = []
             in_code = not in_code
+            i += 1
             continue
         if in_code:
             code_lines.append(raw)
+            i += 1
             continue
         line = raw.strip()
         if not line:
+            i += 1
+            continue
+        # 表格要看下一行是不是分隔行，所以先于分割线判断：
+        # |---|---| 这种行本身也能匹配 --- 之外的规则
+        if (
+            _TABLE_ROW_RE.match(line)
+            and i + 1 < len(lines)
+            and _TABLE_SEP_RE.match(lines[i + 1].strip().replace(" ", ""))
+        ):
+            rows = [_split_table_row(line)]
+            i += 2
+            while i < len(lines) and _TABLE_ROW_RE.match(lines[i].strip()):
+                rows.append(_split_table_row(lines[i].strip()))
+                i += 1
+            blocks.append(_table_block(rows))
             continue
         if _DIVIDER_RE.match(line):
             blocks.append({"block_type": _BLOCK_DIVIDER, "divider": {}})
+            i += 1
             continue
         m = _HEADING_RE.match(line)
         if m:
             blocks.append(
                 _text_block(_HEADING_BLOCK[len(m.group(1))], m.group(2).strip())
             )
+            i += 1
             continue
         m = _BULLET_RE.match(line)
         if m:
             blocks.append(_text_block(_BLOCK_BULLET, m.group(1).strip()))
+            i += 1
             continue
         m = _ORDERED_RE.match(line)
         if m:
             blocks.append(_text_block(_BLOCK_ORDERED, m.group(1).strip()))
+            i += 1
             continue
         m = _QUOTE_RE.match(line)
         if m:
             blocks.append(_text_block(_BLOCK_QUOTE, m.group(1).strip()))
+            i += 1
             continue
         blocks.append(_text_block(_BLOCK_TEXT, line))
+        i += 1
     # 围栏没闭合也不要丢内容
     if in_code and code_lines:
-        blocks.append(_text_block(_BLOCK_CODE, "\n".join(code_lines)))
+        blocks.append(_text_block(_BLOCK_CODE, "\n".join(code_lines), parse_inline=False))
     return blocks
 
 
@@ -650,6 +901,52 @@ def _create_docx(
     return document_id, str(doc.get("title") or "")
 
 
+def _table_descendants(table: dict, seq: int) -> dict:
+    """
+    把表格块展开成「创建嵌套块」接口的载荷。
+
+    表格是 table → table_cell → 文本 的三层结构，平铺的 children 接口建不出来，
+    只能走 descendant；descendants 里是所有块的**平铺**列表，靠临时 block_id 关联。
+    空单元格也必须挂一个文本子块，否则接口报错。
+    """
+    grid: List[List[str]] = table.get(_TABLE_CELLS) or [[]]
+    table_id = f"t{seq}"
+    cell_ids: List[str] = []
+    descendants: List[dict] = []
+    for r, row in enumerate(grid):
+        for c, cell in enumerate(row):
+            cell_id = f"t{seq}c{r}_{c}"
+            text_id = f"{cell_id}t"
+            cell_ids.append(cell_id)
+            descendants.append(
+                {
+                    "block_id": cell_id,
+                    "block_type": _BLOCK_TABLE_CELL,
+                    "table_cell": {},
+                    "children": [text_id],
+                }
+            )
+            descendants.append(
+                {
+                    "block_id": text_id,
+                    "block_type": _BLOCK_TEXT,
+                    "text": {"elements": _inline_elements(cell), "style": {}},
+                    "children": [],
+                }
+            )
+    table_block = {
+        "block_id": table_id,
+        "block_type": _BLOCK_TABLE,
+        "table": table.get("table") or {},
+        "children": cell_ids,
+    }
+    return {
+        "index": -1,
+        "children_id": [table_id],
+        "descendants": [table_block] + descendants,
+    }
+
+
 def _append_docx_blocks(
     api_base: str,
     access_token: str,
@@ -657,27 +954,60 @@ def _append_docx_blocks(
     blocks: List[dict],
     timeout: float,
 ) -> int:
-    """把 block 分批追加到文档根节点，返回已写入数量。"""
+    """
+    把 block 追加到文档根节点，返回已写入数量。
+
+    平铺块走 children 接口分批写；表格必须单独走 descendant 接口。两者按原顺序
+    交替发送，且都是「追加到末尾」，所以混排的顺序不会乱。
+    """
     # 根节点的 block_id 就是 document_id
     path = urllib.parse.quote(document_id, safe="")
-    url = f"{api_base}/open-apis/docx/v1/documents/{path}/blocks/{path}/children"
+    children_url = f"{api_base}/open-apis/docx/v1/documents/{path}/blocks/{path}/children"
+    descendant_url = (
+        f"{api_base}/open-apis/docx/v1/documents/{path}/blocks/{path}/descendant"
+        "?document_revision_id=-1"
+    )
     written = 0
-    for start in range(0, len(blocks), _BLOCK_BATCH):
-        batch = blocks[start : start + _BLOCK_BATCH]
-        if start:
+    sent = 0
+
+    def _post(url: str, body: dict) -> None:
+        nonlocal sent
+        if sent:
             time.sleep(_BLOCK_WRITE_INTERVAL)
         data = _http_json(
             "POST",
             url,
             headers={"Authorization": f"Bearer {access_token}"},
-            body={"index": -1, "children": batch},
+            body=body,
             timeout=timeout,
         )
+        sent += 1
         if data.get("code") != 0:
             raise RuntimeError(
                 f"写入正文失败（已写 {written} 块）: {data.get('msg') or data}"
             )
-        written += len(batch)
+
+    flat: List[dict] = []
+
+    def _flush_flat() -> None:
+        nonlocal written, flat
+        for start in range(0, len(flat), _BLOCK_BATCH):
+            batch = flat[start : start + _BLOCK_BATCH]
+            _post(children_url, {"index": -1, "children": batch})
+            written += len(batch)
+        flat = []
+
+    for idx, block in enumerate(blocks):
+        if block.get("block_type") == _BLOCK_TABLE:
+            # 先把攒着的平铺块写掉，保证表格落在正确位置
+            _flush_flat()
+            _post(descendant_url, _table_descendants(block, idx))
+            written += 1
+            continue
+        flat.append(block)
+        if len(flat) >= _BLOCK_BATCH:
+            _flush_flat()
+    _flush_flat()
     return written
 
 
@@ -958,17 +1288,19 @@ def update_docx_body(
     timeout = float(cfg.timeout or 30)
     _, _, _, api_base = _resolve_credentials(cfg)
 
-    def _read(token: str) -> Tuple[str, int]:
-        document_id, _title = _resolve_document_id(api_base, token, ref, timeout)
+    def _read(token: str) -> Tuple[str, int, str]:
+        document_id, title = _resolve_document_id(api_base, token, ref, timeout)
         existing = 0
         if mode == "replace":
             existing = len(_root_children(api_base, token, document_id, timeout))
-        return document_id, existing
+        return document_id, existing, title
 
     # 先用只读步骤定位文档并验证 token，写操作再用同一个 token，
     # 避免删到一半才发现过期、重试又重复删
     try:
-        token, (document_id, existing) = _with_user_token(cfg, config_path, _read)
+        token, (document_id, existing, doc_title) = _with_user_token(
+            cfg, config_path, _read
+        )
     except Exception as e:
         err = str(e)
         hint = ""
@@ -990,6 +1322,7 @@ def update_docx_body(
                 url=ref.url,
                 ok=False,
                 document_id=document_id,
+                title=doc_title,
                 mode=mode,
                 blocks_deleted=0,
                 error=f"{e}；文档可能已被部分清空，可在飞书里用「历史版本」恢复",
@@ -1005,6 +1338,7 @@ def update_docx_body(
             url=ref.url,
             ok=False,
             document_id=document_id,
+            title=doc_title,
             mode=mode,
             blocks_deleted=deleted,
             error=f"写入正文失败：{e}{tail}",
@@ -1014,7 +1348,346 @@ def update_docx_body(
         url=ref.url,
         ok=True,
         document_id=document_id,
+        title=doc_title,
         mode=mode,
         blocks_written=written,
         blocks_deleted=deleted,
+    )
+
+
+_BLOCK_META_KEYS = frozenset(
+    {"block_id", "block_type", "parent_id", "children", "comment_ids"}
+)
+
+
+def _block_plain_text(block: dict) -> str:
+    """取块的纯文本。读接口里文字在 <字段>.elements[].text_run.content。"""
+    for key, val in (block or {}).items():
+        if key in _BLOCK_META_KEYS or not isinstance(val, dict):
+            continue
+        elements = val.get("elements")
+        if isinstance(elements, list):
+            return "".join(
+                str((e.get("text_run") or {}).get("content") or "") for e in elements
+            )
+    return ""
+
+
+def _all_blocks(
+    api_base: str, access_token: str, document_id: str, timeout: float
+) -> List[dict]:
+    """列出文档所有块（含表格单元格内的文本块），分页取完。"""
+    path = urllib.parse.quote(document_id, safe="")
+    base = f"{api_base}/open-apis/docx/v1/documents/{path}/blocks"
+    items: List[dict] = []
+    page_token = ""
+    while True:
+        query: Dict[str, object] = {"page_size": 500}
+        if page_token:
+            query["page_token"] = page_token
+        data = _http_json(
+            "GET",
+            f"{base}?{urllib.parse.urlencode(query)}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            timeout=timeout,
+        )
+        if data.get("code") != 0:
+            raise RuntimeError(f"列出文档块失败: {data.get('msg') or data}")
+        payload = data.get("data") or {}
+        items.extend(payload.get("items") or [])
+        page_token = str(payload.get("page_token") or "")
+        if not payload.get("has_more") or not page_token:
+            break
+    return items
+
+
+def _norm_for_match(s: str) -> str:
+    return re.sub(r"\s+", "", s or "")
+
+
+def _locate_block(blocks: List[dict], needle: str) -> str:
+    """
+    找出包含 needle 的块，返回 block_id。
+
+    命中多个块时**不猜**，直接报错并列出候选：评论会通知协作者，挂错位置
+    比失败更糟。调用方可以改用更长的片段或直接传 block_id。
+    """
+    target = _norm_for_match(needle)
+    if not target:
+        raise RuntimeError("定位文字为空")
+    exact: List[dict] = []
+    partial: List[dict] = []
+    for b in blocks:
+        # 页面块（1）是文档根，整篇文字都在它下面，会误命中
+        if b.get("block_type") == 1:
+            continue
+        text = _norm_for_match(_block_plain_text(b))
+        if not text:
+            continue
+        if text == target:
+            exact.append(b)
+        elif target in text:
+            partial.append(b)
+    hits = exact or partial
+    if not hits:
+        raise RuntimeError(
+            f"没找到包含「{needle}」的块；确认文字与文档一致（可只取一小段连续文字）"
+        )
+    if len(hits) > 1:
+        preview = "；".join(
+            f"{b.get('block_id')}=「{_block_plain_text(b)[:24]}」" for b in hits[:5]
+        )
+        raise RuntimeError(
+            f"「{needle}」命中 {len(hits)} 个块，无法确定评论位置。"
+            f"请换更独特的片段，或直接指定 block_id。候选：{preview}"
+        )
+    return str(hits[0].get("block_id") or "")
+
+
+def _comment_text(content: Optional[dict]) -> str:
+    """把评论 elements 拼成纯文本；@人与云文档链接也保留可读形式。"""
+    out: List[str] = []
+    for el in (content or {}).get("elements") or []:
+        kind = el.get("type")
+        if kind == "text_run":
+            out.append(str((el.get("text_run") or {}).get("text") or ""))
+        elif kind == "docs_link":
+            out.append(str((el.get("docs_link") or {}).get("url") or ""))
+        elif kind == "person":
+            uid = str((el.get("person") or {}).get("user_id") or "")
+            if uid:
+                out.append(f"@{uid}")
+    return "".join(out).strip()
+
+
+def _parse_comment(item: dict) -> FeishuComment:
+    replies = [
+        _comment_text(r.get("content"))
+        for r in ((item.get("reply_list") or {}).get("replies") or [])
+    ]
+    return FeishuComment(
+        comment_id=str(item.get("comment_id") or ""),
+        user_id=str(item.get("user_id") or ""),
+        created_at=str(item.get("create_time") or ""),
+        is_whole=bool(item.get("is_whole")),
+        is_solved=bool(item.get("is_solved")),
+        quote=str(item.get("quote") or ""),
+        replies=[r for r in replies if r],
+    )
+
+
+def list_docx_comments(
+    cfg: FeishuConfig,
+    ref: FeishuDocRef,
+    *,
+    config_path: Optional[str] = None,
+    page_size: int = 50,
+    max_comments: int = 200,
+) -> FeishuCommentListResult:
+    """
+    只读：分页拉取文档全部评论（含客户端里加的局部评论，看 is_whole / quote 区分）。
+
+    评论只是读，不受写门禁限制。
+    """
+    if not feishu_configured(cfg):
+        return FeishuCommentListResult(
+            url=ref.url, ok=False, error="未配置飞书 app_id / app_secret"
+        )
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+    size = max(1, min(int(page_size or 50), 100))
+    cap = max(1, int(max_comments or 200))
+
+    def _read(token: str) -> Tuple[str, str, List[FeishuComment], bool]:
+        document_id, title = _resolve_document_id(api_base, token, ref, timeout)
+        path = urllib.parse.quote(document_id, safe="")
+        items: List[FeishuComment] = []
+        page_token = ""
+        truncated = False
+        while True:
+            q = {"file_type": "docx", "page_size": size}
+            if page_token:
+                q["page_token"] = page_token
+            url = (
+                f"{api_base}/open-apis/drive/v1/files/{path}/comments"
+                f"?{urllib.parse.urlencode(q)}"
+            )
+            data = _http_json(
+                "GET",
+                url,
+                headers={"Authorization": f"Bearer {token}"},
+                timeout=timeout,
+            )
+            if data.get("code") != 0:
+                raise RuntimeError(f"读评论失败: {data.get('msg') or data}")
+            payload = data.get("data") or {}
+            for it in payload.get("items") or []:
+                items.append(_parse_comment(it))
+                if len(items) >= cap:
+                    # 到上限就停，别把几百条评论一次塞回去
+                    return document_id, title, items, True
+            page_token = str(payload.get("page_token") or "")
+            if not payload.get("has_more") or not page_token:
+                break
+        return document_id, title, items, truncated
+
+    try:
+        _tok, (document_id, title, items, truncated) = _with_user_token(
+            cfg, config_path, _read
+        )
+    except Exception as e:
+        err = str(e)
+        hint = ""
+        if "1069303" in err or "permission" in err.lower() or "20027" in err:
+            hint = "；读评论需要开通 docs:document.comment:read 并重新授权"
+        return FeishuCommentListResult(url=ref.url, ok=False, error=err + hint)
+    return FeishuCommentListResult(
+        url=ref.url,
+        ok=True,
+        document_id=document_id,
+        title=title,
+        comments=items,
+        truncated=truncated,
+    )
+
+
+def _escape_comment_text(text: str) -> str:
+    """new_comments 接口不接受裸 < >，要先转义，否则内容会被拒或截断。"""
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+def create_docx_comment(
+    cfg: FeishuConfig,
+    ref: FeishuDocRef,
+    text: str,
+    *,
+    comment_id: str = "",
+    block_id: str = "",
+    anchor_text: str = "",
+    config_path: Optional[str] = None,
+    confirmed: bool = False,
+) -> FeishuCommentResult:
+    """
+    给文档加评论。三种模式：
+
+    - 默认：全文评论，显示在文档底部
+    - 传 comment_id：回复已有评论
+    - 传 block_id 或 anchor_text：**局部评论（划词评论）**，锚定到具体块，
+      在正文旁边显示并带引用
+
+    局部评论走 v2 的 new_comments 接口（anchor.block_id）；v1 的 comments 接口
+    只能建全文评论，传 is_whole / quote 会被静默忽略。anchor_text 会先列出所有
+    块按文字定位，命中多个就报错而不是猜。
+
+    评论会通知文档协作者、别人立刻看得见，所以和改正文同一门禁：
+    confirmed 必须显式传 True，否则直接返回错误且不发任何请求。
+    """
+    if not confirmed:
+        return FeishuCommentResult(
+            url=ref.url,
+            ok=False,
+            error="未确认：评论飞书文档需本人逐次确认，调用方须显式传 confirmed=True",
+        )
+    body_text = (text or "").strip()
+    if not body_text:
+        return FeishuCommentResult(url=ref.url, ok=False, error="评论内容为空，不做改动")
+    if not feishu_configured(cfg):
+        return FeishuCommentResult(
+            url=ref.url, ok=False, error="未配置飞书 app_id / app_secret"
+        )
+    if comment_id and (block_id or anchor_text):
+        return FeishuCommentResult(
+            url=ref.url,
+            ok=False,
+            error="回复已有评论与新建局部评论不能同时指定",
+        )
+
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+
+    def _read(token: str) -> Tuple[str, str, str]:
+        document_id, title = _resolve_document_id(api_base, token, ref, timeout)
+        anchor = block_id
+        if anchor_text and not anchor:
+            anchor = _locate_block(
+                _all_blocks(api_base, token, document_id, timeout), anchor_text
+            )
+        return document_id, title, anchor
+
+    # 先用只读步骤定位文档（必要时定位块）并验证 token，再用同一个 token 发评论，
+    # 避免评论发出去才发现 token 过期、重试又评论两遍
+    try:
+        token, (document_id, title, anchor_block) = _with_user_token(
+            cfg, config_path, _read
+        )
+    except Exception as e:
+        return FeishuCommentResult(url=ref.url, ok=False, error=str(e))
+
+    path = urllib.parse.quote(document_id, safe="")
+    payload: Dict
+    if anchor_block:
+        url = (
+            f"{api_base}/open-apis/drive/v1/files/{path}/new_comments"
+            f"?{urllib.parse.urlencode({'file_type': 'docx'})}"
+        )
+        payload = {
+            "file_type": "docx",
+            "reply_elements": [
+                {"type": "text", "text": _escape_comment_text(body_text)}
+            ],
+            "anchor": {"block_id": anchor_block},
+        }
+    else:
+        url = (
+            f"{api_base}/open-apis/drive/v1/files/{path}/comments"
+            f"?{urllib.parse.urlencode({'file_type': 'docx'})}"
+        )
+        payload = {
+            "reply_list": {
+                "replies": [
+                    {
+                        "content": {
+                            "elements": [
+                                {"type": "text_run", "text_run": {"text": body_text}}
+                            ]
+                        }
+                    }
+                ]
+            }
+        }
+        if comment_id:
+            payload["comment_id"] = comment_id
+    try:
+        data = _http_json(
+            "POST",
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            body=payload,
+            timeout=timeout,
+        )
+    except Exception as e:
+        err = str(e)
+        hint = ""
+        if "1069303" in err or "permission" in err.lower() or "20027" in err:
+            hint = "；加评论需要开通 docs:document.comment:create 并重新授权"
+        return FeishuCommentResult(
+            url=ref.url, ok=False, document_id=document_id, title=title, error=err + hint
+        )
+    if data.get("code") != 0:
+        return FeishuCommentResult(
+            url=ref.url,
+            ok=False,
+            document_id=document_id,
+            title=title,
+            error=f"加评论失败: {data.get('msg') or data}",
+        )
+    new_id = str((data.get("data") or {}).get("comment_id") or "")
+    return FeishuCommentResult(
+        url=ref.url,
+        ok=True,
+        document_id=document_id,
+        title=title,
+        comment_id=new_id,
+        replied_to=comment_id,
+        block_id=anchor_block,
     )

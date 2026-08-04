@@ -24,7 +24,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core import MemorySandbox
+from core import MemorySandbox, cursor_hooks
 from core.config import load_config
 from core.paths import app_support_dir, default_config_path, default_persist_dir, is_frozen
 
@@ -32,7 +32,7 @@ HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
 # 前端/协议版本：用于识别旧进程（无思考过程流）并提示重启
 UI_BUILD = "20260731-desktop-api"
-UI_FEATURES = ("chat_stream", "think_card", "api_only", "cors")
+UI_FEATURES = ("chat_stream", "think_card", "api_only", "cors", "cursor_hooks")
 # API-only：只提供 /api/*，供 desktop/（Vite+Tauri）调用；可用 --api-only 或 MS_API_ONLY=1
 API_ONLY = False
 # 开发/桌面允许的跨域来源（逗号分隔可用 MS_CORS_ORIGINS 覆盖）
@@ -2327,6 +2327,9 @@ class Handler(BaseHTTPRequestHandler):
                 },
             )
             return
+        if path == "/api/cursor_hooks/status":
+            _json_response(self, 200, cursor_hooks.status().to_dict())
+            return
         self.send_error(404)
 
     def do_POST(self):
@@ -2339,6 +2342,14 @@ class Handler(BaseHTTPRequestHandler):
             data = {}
 
         try:
+            if path == "/api/cursor_hooks/install":
+                res = cursor_hooks.install(python=(data.get("python") or None))
+                _json_response(self, 200 if res.ok else 500, res.to_dict())
+                return
+            if path == "/api/cursor_hooks/uninstall":
+                res = cursor_hooks.uninstall()
+                _json_response(self, 200 if res.ok else 500, res.to_dict())
+                return
             if path == "/api/chat":
                 text = (data.get("text") or "").strip()
                 result = STATE.sandbox.chat(text)

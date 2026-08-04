@@ -14,11 +14,39 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core import MemorySandbox
+from core import MemorySandbox, cursor_hooks
 from core.cli_ui import CliUi
 from core.config import agent_ui_mode_from_config, load_config
 from core.paths import default_config_path, default_persist_dir
 from core.utils import assemble_long_term_query, clean_text
+
+
+def _format_hooks_status(st: "cursor_hooks.HooksStatus") -> str:
+    if st.error:
+        head = f"异常：{st.error}"
+    elif not st.installed:
+        head = "未安装（AI 不会被强制先查记忆、也不会被追问落库）"
+    elif not st.up_to_date:
+        head = "已安装，但脚本是旧版，建议重新执行 hooks-install"
+    else:
+        head = "已安装且是最新版"
+
+    lines = [
+        head,
+        f"- 配置文件：{st.hooks_json}",
+        f"- 脚本目录：{st.hooks_dir}",
+        f"- 解释器：{st.python}",
+    ]
+    if st.installed_at:
+        lines.append(f"- 安装时间：{st.installed_at}")
+    if st.missing_scripts:
+        lines.append(f"- 缺少脚本：{', '.join(st.missing_scripts)}")
+    if st.stale_scripts:
+        lines.append(f"- 待更新脚本：{', '.join(st.stale_scripts)}")
+    if st.missing_events:
+        lines.append(f"- 未挂载事件：{', '.join(st.missing_events)}")
+    lines.append(f"- 你自己的其它 hook：{st.foreign_entries} 条（安装/卸载都不会动）")
+    return "\n".join(lines)
 
 
 def build_sandbox(config_path: Optional[str] = None, use_user_memory: bool = True) -> MemorySandbox:
@@ -79,6 +107,22 @@ def _feishu_content_arg(args) -> Optional[str]:
             print(f"读正文文件失败：{e}", file=sys.stderr)
             return None
     return args.content or ""
+
+
+def _remember_feishu_write(sb: MemorySandbox, **kw) -> None:
+    """
+    把飞书写操作落库。飞书侧没动过时静默跳过（由 build_write_memory 判定）。
+
+    落库失败只提示，不改命令退出码：文档已经改成功了，不该因为记账失败
+    让调用方以为写操作没生效、跑去重试。
+    """
+    try:
+        msg = sb.remember_feishu_write(**kw)
+    except Exception as e:  # noqa: BLE001
+        print(f"（落库失败，飞书侧改动已生效，请手动 remember：{e}）", file=sys.stderr)
+        return
+    if msg:
+        print(msg)
 
 
 def interactive(sandbox: MemorySandbox, as_json: bool = False, local_only: bool = False) -> None:
@@ -277,7 +321,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     sp = sub.add_parser("feishu-create-doc", help="在云空间新建飞书文档（写操作）")
     sp.add_argument("title", help="文档标题")
-    sp.add_argument("--content", default=None, help="正文（Markdown 子集）")
+    sp.add_argument(
+        "--content",
+        default=None,
+        help="正文（Markdown 子集：标题/列表/代码块/引用/表格 + 行内粗体斜体链接）",
+    )
     sp.add_argument("--content-file", default=None, help="从文件读正文，优先于 --content")
     sp.add_argument("--folder", default="", help="目标文件夹 token；省略则建在云空间根目录")
     sp.add_argument(
@@ -291,8 +339,43 @@ def build_parser() -> argparse.ArgumentParser:
     g = sp.add_mutually_exclusive_group(required=True)
     g.add_argument("--append", action="store_true", help="追加到正文末尾")
     g.add_argument("--replace", action="store_true", help="删掉原正文再写入（破坏性）")
-    sp.add_argument("--content", default=None, help="正文（Markdown 子集）")
+    sp.add_argument(
+        "--content",
+        default=None,
+        help="正文（Markdown 子集：标题/列表/代码块/引用/表格 + 行内粗体斜体链接）",
+    )
     sp.add_argument("--content-file", default=None, help="从文件读正文，优先于 --content")
+    sp.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过交互确认；仅限本人执行，AI 不得自行使用",
+    )
+
+    sp = sub.add_parser("feishu-comments", help="列出飞书文档的评论（只读）")
+    sp.add_argument("url", help="飞书 wiki 或 docx 链接")
+    sp.add_argument("--max", type=int, default=200, help="最多列出多少条，默认 200")
+    sp.add_argument("--json", action="store_true", help="输出 JSON")
+
+    sp = sub.add_parser("feishu-comment", help="给飞书文档加评论（写操作）")
+    sp.add_argument("url", help="飞书 wiki 或 docx 链接")
+    sp.add_argument("text", help="评论内容")
+    sp.add_argument(
+        "--reply-to",
+        default="",
+        help="回复某条评论的 comment_id；省略则新建评论",
+    )
+    sp.add_argument(
+        "--on",
+        dest="anchor_text",
+        default="",
+        help="锚定到含这段文字的块，做局部评论（划词评论）；命中多块会报错",
+    )
+    sp.add_argument(
+        "--block-id",
+        dest="block_id",
+        default="",
+        help="已知块 ID 时直接锚定；与 --on 二选一",
+    )
     sp.add_argument(
         "--yes",
         action="store_true",
@@ -336,6 +419,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="ask 只读 | plan 规划 | agent 可写；省略则显示当前",
     )
     sp.add_argument("--no-persist", action="store_true", help="只改本次进程，不写配置文件")
+
+    # Cursor hook 门禁（先查记忆、结束落库）
+    sub.add_parser("hooks-status", help="查看 Cursor hook 门禁的安装状态")
+
+    sp = sub.add_parser(
+        "hooks-install", help="把 Cursor hook 门禁装到 ~/.cursor（合并，不覆盖已有 hook）"
+    )
+    sp.add_argument(
+        "--python",
+        default="",
+        help="指定 hook 用的解释器绝对路径；省略则自动探测",
+    )
+
+    sub.add_parser("hooks-uninstall", help="移除 Cursor hook 门禁（保留你其它 hook）")
 
     sub.add_parser("seed", help="写入一组开发常用种子记忆")
 
@@ -581,6 +678,14 @@ def main(argv=None) -> int:
             print(f"改标题失败：{res.error}", file=sys.stderr)
             return 2
         print(f"已改标题：{res.old_title or '(原标题未知)'} → {res.new_title}")
+        _remember_feishu_write(
+            sb,
+            action="title",
+            url=res.url,
+            title=res.new_title,
+            old_title=res.old_title,
+            ok=True,
+        )
         return 0
 
     if cmd == "feishu-create-doc":
@@ -607,13 +712,26 @@ def main(argv=None) -> int:
             config_path=args.config or str(default_config_path()),
             confirmed=True,
         )
+        remember_kw = dict(
+            action="create",
+            url=res.url,
+            title=res.title or title,
+            document_id=res.document_id,
+            content=content,
+            blocks_written=res.blocks_written,
+            ok=res.ok,
+            error=res.error,
+        )
         if not res.ok:
             print(f"创建失败：{res.error}", file=sys.stderr)
             if res.document_id:
                 print(f"已产生半成品文档：document_id={res.document_id}", file=sys.stderr)
+                # 半成品也要留档，否则这篇文档没人记得去清理
+                _remember_feishu_write(sb, **remember_kw)
             return 2
         print(f"已创建：{res.title}（写入 {res.blocks_written} 块）")
         print(res.url or f"document_id={res.document_id}（配置 feishu.doc_host 可输出链接）")
+        _remember_feishu_write(sb, **remember_kw)
         return 0
 
     if cmd == "feishu-edit-body":
@@ -662,13 +780,136 @@ def main(argv=None) -> int:
             config_path=config_path,
             confirmed=True,
         )
+        remember_kw = dict(
+            action=res.mode or mode,
+            url=res.url,
+            title=res.title,
+            document_id=res.document_id,
+            content=content,
+            blocks_written=res.blocks_written,
+            blocks_deleted=res.blocks_deleted,
+            ok=res.ok,
+            error=res.error,
+        )
         if not res.ok:
             print(f"改正文失败：{res.error}", file=sys.stderr)
+            # 删了却没写成时飞书侧已被改动，必须留档以便去恢复历史版本
+            _remember_feishu_write(sb, **remember_kw)
             return 2
         if res.blocks_deleted:
             print(f"已替换正文：删除 {res.blocks_deleted} 块，写入 {res.blocks_written} 块")
         else:
             print(f"已追加正文：写入 {res.blocks_written} 块")
+        _remember_feishu_write(sb, **remember_kw)
+        return 0
+
+    if cmd == "feishu-comments":
+        from core.feishu import extract_feishu_urls, list_docx_comments
+
+        refs = extract_feishu_urls(args.url)
+        if not refs:
+            print("不是有效的飞书文档链接", file=sys.stderr)
+            return 2
+        res = list_docx_comments(
+            sb.config.feishu,
+            refs[0],
+            config_path=args.config or str(default_config_path()),
+            max_comments=args.max,
+        )
+        if not res.ok:
+            print(f"读评论失败：{res.error}", file=sys.stderr)
+            return 2
+        if args.json:
+            print(
+                json.dumps(
+                    {
+                        "title": res.title,
+                        "url": res.url,
+                        "truncated": res.truncated,
+                        "comments": [vars(c) for c in res.comments],
+                    },
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+            return 0
+        print(f"{res.title or '(标题未知)'} —— {len(res.comments)} 条评论")
+        if res.truncated:
+            print(f"（已达 --max {args.max} 上限，可能还有更多）")
+        for c in res.comments:
+            where = "全文" if c.is_whole else f"局部：{c.quote[:30]}"
+            state = "已解决" if c.is_solved else "未解决"
+            print(f"\n[{c.comment_id}] {where} | {state}")
+            for r in c.replies:
+                print(f"  - {r}")
+        return 0
+
+    if cmd == "feishu-comment":
+        from core.feishu import create_docx_comment, extract_feishu_urls
+
+        refs = extract_feishu_urls(args.url)
+        if not refs:
+            print("不是有效的飞书文档链接", file=sys.stderr)
+            return 2
+        ref = refs[0]
+        text = (args.text or "").strip()
+        if not text:
+            print("评论内容为空，不做改动", file=sys.stderr)
+            return 2
+        # 评论会通知协作者、别人立刻看得见，默认二次确认
+        if not args.yes:
+            from core.feishu import preview_docx_body
+
+            pre = preview_docx_body(
+                sb.config.feishu, ref, config_path=args.config or str(default_config_path())
+            )
+            if not pre.ok:
+                print(f"读取目标文档失败：{pre.error}", file=sys.stderr)
+                return 2
+            print(f"目标文档：{pre.title or '(标题未知)'}")
+            print(f"链接：{pre.url}")
+            if args.reply_to:
+                print(f"将回复评论 {args.reply_to}：{text}")
+            elif args.anchor_text:
+                print(f"将在含「{args.anchor_text}」的段落上加局部评论：{text}")
+            elif args.block_id:
+                print(f"将在块 {args.block_id} 上加局部评论：{text}")
+            else:
+                print(f"将添加全文评论（显示在文档底部）：{text}")
+            print("（评论会通知文档协作者）")
+            if input("确认？(y/N) ").strip().lower() not in {"y", "yes"}:
+                print("已取消")
+                return 1
+        res = create_docx_comment(
+            sb.config.feishu,
+            ref,
+            text,
+            comment_id=args.reply_to or "",
+            block_id=args.block_id or "",
+            anchor_text=args.anchor_text or "",
+            config_path=args.config or str(default_config_path()),
+            confirmed=True,
+        )
+        if not res.ok:
+            print(f"评论失败：{res.error}", file=sys.stderr)
+            return 2
+        if res.replied_to:
+            print(f"已回复评论 {res.replied_to}（新 comment_id={res.comment_id}）")
+        elif res.block_id:
+            print(
+                f"已添加局部评论（comment_id={res.comment_id}，锚定块 {res.block_id}）"
+            )
+        else:
+            print(f"已添加全文评论（comment_id={res.comment_id}）")
+        _remember_feishu_write(
+            sb,
+            action="comment",
+            url=res.url,
+            title=res.title,
+            document_id=res.document_id,
+            content=text,
+            ok=True,
+        )
         return 0
 
     if cmd == "list":
@@ -709,6 +950,43 @@ def main(argv=None) -> int:
             print(f"将清空 {n} 条长时记忆。确认请加 --yes（可选 --backup-first）", file=sys.stderr)
             return 2
         print(sb.clear_long_term(backup_first=args.backup_first))
+        return 0
+
+    if cmd == "hooks-status":
+        st = cursor_hooks.status()
+        if as_json:
+            print(json.dumps(st.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        print(_format_hooks_status(st))
+        return 0
+
+    if cmd == "hooks-install":
+        res = cursor_hooks.install(python=args.python or None)
+        if as_json:
+            print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
+            return 0 if res.ok else 1
+        if not res.ok:
+            print(f"安装失败：{res.error}", file=sys.stderr)
+            return 1
+        print(res.message)
+        print(f"- 脚本目录：{res.hooks_dir}")
+        print(f"- 解释器：{res.python}")
+        print(f"- 挂载事件：{', '.join(res.events)}")
+        if res.backup:
+            print(f"- 原配置已备份：{res.backup}")
+        return 0
+
+    if cmd == "hooks-uninstall":
+        res = cursor_hooks.uninstall()
+        if as_json:
+            print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
+            return 0 if res.ok else 1
+        if not res.ok:
+            print(f"移除失败：{res.error}", file=sys.stderr)
+            return 1
+        print(res.message)
+        if res.backup:
+            print(f"- 原配置已备份：{res.backup}")
         return 0
 
     if cmd == "scene":

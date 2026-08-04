@@ -150,6 +150,46 @@ export async function suggestQuestion(
   return apiPost('/api/suggest_question', { question, answer, fetch: true })
 }
 
+export type CursorHooksStatus = {
+  installed: boolean
+  up_to_date: boolean
+  hooks_json: string
+  hooks_dir: string
+  python: string
+  installed_at: string
+  missing_scripts: string[]
+  stale_scripts: string[]
+  missing_events: string[]
+  foreign_entries: number
+  available: boolean
+  error: string
+}
+
+export type CursorHooksResult = {
+  ok: boolean
+  action: string
+  hooks_json: string
+  python: string
+  events: string[]
+  backup: string
+  kept_foreign: number
+  message: string
+  error: string
+}
+
+export async function getCursorHooksStatus(): Promise<CursorHooksStatus> {
+  const res = await fetch(`${API_BASE}/api/cursor_hooks/status`)
+  return parseJson<CursorHooksStatus>(res)
+}
+
+export async function installCursorHooks(): Promise<CursorHooksResult> {
+  return apiPost('/api/cursor_hooks/install')
+}
+
+export async function uninstallCursorHooks(): Promise<CursorHooksResult> {
+  return apiPost('/api/cursor_hooks/uninstall')
+}
+
 export async function getRetrievalSettings(): Promise<Record<string, unknown>> {
   return apiPost('/api/retrieval_settings', {})
 }

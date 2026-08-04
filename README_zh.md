@@ -62,6 +62,48 @@ Agent 会调用这些工具：
 
 项目规则 `.cursor/rules/memory-sandbox.mdc` 会引导 Agent：**先 `memory_prepare`**；把返回的 `references` / `context_pack` 当参考并结合当前仓库；改功能时不要因硬命中短路；纯事实复述且 `hit_local` 才可直接用 `answer`；结束前 `memory_remember`。
 
+### 4. AI 记忆门禁：让「先查记忆、后落库」在所有项目里强制生效
+
+上面那份规则是**项目级**的，只在本仓库生效。在别的项目里 Agent 既不知道要先检索、也不知道要落库：
+一整轮排障或调研的结论会丢，或者凭空写文档而模板早就在记忆里。门禁用**用户级 hook**
+（`~/.cursor/hooks.json` + `~/.cursor/hooks/`，全项目生效）在读写两侧各加一道：
+
+四种安装方式，装的是同一套东西（逻辑都在 `core/cursor_hooks.py`）：
+
+| 方式 | 怎么做 |
+|------|--------|
+| BloomBox 首次启动 | 弹窗询问一次，同意即装；拒绝了也不再打扰 |
+| BloomBox 工具栏 | 点「AI 门禁」查看状态、启用、更新脚本或关闭 |
+| 命令行 | `python3 main.py hooks-install` / `hooks-status` / `hooks-uninstall` |
+| 脚本 | `./scripts/install_cursor_hooks.sh`（`--status` / `--uninstall`） |
+
+安装是**合并**进 `~/.cursor/hooks.json`：只认领命令里含自己脚本名的条目，你自己配的 hook
+一条都不会动，改写前还会把原文件备份成 `hooks.json.bak-<时间>`。可反复执行，不会产生重复条目；
+脚本内容变了会被认成「待更新」，重新安装即可（按内容哈希判断，不靠版本号）。
+
+| 脚本 | 事件 | 作用 |
+|------|------|------|
+| `memory-session-context.py` | `sessionStart` | 用 `additional_context` 把调用协议注入每个会话的初始系统上下文 |
+| `memory-require-prepare.py` | `preToolUse` | 本轮没查过记忆就要动手改东西 → 拦一次，要求先 `memory_prepare` |
+| `memory-mark.py` | `postToolUse` | 调过 prepare/ask 写 `.prepared`，调过 remember 写 `.remembered` |
+| `memory-ensure-remember.py` | `stop` | 没落库就追问一轮；并按轮清掉读侧标记、清理 7 天前的过期状态 |
+
+- 脚本源在仓库 `cursor_hooks/`，安装时拷到 `~/.cursor/hooks/`。脚本**只用标准库**，装完与本仓库
+  彻底解耦：仓库删了、BloomBox 卸载了，hook 照样能跑（有单测守着这条约束）
+- 标记按 `conversation_id` 存在 `~/.cursor/memory-sandbox-hook-state/`，每轮 `stop` 清一次 →
+  「每轮都要查、每轮都要记」
+- 读侧只拦 `Write` / `Delete` / `Task` 与飞书写操作；`Read` / `Grep` / `Shell` 和所有 `memory_*`
+  工具照常放行
+- 同一轮最多拦一次，MCP 挂了不会把整轮卡死；`stop` 配 `loop_limit: 1` 只追问一次
+- 所有脚本失败放过（打印 `{}` / `permission: allow`、exit 0），不会挡住正常工作流
+
+注意**不要**再往本仓库放项目级 `.cursor/hooks.json`——两份都在会重复执行。
+`sessionStart` 注入要新开对话才生效；读侧门禁存盘即生效。
+
+关于全局规则的两个坑：Cursor 不支持 `~/.cursor/rules/*.mdc`（静默忽略），User Rules 只能在
+**Customize → Rules** 手填且不随 profile 导出；`beforeSubmitPrompt` 也注入不了上下文（只认
+`continue` / `user_message`，多余字段静默丢弃）。上面的 `sessionStart` 注入就是用来替代手填的。
+
 ### 标签与类型（更好找）
 
 - 写入时可带标签，如 `feishu`、`frontend`；问题里写 `#tag` 也可以
@@ -313,6 +355,17 @@ python3 scripts/feishu_login.py
 
 成功后写入 `user_access_token` + `refresh_token`；过期自动 refresh；长期失效再登录。
 
+登录时会打印**实际授予**的权限，申请了但没批下来的会逐条列出——需审核权限（如
+`docx:document:write_only`）常卡在这一步，早发现比等调用 API 报错好。
+
+想拿到 `refresh_token`（否则每约 2 小时要重新登录）需要**两个**开关，缺一不可：
+
+1. 「权限管理」开通 `offline_access`
+2. 「安全设置」打开**「刷新 user_access_token」开关**（最易漏；只开权限不开开关照样不下发，
+   刷新时会报 `20074`）
+
+两处都改完要发布版本，再重跑登录。
+
 5. 重启 Web / CLI，提问带飞书链接的问题即可（进度中应有「飞书文档：拉取…」）。
 
 ### 配置字段
@@ -375,8 +428,99 @@ python3 main.py feishu-edit-body <链接> --replace --content-file notes.md   # 
 - 正文为空一律拒绝：不希望「文件恰好读空」变成把文档清空
 - wiki 链接会先 `get_node` 换成 docx 的 `obj_token`，再按块操作
 
-正文支持 Markdown 子集：`#`~`######` 标题、`-`/`*` 无序列表、`1.` 有序列表、``` 代码块、
-`>` 引用、`---` 分割线，其余非空行作普通段落；**行内语法（粗体、链接）不解析**，按纯文本写入。
+正文支持的 Markdown 子集：
+
+- 块级：`#`~`######` 标题、`-`/`*` 无序列表、`1.` 有序列表、``` 代码块、`>` 引用、
+ `---` 分割线、GFM 管道表格（`| a | b |` + `|---|---|`），其余非空行作普通段落
+- 行内：`**粗体**`、`*斜体*`、`~~删除线~~`、`` `代码` ``、`[文字](链接)`
+- 代码块与行内代码里的 Markdown 不再解析，`**` 和 `|` 保持字面量
+- 表格必须走「创建嵌套块」接口（table → table_cell → 文本 三层），所以写入时
+ 表格单独发一次请求、平铺块按 50 一批发，二者按原文顺序交替追加
+- 列宽按每列最长内容自动分配（中文按两格算，Markdown 标记不计宽），总宽约 800px 铺满正文区，
+ 每列保底 100px。不显式给 `column_width` 的话飞书会按一个偏小的默认值平分，
+ 长文件路径会被挤成一列一个字；列数过多时按保底宽度给，表格自身横向滚动
+
+未支持的语法（会按纯文本写入）：图片、脚注、任务列表、嵌套列表缩进层级、单元格内换行。
+
+这些能力同样暴露成 MCP 工具，所以在 Cursor 等外部 AI 工具里也能直接用，不必回到终端：
+
+| 用途 | MCP 工具 | 对应 CLI |
+|------|----------|----------|
+| 读正文纯文本 | `memory_feishu_read` | — |
+| 只读预览标题与块数（不含正文） | `memory_feishu_preview` | —（CLI 在确认前自动做） |
+| 读评论 | `memory_feishu_list_comments` | `feishu-comments` |
+| 加评论 / 回复评论 | `memory_feishu_comment` | `feishu-comment` |
+| 新建文档 | `memory_feishu_create_doc` | `feishu-create-doc` |
+| 改正文 | `memory_feishu_edit_body`（`mode=append`/`replace`） | `feishu-edit-body` |
+| 改 wiki 标题 | `memory_feishu_set_title` | `feishu-set-title` |
+
+三个读工具容易混，按需要的东西选：
+
+- `memory_feishu_read` —— **要正文**（分析需求、照着写文档）。返回纯文本，默认单次最多 30000 字，
+  超长时给 `next_offset`，用同一链接带 `offset` 续读，直到 `next_offset` 为 `null`
+- `memory_feishu_preview` —— 只要「是哪一篇、多少块」，**不返回正文**，用于写操作前确认目标、省 token
+- `memory_feishu_bookmark` —— 想把文档存成待确认记忆候选，正文会被截断到约 1200 字
+
+三个写工具的 `confirmed` 都是 **required 且必须为 `true`**，漏传或传 `false` 都会直接报错、一个请求都不发出——
+和 CLI 的交互确认是同一层门禁，AI 只有在你本轮明确同意后才可以传 `true`。改完 `mcp_server.py` 记得重启 MCP，
+否则外部工具握手拿到的还是旧工具清单。
+
+### 评论
+
+```bash
+python3 main.py feishu-comments <链接>                      # 列出全部评论（只读）
+python3 main.py feishu-comment <链接> "这里建议补充埋点" --on "要评论的原文片段"   # 局部评论（写）
+python3 main.py feishu-comment <链接> "整篇看下来还行"        # 全文评论，显示在文档底部（写）
+python3 main.py feishu-comment <链接> "同意" --reply-to <comment_id>   # 回复某条评论
+```
+
+需 `docs:document.comment:read`（读）+ `docs:document.comment:create`（加/回复）。
+聚合权限 `docs:doc`、`drive:drive` 也能调通，但范围大到整个云空间，不建议申请。
+
+两种评论的区别，以及它们走的**不是同一个接口**：
+
+| | 显示位置 | 接口 | 怎么发 |
+|---|---|---|---|
+| 局部评论（划词评论） | 正文旁边，带引用、可定位 | `POST /drive/v1/files/:token/new_comments`（v2 协议） | `--on` 或 `--block-id` |
+| 全文评论 | 文档**最底部** | `POST /drive/v1/files/:token/comments`（v1） | 都不传 |
+
+v1 的 `comments` 接口文档标题就叫「添加全文评论」，明说不支持局部评论；即使按响应体字段
+去传 `is_whole` / `quote` 也会被**静默忽略**，永远建出全文评论。要锚定到某段文字，必须走
+v2 的 `new_comments` 并传 `anchor.block_id`。
+
+`--on` 传一小段连续且独特的原文即可，会先列出所有块按文字定位（跨粗体等样式边界也能匹配，
+空白差异忽略）。**命中多个段落时直接报错并列出候选**，不猜——评论挂错位置比失败更糟；
+这时换更独特的片段，或用 `--block-id` 直接指定。审阅场景建议逐个问题发局部评论，
+而不是把多条意见塞进一条全文评论。
+
+读没有这个限制：别人在客户端手动加的局部评论也能读出来，用返回里的 `is_whole` 与
+`quote`（被选中的原文）区分。注意评论正文在 `replies` 数组里，不是顶层字段。
+
+评论会通知文档协作者、别人立刻看得见，所以和改正文同一门禁：CLI 交互确认、MCP 的 `confirmed`
+必须显式为 `true`。
+
+### 写过的文档自动落库
+
+新建、改正文、改标题只要在飞书侧真的生效，就会自动写一条长时记忆（MCP 与 CLI 都会），
+不用再手动 `memory_remember`：
+
+- 问法固定为 `《文档标题》飞书文档正文与写入记录 <链接>`，与读取型飞书记忆同构，
+  所以「那篇客服工单的文档」既能命中读进来的正文，也能命中自己写过的改动
+- 答案里记操作类型、时间、链接、`document_id`、写入/删除块数，外加正文大纲与约 600 字摘录
+  （不塞全文，避免一条记忆过长拖垮检索）
+- 打上 `feishu` / `docs` / `doc-write` 标签（评论是 `doc-comment`），`facts.path` 存链接
+- 同一篇文档反复改会**更新同一条**，不会在库里堆成十几条
+- 正文与评论是同一篇文档的两个**侧面**，各自一条、互不覆盖。去重链里有「同飞书 token 即同一条」
+  这一档，所以光让问法不同拦不住覆盖；靠 `save_memory(dedup_facet=...)` 只在同侧面内合并
+- MCP 返回里的 `remembered` 字段就是落库结果；CLI 会把它打在命令输出里
+
+有两条边界值得知道：
+
+| 情况 | 行为 |
+|------|------|
+| 未确认被拒、token 失效等飞书侧零改动 | **不落库**，免得把没发生的事记成改动史 |
+| 文档建出来了但正文写失败 / 替换时删完写失败 | **落库**并标「未完成」，因为半成品和已删正文都需要有人记得去清理或恢复 |
+| 落库本身失败（磁盘满等） | 命令仍按写成功返回，只提示落库失败——否则调用方以为没写成，重试会再建一篇重复文档 |
 
 飞书接口本身的限制，实现里已处理，但值得知道：
 
@@ -393,6 +537,8 @@ python3 main.py feishu-edit-body <链接> --replace --content-file notes.md   # 
 | 现象 | 处理 |
 |------|------|
 | `99991668` Invalid access token | 再跑 `feishu_login.py` |
+| 登录后没有 `refresh_token`（每 2 小时要重登） | `offline_access` 已授予也可能缺它：还要在「安全设置」打开「刷新 user_access_token」开关，发布后重登；刷新报 `20074` 同因 |
+| 申请过的权限仍报权限不足 | 看登录输出的「未获授予」清单：需审核权限没批、或只开了「应用身份」栏漏了「用户身份」栏 |
 | `131006` node permission denied | 个人文档靠 user token；或把文档授权给应用；写操作还需该节点的容器编辑权限 |
 | `1770040` / `1770032` no folder permission | 新建文档时目标文件夹没有编辑权限，或未开通 `docx:document:write_only` |
 | 缺 wiki scope | 开放平台开通 wiki 读权限 |

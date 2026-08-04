@@ -245,6 +245,47 @@ button.ghost {
   gap: 8px;
 }
 
+.hooks-ok,
+.hooks-warn {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.hooks-ok {
+  color: var(--accent);
+}
+
+.hooks-warn {
+  color: var(--danger);
+}
+
+.hooks-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.hooks-meta > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.hooks-meta span {
+  flex: 0 0 84px;
+  color: var(--muted);
+}
+
+.hooks-meta code {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+  font-size: 11px;
+}
+
 .qa-list {
   flex: 1;
   overflow-y: auto;

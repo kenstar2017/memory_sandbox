@@ -10,8 +10,14 @@ cp "$ROOT/config.yaml" "$DEST/"
 cp "$ROOT/requirements.txt" "$DEST/" 2>/dev/null || true
 rsync -a --exclude '__pycache__' --exclude '*.pyc' --exclude '*.pyo' \
   "$ROOT/core/" "$DEST/core/"
+# Cursor hook 门禁的源脚本：core/cursor_hooks.py 从这里拷到用户的 ~/.cursor/hooks/，
+# 少了它装机后就只有空壳（source_dir() 会找不到而报「无法安装」）
+mkdir -p "$DEST/cursor_hooks"
+rsync -a --exclude '__pycache__' --exclude '*.pyc' \
+  "$ROOT/cursor_hooks/" "$DEST/cursor_hooks/"
 printf '%s\n' \
   'BloomBox bundled API sources.' \
   'Started by the app as: python3 app_web.py --api-only' \
+  'cursor_hooks/ holds the Cursor hook scripts installed into ~/.cursor/hooks/.' \
   > "$DEST/README.txt"
 echo "Synced API resources → $DEST"

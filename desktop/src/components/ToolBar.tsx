@@ -13,6 +13,7 @@ const ACTIONS: { id: string; label: string; danger?: boolean }[] = [
   { id: 'all', label: '全部记忆' },
   { id: 'status', label: '记忆状态' },
   { id: 'retrieval', label: '检索设置' },
+  { id: 'hooks', label: 'AI 门禁' },
   { id: 'extract', label: '提炼候选' },
   { id: 'clear_w', label: '清空工作记忆' },
   { id: 'backup', label: '备份长时' },

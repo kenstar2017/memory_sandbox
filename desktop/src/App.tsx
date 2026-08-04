@@ -10,9 +10,11 @@ import {
   exportPack,
   extractCandidates,
   getAgentMode,
+  getCursorHooksStatus,
   gitCheck,
   getStatus,
   healthCheck,
+  installCursorHooks,
   listLongTerm,
   listMemory,
   openDataDir,
@@ -23,6 +25,7 @@ import {
 import type { ChatMessage, MemoryRecord } from './api/types'
 import { AnswerModal, type ModalSeed } from './components/AnswerModal'
 import { Chat, sourceLabel } from './components/Chat'
+import { CursorHooksModal } from './components/CursorHooksModal'
 import { DialogHost } from './components/DialogHost'
 import { RetrievalModal } from './components/RetrievalModal'
 import { SideList } from './components/SideList'
@@ -36,6 +39,8 @@ applyTheme(loadThemePreference())
 
 const PENDING_KEY = 'ms_desktop_pending_q'
 const EXTRACT_KEY = 'ms_desktop_extract_map'
+// 首次启动问过一次就不再打扰；用户拒绝后可在「AI 门禁」里自己开
+const HOOKS_ASKED_KEY = 'ms_desktop_hooks_asked'
 
 function loadPending(): string[] {
   try {
@@ -87,6 +92,7 @@ export default function App() {
   const [modal, setModal] = useState<ModalSeed | null>(null)
   const [modalBusy, setModalBusy] = useState(false)
   const [retrievalOpen, setRetrievalOpen] = useState(false)
+  const [hooksOpen, setHooksOpen] = useState(false)
   const [agentMode, setAgentModeState] = useState<AgentMode>('ask')
   const { preference: theme, setPreference: setTheme } = useTheme()
 
@@ -110,6 +116,44 @@ export default function App() {
     }
   }, [])
 
+  /**
+   * 首次启动问一次是否开启记忆门禁。
+   *
+   * 不静默安装：门禁会拒绝其它项目里的工具调用，悄悄改掉用户的 Cursor 行为不合适。
+   * 问过一次就落地标记，之后想开只走工具栏「AI 门禁」。
+   */
+  const maybeOfferHooks = useCallback(async () => {
+    if (localStorage.getItem(HOOKS_ASKED_KEY)) return
+    let st
+    try {
+      st = await getCursorHooksStatus()
+    } catch {
+      return
+    }
+    if (!st.available || st.installed) return
+
+    localStorage.setItem(HOOKS_ASKED_KEY, '1')
+    const ok = await confirmDialog(
+      '给 Cursor 装一组 hook，让所有项目里的 AI 都「动手前先查记忆、结束前把结论落库」？\n\n' +
+        '会合并写入 ~/.cursor/hooks.json，不会动你已有的 hook；随时可以关掉。',
+      { title: '开启 AI 记忆门禁？', confirmText: '开启', cancelText: '暂不' },
+    )
+    if (!ok) {
+      push({
+        id: uid(),
+        role: 'meta',
+        text: '未开启 AI 记忆门禁。想开随时点工具栏「AI 门禁」。',
+      })
+      return
+    }
+    try {
+      const res = await installCursorHooks()
+      push({ id: uid(), role: 'meta', text: res.message })
+    } catch (e) {
+      void alertDialog(String(e))
+    }
+  }, [push])
+
   useEffect(() => {
     let cancelled = false
     ;(async () => {
@@ -131,6 +175,7 @@ export default function App() {
             }
             if (am.status_line) setStatusLine(am.status_line)
             await refreshSaved()
+            if (!cancelled) await maybeOfferHooks()
             return
           }
         } catch {
@@ -426,6 +471,10 @@ export default function App() {
       setRetrievalOpen(true)
       return
     }
+    if (id === 'hooks') {
+      setHooksOpen(true)
+      return
+    }
     setBusy(true)
     try {
       if (id === 'working' || id === 'long' || id === 'all') {
@@ -597,6 +646,7 @@ export default function App() {
         onClose={() => setModal(null)}
         onConfirm={(p) => void onConfirmRemember(p)}
       />
+      <CursorHooksModal open={hooksOpen} onClose={() => setHooksOpen(false)} />
       <RetrievalModal
         open={retrievalOpen}
         onClose={() => setRetrievalOpen(false)}

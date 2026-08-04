@@ -62,6 +62,54 @@ The Agent will call these tools:
 
 Project rule `.cursor/rules/memory-sandbox.mdc` guides the Agent: **`memory_prepare` first**; treat `references` / `context_pack` as background and combine with the current repo; for feature work do not short-circuit on a hard hit; only reuse `answer` for pure factual Q&A when `hit_local`; always `memory_remember` stable conclusions.
 
+### 4. Memory gate: enforce "search first, record after" in every project
+
+That rule is **project-scoped**, so it only applies inside this repo. Elsewhere the agent knows
+neither to search first nor to record afterwards: a whole debugging session is lost, or it writes a
+document from scratch while the template was already in memory. The gate uses **user-level hooks**
+(`~/.cursor/hooks.json` + `~/.cursor/hooks/`, active in every project), one on each side.
+
+Four ways to install the same thing (logic lives in `core/cursor_hooks.py`):
+
+| Path | How |
+|------|-----|
+| BloomBox first launch | Asks once; installs on consent and never nags again if declined |
+| BloomBox toolbar | "AI 门禁" shows status and can enable, refresh, or disable |
+| CLI | `python3 main.py hooks-install` / `hooks-status` / `hooks-uninstall` |
+| Script | `./scripts/install_cursor_hooks.sh` (`--status` / `--uninstall`) |
+
+Installing **merges** into `~/.cursor/hooks.json`: it only claims entries whose command mentions one
+of its own scripts, so your own hooks are never touched, and the original file is backed up to
+`hooks.json.bak-<timestamp>` first. Re-running never duplicates entries; changed script contents are
+reported as "needs update" (detected by content hash, not a hand-maintained version number).
+
+| Script | Event | Purpose |
+|--------|-------|---------|
+| `memory-session-context.py` | `sessionStart` | Injects the calling protocol via `additional_context` into every conversation's initial system context |
+| `memory-require-prepare.py` | `preToolUse` | About to change something without having searched memory this turn → denied once, told to call `memory_prepare` first |
+| `memory-mark.py` | `postToolUse` | Writes `.prepared` after prepare/ask, `.remembered` after remember |
+| `memory-ensure-remember.py` | `stop` | Follow-up if nothing was recorded; clears read-side markers per turn and prunes state older than 7 days |
+
+- Script sources live in `cursor_hooks/` and are copied into `~/.cursor/hooks/` on install. They use
+  **stdlib only**, so once installed they are fully decoupled from this repo: delete the repo or
+  uninstall BloomBox and the hooks keep working (a unit test guards that constraint)
+- Markers live in `~/.cursor/memory-sandbox-hook-state/` keyed by `conversation_id` and are cleared
+  each `stop`, so it is "search every turn, record every turn"
+- Only `Write` / `Delete` / `Task` and Feishu writes are gated; `Read` / `Grep` / `Shell` and all
+  `memory_*` tools pass through
+- At most one denial per turn, so an unavailable MCP server can never deadlock the turn;
+  `loop_limit: 1` keeps the stop hook to a single nudge
+- Every script fails open (`{}` / `permission: allow`, exit 0) and can never block normal work
+
+Do **not** add a project-level `.cursor/hooks.json` back to this repo — having both would run twice.
+The `sessionStart` injection only applies to newly opened conversations; the read-side gate is live
+as soon as the file is saved.
+
+Two traps around global rules: Cursor does not support `~/.cursor/rules/*.mdc` (silently ignored),
+and User Rules exist only in **Customize → Rules** and are not included in profile exports.
+`beforeSubmitPrompt` cannot inject context either (it accepts only `continue` / `user_message` and
+silently drops extra fields). The `sessionStart` injection above replaces that manual step.
+
 ### Tags & types (easier to find)
 
 - Tag memories (`feishu`, `frontend`, or `#tag` in text)
@@ -281,6 +329,15 @@ python3 scripts/feishu_login.py
 
 Stores `user_access_token` + `refresh_token`; auto-refresh on expiry.
 
+Login prints the scopes that were **actually granted** and lists any you requested but didn't get —
+review-gated scopes such as `docx:document:write_only` often stall there, and it's better to see it
+now than when an API call fails.
+
+Getting a `refresh_token` (without one you re-login roughly every 2 hours) needs **two** switches:
+enable `offline_access` under **Permissions & Scopes**, *and* turn on **“refresh user_access_token”**
+under **Security Settings**. The second one is easy to miss — with the scope alone no refresh token
+is issued and refreshing fails with `20074`. Publish a version after changing either, then log in again.
+
 5. Restart Web/CLI and ask with a Feishu link.
 
 ### Related commands
@@ -303,6 +360,8 @@ Feishu docs are usually shared with the team and edits are hard to roll back, so
   approval never counts as approval for the current change
 
 ```bash
+python3 main.py feishu-comments <URL>                                 # list comments (read-only)
+python3 main.py feishu-comment <URL> "please add tracking here"       # add a whole-file comment
 python3 main.py feishu-set-title <wiki URL> "<new title>"             # needs wiki:node:update
 python3 main.py feishu-create-doc "<title>" --content-file notes.md   # needs :create + :write_only
 python3 main.py feishu-edit-body <URL> --append  --content-file notes.md   # append to the end
@@ -316,9 +375,77 @@ target title plus its current block count; `--replace` also spells out how many 
 delete, because editing the wrong document costs more than writing the wrong text. Empty content
 is always rejected, so a file that happens to read empty can never wipe a document.
 
-Document bodies accept a Markdown subset: `#`–`######` headings, `-`/`*` bullets, `1.` ordered
-items, ``` code fences, `>` quotes, `---` dividers; everything else non-blank becomes a paragraph.
-**Inline syntax (bold, links) is not parsed** and is written as plain text.
+Document bodies accept a Markdown subset. Block level: `#`–`######` headings, `-`/`*` bullets,
+`1.` ordered items, ``` code fences, `>` quotes, `---` dividers, and GFM pipe tables
+(`| a | b |` followed by `|---|---|`); everything else non-blank becomes a paragraph. Inline:
+`**bold**`, `*italic*`, `~~strikethrough~~`, `` `code` ``, and `[text](url)`. Markdown inside code
+fences and inline code is left literal, so `**` and `|` survive untouched.
+
+Tables are the one structural exception: a Feishu table is a three-level nest
+(table → table_cell → text) that the flat *create blocks* endpoint cannot express, so each table is
+written through the *create nested blocks* endpoint in its own request while flat blocks go out in
+batches of 50. Both are appended in document order, so mixed content keeps its original sequence.
+Column widths are set explicitly, sized per column from its longest cell (CJK counts double, Markdown
+markup counts as nothing) to fill the ~800px body area with a 100px floor per column. Without an
+explicit `column_width` Feishu splits a small default width evenly and long file paths collapse to
+one character per line; with more columns than the budget allows every column keeps the floor and the
+table scrolls horizontally instead.
+Still unsupported and written as plain text: images, footnotes, task lists, nested list indentation,
+and line breaks inside a cell.
+
+Comments need `docs:document.comment:read` (list) and `docs:document.comment:create` (add or
+reply). Two kinds of comment exist and they do **not** share an endpoint. An *anchored* comment
+(shown next to the passage, carrying a quote) requires the v2 endpoint
+`POST /drive/v1/files/:token/new_comments` with `anchor.block_id`; a *whole-file* comment (shown at
+the very **bottom** of the document) uses the v1 `POST /drive/v1/files/:token/comments`. The v1
+endpoint is literally titled "add a whole-file comment" and **silently ignores** `is_whole` /
+`quote` if you pass them, so it can never produce an anchored comment.
+
+Pass `--on "<a distinctive snippet of the original text>"` to anchor: the snippet is matched against
+every block (across bold and other inline style boundaries, whitespace-insensitive). If it matches
+more than one block the command **fails and lists the candidates** instead of guessing, because
+anchoring a comment to the wrong paragraph is worse than not sending it; narrow the snippet or pass
+`--block-id`. For review work, prefer one anchored comment per issue over a single whole-file dump.
+
+Reading has no such limit: anchored comments made by others come back too, distinguished by
+`is_whole` and `quote` (the highlighted text), with the comment body inside `replies`. Commenting
+notifies collaborators, so it sits behind the same confirmation gate as body edits.
+
+The same capabilities are exposed as MCP tools, so external AI tools (Cursor and friends) can use
+them without dropping back to a terminal: `memory_feishu_read` (body text),
+`memory_feishu_preview` (title + block count only), `memory_feishu_list_comments`,
+`memory_feishu_comment`, `memory_feishu_create_doc`,
+`memory_feishu_edit_body` (`mode=append`/`replace`) and `memory_feishu_set_title`.
+
+Pick the right reader: `memory_feishu_read` when you need the **body** (returns plain text, at most
+`max_chars` per call — default 30000 — with a `next_offset` to continue until it comes back `null`);
+`memory_feishu_preview` when you only need to know which document and how many blocks, which
+deliberately omits the body to save tokens; `memory_feishu_bookmark` to turn a document into a
+pending memory candidate, where the body is truncated to roughly 1200 characters. On all three write tools `confirmed` is **required and must be `true`** —
+omitting it or passing `false` fails immediately without issuing a single request, the same gate the
+CLI enforces interactively. After editing `mcp_server.py`, restart the MCP server; otherwise clients
+keep the tool list from their last handshake.
+
+### Documents you write are recorded automatically
+
+Whenever a create / body edit / rename actually takes effect on the Feishu side, a long-term memory
+entry is written automatically (from both MCP and the CLI), so there is no need to call
+`memory_remember` for it yourself. The question is always `《title》飞书文档正文与写入记录 <url>`,
+matching the shape used for documents read *in*, so one topical query finds both. The answer records
+the action, timestamp, link, `document_id`, blocks written/deleted, plus an outline and a ~600
+character excerpt (never the full body, which would bloat retrieval). Entries are tagged
+`feishu` / `docs` / `doc-write` (`doc-comment` for comments), and editing the same document again
+**updates the same entry** instead of piling up duplicates. Body and comments are two *facets* of
+one document and are kept as separate entries: dedup includes a "same Feishu token means same
+record" rule, so distinct questions alone would not prevent a comment from clobbering the body —
+`save_memory(dedup_facet=...)` restricts merging to within a facet. MCP returns the outcome in a `remembered` field; the CLI prints it.
+
+Two edge cases worth knowing: nothing is recorded when the Feishu side was untouched (a refused
+confirmation, an expired token), because a change that never happened should not enter the history;
+but a half-created document, or a `replace` that deleted the old body and then failed to write, **is**
+recorded and flagged as incomplete, since both leave something that needs cleaning up or restoring.
+If the bookkeeping write itself fails, the command still reports success and only warns — otherwise a
+caller would think the write never landed and retry, creating a duplicate document.
 
 API limits handled for you, but worth knowing: the create API sets the title only (the body needs
 a second “create blocks” call, hence the edit scope); a single request handles at most 50 blocks,
@@ -333,6 +460,8 @@ Feishu’s version history.
 | Symptom | Fix |
 |---------|-----|
 | `99991668` | Re-run `feishu_login.py` |
+| No `refresh_token` after login (re-login every 2h) | Granting `offline_access` isn't enough — also turn on “refresh user_access_token” in Security Settings, publish, and log in again; a `20074` on refresh has the same cause |
+| A scope you enabled is still denied | Check the “not granted” list printed at login: review-gated scope pending, or enabled only under the app-identity tab instead of user identity |
 | `131006` | Need user token for personal docs, or authorize the doc to the app; writes also need container edit permission |
 | `1770040` / `1770032` | No edit permission on the target folder, or `docx:document:write_only` not enabled |
 | Missing wiki scope | Enable wiki read scopes on the app |

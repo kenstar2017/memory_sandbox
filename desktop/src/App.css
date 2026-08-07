@@ -94,9 +94,27 @@ body,
 }
 
 .side-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   padding: 14px 16px 8px;
   font-weight: 600;
   font-size: 14px;
+}
+
+/* 别处（MCP / CLI）刚写入的条数；点一下标为已看 */
+.side-new {
+  border: none;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+}
+
+.side-new.edited {
+  background: var(--pending);
 }
 
 .side-tabs {
@@ -122,35 +140,110 @@ body,
   background: var(--accent-soft);
 }
 
-.tag-filter {
+/* 搜索 + 标签下拉各占一行；标签曾铺成 chip 云，上百个直接把列表顶出可视区 */
+.side-filters {
   display: flex;
-  flex-wrap: wrap;
+  flex-direction: column;
   gap: 6px;
   padding: 0 12px 10px;
+  min-width: 0;
 }
 
-.tag-chip {
+.side-search,
+.side-tag-select {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
   border: 1px solid var(--border);
-  background: transparent;
-  color: var(--muted);
-  border-radius: 999px;
-  padding: 3px 10px;
-  font-size: 11px;
-  cursor: pointer;
-  max-width: 100%;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  border-radius: 6px;
+  background: var(--item-bg);
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
 }
 
-.tag-chip.active {
+.side-search:focus,
+.side-tag-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 知识库录入：输入框吃掉剩余宽度，按钮不被挤变形 */
+.side-add-doc {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.side-add-doc input {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--item-bg);
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.side-add-doc input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.side-add-doc button {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--primary-fg);
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.side-add-doc button:disabled {
+  background: var(--item-bg);
+  color: var(--muted);
+  cursor: default;
+}
+
+.side-backfill {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--item-bg);
+  color: var(--muted);
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.side-backfill:hover:not(:disabled) {
   color: var(--text);
   border-color: var(--accent);
-  background: var(--accent-soft);
 }
 
-.badge.tag {
-  opacity: 0.9;
+.side-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.side-foot button {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
 }
 
 .tool-bar {
@@ -205,6 +298,12 @@ body,
 .tool-actions button.danger {
   color: var(--danger);
   border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.bot-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
 }
 
 .toolbar-actions .active-btn {
@@ -286,6 +385,22 @@ button.ghost {
   font-size: 11px;
 }
 
+/* 机器人日志尾巴：长连接掉线、缺权限的报错都在这儿，出问题第一眼就该看到 */
+.bot-log {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--status-bg);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
 .qa-list {
   flex: 1;
   overflow-y: auto;
@@ -300,41 +415,152 @@ button.ghost {
   font-size: 13px;
 }
 
-.qa-item {
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  padding: 10px;
-  margin-bottom: 8px;
-  cursor: pointer;
-  background: var(--item-bg);
+/* 一条记忆一行，只放标题：正文摘要与徽标会把列表撑成卡片墙，翻不动 */
+.qa-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
   min-width: 0;
+  padding: 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.qa-row:hover {
+  background: var(--accent-soft);
+}
+
+.qa-row.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.qa-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.qa-row-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--pending);
+}
+
+.qa-row-dot.fresh {
+  background: var(--accent);
+}
+
+/* 原地被改写：和「新增」区分开，否则条数不变时看不出发生过什么 */
+.qa-row-dot.edited {
+  background: var(--pending);
+}
+
+/* 知识库里抓取失败的文档：标题压暗，免得看着像正常入库了 */
+.qa-row-dot.failed {
+  background: var(--danger);
+}
+
+.qa-row.failed .qa-row-title {
+  color: var(--muted);
+}
+
+.qa-row.fresh .qa-row-title {
+  font-weight: 600;
+}
+
+/* 删除键平时不占视觉位置，指到这行才露出来 */
+.qa-row-del {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0;
+}
+
+.qa-row:hover .qa-row-del,
+.qa-row-del:focus-visible {
+  opacity: 1;
+}
+
+.qa-row-del:hover {
+  color: var(--danger);
+}
+
+/* 点左侧标题后顶掉对话区的记忆详情 */
+.detail {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  padding: 16px 20px 0;
   overflow: hidden;
 }
 
-.qa-item:hover {
-  border-color: var(--accent-dim);
-}
-
-.qa-top {
+.detail-head {
   display: flex;
-  gap: 6px;
   align-items: flex-start;
-  margin-bottom: 6px;
+  gap: 12px;
 }
 
-/* 徽标区可换行；删除按钮始终留在右上角 */
-.qa-badges {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 4px;
+.detail-title {
   flex: 1 1 auto;
   min-width: 0;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
 }
 
-.badge {
+.detail-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+}
+
+.detail-actions button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.detail-actions button:hover {
+  border-color: var(--accent);
+}
+
+.detail-actions .detail-danger:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 0;
+}
+
+.detail-chip {
   font-size: 11px;
-  padding: 2px 6px;
-  border-radius: 4px;
+  padding: 2px 7px;
+  border-radius: 999px;
   background: var(--badge-bg);
   color: var(--muted);
   max-width: 100%;
@@ -343,59 +569,66 @@ button.ghost {
   white-space: nowrap;
 }
 
-.badge.pending {
-  color: var(--pending);
-}
-
-.badge.kind {
+.detail-chip.kind {
   color: var(--badge-kind);
 }
 
-.qa-del {
-  flex: 0 0 auto;
-  border: none;
-  background: transparent;
-  color: var(--muted);
-  cursor: pointer;
-  font-size: 12px;
-  white-space: nowrap;
-  padding: 2px 0 2px 4px;
-}
-
-.qa-del:hover {
-  color: var(--danger);
-}
-
-.qa-q {
-  margin: 0 0 4px;
-  font-size: 13px;
-  font-weight: 500;
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 3;
-  line-clamp: 3;
-  overflow: hidden;
-}
-
-.qa-a {
-  margin: 0;
-  font-size: 12px;
-  color: var(--muted);
-  overflow-wrap: anywhere;
-  display: -webkit-box;
-  -webkit-box-orient: vertical;
-  -webkit-line-clamp: 2;
-  line-clamp: 2;
-  overflow: hidden;
-}
-
-.qa-more {
-  display: inline-block;
-  margin-top: 4px;
+.detail-dim {
   font-size: 11px;
-  color: var(--accent);
-  opacity: 0.85;
+  color: var(--muted);
+}
+
+.detail-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+
+.detail-fact {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.detail-fact dt {
+  color: var(--muted);
+}
+
+.detail-fact dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.detail-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin-top: 12px;
+  padding-bottom: 16px;
+}
+
+/* 知识库正文按块显示：块之间要看得出分界，否则整篇糊成一坨 */
+.kb-chunk + .kb-chunk {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+
+.kb-chunk-head {
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.detail-body pre {
+  margin: 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
 }
 
 .main-col {
@@ -639,6 +872,28 @@ button:disabled {
   flex-direction: column;
   gap: 10px;
   color: var(--text);
+}
+
+.modal-wide {
+  width: min(900px, 100%);
+}
+
+/* 配置编辑器：改的是 YAML，缩进一错就读不出来，所以必须等宽字体 + 不换行 */
+.config-editor {
+  flex: 1;
+  min-height: 340px;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 2;
 }
 
 .modal h3 {

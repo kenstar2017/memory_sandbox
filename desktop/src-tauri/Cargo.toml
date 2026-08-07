@@ -21,5 +21,9 @@ tauri-build = { version = "2.6.3", features = [] }
 serde_json = "1.0"
 serde = { version = "1.0", features = ["derive"] }
 log = "0.4"
+# 后端代码指纹（要和 app_web.py::compute_code_stamp 同算法）
+sha2 = "0.10"
 tauri = { version = "2.11.3", features = [] }
 tauri-plugin-log = "2"
+# 用系统浏览器打开外链：WebView 里 <a target="_blank"> 是不动的
+tauri-plugin-opener = "2"

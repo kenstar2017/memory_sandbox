@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
-from typing import Dict, Iterable, List, Optional, Set, Tuple
+from typing import Dict, Iterable, List, Optional, Sequence, Set, Tuple
 
 from .config import FeishuConfig
 
@@ -82,6 +82,30 @@ class FeishuBodyUpdateResult:
 
 
 @dataclass
+class FeishuBlockUpdateResult:
+    """改单个块的结果。评论机器人只允许这种最小改动，不做全文重写。"""
+
+    url: str
+    ok: bool
+    document_id: str = ""
+    title: str = ""
+    block_id: str = ""
+    old_text: str = ""
+    new_text: str = ""
+    error: str = ""
+
+
+@dataclass
+class FeishuCommentReply:
+    """评论串里的一条回复。评论机器人要按 reply_id 找「刚发的那条」，光有正文不够。"""
+
+    reply_id: str = ""
+    user_id: str = ""
+    created_at: str = ""
+    text: str = ""
+
+
+@dataclass
 class FeishuComment:
     comment_id: str = ""
     user_id: str = ""
@@ -91,6 +115,7 @@ class FeishuComment:
     # 局部评论选中的原文；API 加不了局部评论，但客户端里加的能读到
     quote: str = ""
     replies: List[str] = field(default_factory=list)
+    reply_items: List[FeishuCommentReply] = field(default_factory=list)
 
 
 @dataclass
@@ -112,6 +137,8 @@ class FeishuCommentResult:
     title: str = ""
     comment_id: str = ""
     replied_to: str = ""
+    # 回复已有评论时才有：新回复在那条评论串里的 id（贴表情要用它）
+    reply_id: str = ""
     # 非空表示这是锚定到该块的局部评论（划词评论）
     block_id: str = ""
     error: str = ""
@@ -304,13 +331,33 @@ def _is_user_token_error(err: str) -> bool:
     return any(c in err for c in codes) or any(t in low for t in texts)
 
 
+def _widget_tail(
+    api_base: str, access_token: str, document_id: str, timeout: float
+) -> str:
+    """组件附录，拼在正文后面。绝不抛异常：读不到组件不该让整篇正文读失败。"""
+    from .feishu_widgets import widget_appendix
+
+    try:
+        blocks = _all_blocks(api_base, access_token, document_id, timeout)
+        tail = widget_appendix(api_base, access_token, blocks, timeout)
+    except Exception as e:  # noqa: BLE001
+        tail = f"【文档组件附录】列块失败，未能检查画板等组件：{e}"
+    return f"\n\n{tail}" if tail else ""
+
+
 def fetch_feishu_document(
     cfg: FeishuConfig,
     ref: FeishuDocRef,
     *,
     config_path: Optional[str] = None,
+    include_widgets: bool = False,
 ) -> FeishuFetchResult:
-    """拉取单篇飞书文档纯文本。"""
+    """
+    拉取单篇飞书文档纯文本。
+
+    include_widgets=True 时额外列一遍文档块，把画板这类「正文里没有痕迹」的
+    组件读出来附在末尾。默认关掉：多两次请求，而大多数文档没有组件。
+    """
     if not feishu_configured(cfg):
         return FeishuFetchResult(
             url=ref.url,
@@ -348,6 +395,10 @@ def fetch_feishu_document(
         content = _docx_raw_content(api_base, access_token, document_id, timeout)
         if not title:
             title = _docx_title(api_base, access_token, document_id, timeout)
+        if include_widgets:
+            content = content.rstrip() + _widget_tail(
+                api_base, access_token, document_id, timeout
+            )
         return document_id, content, title
 
     errors: List[str] = list(prep_errors)
@@ -1444,6 +1495,195 @@ def _locate_block(blocks: List[dict], needle: str) -> str:
     return str(hits[0].get("block_id") or "")
 
 
+# update_text_elements 只认文本类块：表格、图片、分割线没有 elements 可改
+_TEXT_BLOCK_TYPES = frozenset(_BLOCK_FIELD)
+
+
+def docx_url(cfg: FeishuConfig, document_id: str) -> str:
+    """文档可点链接；没配 doc_host 时返回空串（api_base 推不出企业域名）。"""
+    return _docx_url(cfg, document_id)
+
+
+def find_docx_block(
+    cfg: FeishuConfig,
+    ref: FeishuDocRef,
+    needle: str,
+    *,
+    config_path: Optional[str] = None,
+) -> Tuple[str, str]:
+    """
+    只读：按一段原文定位块，返回 (block_id, 该块当前全文)。命中多个或没命中都抛异常。
+
+    局部评论自带 quote（用户划中的那句），拿它就能定位到块——这是评论机器人能
+    「只改这一段」的前提。
+    """
+    if not feishu_configured(cfg):
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+
+    def _read(token: str) -> Tuple[str, str]:
+        document_id, _title = _resolve_document_id(api_base, token, ref, timeout)
+        blocks = _all_blocks(api_base, token, document_id, timeout)
+        block_id = _locate_block(blocks, needle)
+        for b in blocks:
+            if str(b.get("block_id") or "") == block_id:
+                return block_id, _block_plain_text(b)
+        return block_id, ""
+
+    _tok, found = _with_user_token(cfg, config_path, _read)
+    return found
+
+
+def _fetch_block(
+    api_base: str, access_token: str, document_id: str, block_id: str, timeout: float
+) -> dict:
+    doc = urllib.parse.quote(document_id, safe="")
+    bid = urllib.parse.quote(block_id, safe="")
+    data = _http_json(
+        "GET",
+        f"{api_base}/open-apis/docx/v1/documents/{doc}/blocks/{bid}",
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=timeout,
+    )
+    if data.get("code") != 0:
+        raise RuntimeError(f"读取块失败: {data.get('msg') or data}")
+    return (data.get("data") or {}).get("block") or {}
+
+
+def update_docx_block_text(
+    cfg: FeishuConfig,
+    ref: FeishuDocRef,
+    block_id: str,
+    new_text: str,
+    *,
+    expect_text: str = "",
+    config_path: Optional[str] = None,
+    confirmed: bool = False,
+) -> FeishuBlockUpdateResult:
+    """
+    改一个块的文字（PATCH .../blocks/{block_id}，update_text_elements）。
+
+    这是 update_docx_body 之外最小粒度的写法：只动指定的那一块，别处一个字不碰。
+    评论机器人只允许这种改法 —— mode=replace 会删掉全文所有块，不能交给自动流程。
+
+    `expect_text`：非空时先比对块的当前文字，对不上就拒绝执行。提案和落笔之间隔着
+    人工确认，中间别人可能已经改过同一段，覆盖掉才是真正的事故。
+
+    和其它写操作同一门禁：confirmed 必须显式传 True，否则不发任何请求。
+    行内样式会被这次替换抹平（整块文字换成一段纯文本），所以只适合改一句话，
+    不适合改带复杂格式的长段落。
+    """
+    if not confirmed:
+        return FeishuBlockUpdateResult(
+            url=ref.url,
+            ok=False,
+            block_id=block_id,
+            error="未确认：改飞书文档正文需本人逐次确认，调用方须显式传 confirmed=True",
+        )
+    text = (new_text or "").strip()
+    if not text:
+        return FeishuBlockUpdateResult(
+            url=ref.url, ok=False, block_id=block_id, error="新内容为空，不做改动"
+        )
+    if not block_id:
+        return FeishuBlockUpdateResult(
+            url=ref.url, ok=False, error="未指定 block_id，不知道要改哪一块"
+        )
+    if not feishu_configured(cfg):
+        return FeishuBlockUpdateResult(
+            url=ref.url, ok=False, block_id=block_id, error="未配置飞书 app_id / app_secret"
+        )
+
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+
+    def _read(token: str) -> Tuple[str, str, dict]:
+        document_id, title = _resolve_document_id(api_base, token, ref, timeout)
+        block = _fetch_block(api_base, token, document_id, block_id, timeout)
+        return document_id, title, block
+
+    try:
+        token, (document_id, title, block) = _with_user_token(cfg, config_path, _read)
+    except Exception as e:
+        return FeishuBlockUpdateResult(
+            url=ref.url, ok=False, block_id=block_id, error=str(e)
+        )
+
+    old_text = _block_plain_text(block)
+    block_type = int(block.get("block_type") or 0)
+    if block_type not in _TEXT_BLOCK_TYPES:
+        return FeishuBlockUpdateResult(
+            url=ref.url,
+            ok=False,
+            document_id=document_id,
+            title=title,
+            block_id=block_id,
+            old_text=old_text,
+            error=f"块类型 {block_type} 不是文本块，改不了（表格/图片这类要在飞书里手动改）",
+        )
+    if expect_text and _norm_for_match(expect_text) != _norm_for_match(old_text):
+        return FeishuBlockUpdateResult(
+            url=ref.url,
+            ok=False,
+            document_id=document_id,
+            title=title,
+            block_id=block_id,
+            old_text=old_text,
+            error="这段正文和提案时不一样了（可能已被别人改过），没有覆盖；请重新提一次",
+        )
+
+    doc = urllib.parse.quote(document_id, safe="")
+    bid = urllib.parse.quote(block_id, safe="")
+    try:
+        data = _http_json(
+            "PATCH",
+            f"{api_base}/open-apis/docx/v1/documents/{doc}/blocks/{bid}",
+            headers={"Authorization": f"Bearer {token}"},
+            body={
+                "update_text_elements": {
+                    "elements": [
+                        {"text_run": {"content": text, "text_element_style": {}}}
+                    ]
+                }
+            },
+            timeout=timeout,
+        )
+    except Exception as e:
+        err = str(e)
+        hint = ""
+        if "1770032" in err or "131006" in err or "permission" in err.lower():
+            hint = "；改正文需要该文档的编辑权限与 docx:document:write_only"
+        return FeishuBlockUpdateResult(
+            url=ref.url,
+            ok=False,
+            document_id=document_id,
+            title=title,
+            block_id=block_id,
+            old_text=old_text,
+            error=err + hint,
+        )
+    if data.get("code") != 0:
+        return FeishuBlockUpdateResult(
+            url=ref.url,
+            ok=False,
+            document_id=document_id,
+            title=title,
+            block_id=block_id,
+            old_text=old_text,
+            error=f"改正文失败: {data.get('msg') or data}",
+        )
+    return FeishuBlockUpdateResult(
+        url=ref.url,
+        ok=True,
+        document_id=document_id,
+        title=title,
+        block_id=block_id,
+        old_text=old_text,
+        new_text=text,
+    )
+
+
 def _comment_text(content: Optional[dict]) -> str:
     """把评论 elements 拼成纯文本；@人与云文档链接也保留可读形式。"""
     out: List[str] = []
@@ -1461,8 +1701,13 @@ def _comment_text(content: Optional[dict]) -> str:
 
 
 def _parse_comment(item: dict) -> FeishuComment:
-    replies = [
-        _comment_text(r.get("content"))
+    reply_items = [
+        FeishuCommentReply(
+            reply_id=str(r.get("reply_id") or ""),
+            user_id=str(r.get("user_id") or ""),
+            created_at=str(r.get("create_time") or ""),
+            text=_comment_text(r.get("content")),
+        )
         for r in ((item.get("reply_list") or {}).get("replies") or [])
     ]
     return FeishuComment(
@@ -1472,7 +1717,8 @@ def _parse_comment(item: dict) -> FeishuComment:
         is_whole=bool(item.get("is_whole")),
         is_solved=bool(item.get("is_solved")),
         quote=str(item.get("quote") or ""),
-        replies=[r for r in replies if r],
+        replies=[r.text for r in reply_items if r.text],
+        reply_items=reply_items,
     )
 
 
@@ -1483,11 +1729,15 @@ def list_docx_comments(
     config_path: Optional[str] = None,
     page_size: int = 50,
     max_comments: int = 200,
+    resolve_title: bool = True,
 ) -> FeishuCommentListResult:
     """
     只读：分页拉取文档全部评论（含客户端里加的局部评论，看 is_whole / quote 区分）。
 
     评论只是读，不受写门禁限制。
+
+    `resolve_title=False` 是给轮询用的：docx 取标题是额外一次网络往返，几十秒一轮、
+    十几篇文档地打下去请求量白白翻倍，而轮询根本不看标题。
     """
     if not feishu_configured(cfg):
         return FeishuCommentListResult(
@@ -1499,13 +1749,16 @@ def list_docx_comments(
     cap = max(1, int(max_comments or 200))
 
     def _read(token: str) -> Tuple[str, str, List[FeishuComment], bool]:
-        document_id, title = _resolve_document_id(api_base, token, ref, timeout)
+        if resolve_title or ref.kind == "wiki":
+            document_id, title = _resolve_document_id(api_base, token, ref, timeout)
+        else:
+            document_id, title = ref.token, ""
         path = urllib.parse.quote(document_id, safe="")
         items: List[FeishuComment] = []
         page_token = ""
         truncated = False
         while True:
-            q = {"file_type": "docx", "page_size": size}
+            q = {"file_type": "docx", "page_size": size, "user_id_type": "open_id"}
             if page_token:
                 q["page_token"] = page_token
             url = (
@@ -1551,9 +1804,304 @@ def list_docx_comments(
     )
 
 
+DOC_COMMENT_EVENT = "drive.notice.comment_add_v1"
+
+
+def subscribe_user_doc_events(
+    cfg: FeishuConfig,
+    *,
+    config_path: Optional[str] = None,
+    event_type: str = DOC_COMMENT_EVENT,
+) -> None:
+    """
+    以本人身份订阅云文档事件，失败抛异常。
+
+    这一步不做，长连接**一条评论事件都收不到**：`drive.notice.comment_add_v1` 是
+    「某个用户收到评论通知」时才推送的，得先有人订阅。用户身份订阅只能靠
+    user_access_token，且推送范围就是你自己在飞书里能收到通知的那些评论。
+
+    接口幂等，每次启动调一次即可。需要 docs:event:subscribe + docs:document.comment:read。
+    """
+    if not feishu_configured(cfg):
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+
+    def _post(token: str) -> bool:
+        data = _http_json(
+            "POST",
+            f"{api_base}/open-apis/drive/v1/user/subscription",
+            headers={"Authorization": f"Bearer {token}"},
+            body={"event_type": event_type},
+            timeout=timeout,
+        )
+        if data.get("code") != 0:
+            raise RuntimeError(f"订阅云文档事件失败: {data.get('msg') or data}")
+        return True
+
+    # 幂等，所以借 _with_user_token 的「token 过期就刷新重试」没有副作用
+    _with_user_token(cfg, config_path, _post)
+
+
+@dataclass
+class FileSubscribeResult:
+    url: str
+    ok: bool
+    identity: str = ""  # tenant / user
+    document_id: str = ""
+    error: str = ""
+
+
+def subscribe_file_events(
+    cfg: FeishuConfig,
+    ref: FeishuDocRef,
+    *,
+    config_path: Optional[str] = None,
+) -> FileSubscribeResult:
+    """
+    按文件订阅云文档事件，让这篇文档的评论能推到机器人。
+
+    只做 `subscribe_user_doc_events`（用户维度）是不够的：那条链路的推送前提是
+    「你本人在飞书客户端收到了这条评论通知」，而飞书**不会就你自己的评论通知你自己**，
+    所以自己在文档里 @ 机器人永远收不到事件（2026-08-06 实测）。
+
+    优先用应用身份（tenant）：应用订阅之后谁评论都推，包括你自己发的。应用身份需要
+    在开放平台开通「应用身份」的 docs:event:subscribe，没开会报 99991672，
+    这时退回用户身份——那样至少别人评论（会给你产生通知的那些）能触发。
+    """
+    if not feishu_configured(cfg):
+        return FileSubscribeResult(url=ref.url, ok=False, error="未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    app_id, app_secret, _, api_base = _resolve_credentials(cfg)
+
+    # wiki 链接的 token 不能直接喂给订阅接口，要先解析成 docx 的 obj_token
+    try:
+        token, (document_id, _title) = _with_user_token(
+            cfg,
+            config_path,
+            lambda t: _resolve_document_id(api_base, t, ref, timeout),
+        )
+    except Exception as e:  # noqa: BLE001
+        return FileSubscribeResult(url=ref.url, ok=False, error=str(e))
+
+    url = f"{api_base}/open-apis/drive/v1/files/{document_id}/subscribe?file_type=docx"
+    errors = []
+    try:
+        tenant = _tenant_access_token(api_base, app_id, app_secret, timeout)
+        data = _http_json(
+            "POST", url, headers={"Authorization": f"Bearer {tenant}"}, body={}, timeout=timeout
+        )
+        if data.get("code") == 0:
+            return FileSubscribeResult(
+                url=ref.url, ok=True, identity="tenant", document_id=document_id
+            )
+        errors.append(f"应用身份: {data.get('code')} {data.get('msg') or data}")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"应用身份: {e}")
+
+    try:
+        data = _http_json(
+            "POST", url, headers={"Authorization": f"Bearer {token}"}, body={}, timeout=timeout
+        )
+        if data.get("code") == 0:
+            return FileSubscribeResult(
+                url=ref.url, ok=True, identity="user", document_id=document_id
+            )
+        errors.append(f"用户身份: {data.get('code')} {data.get('msg') or data}")
+    except Exception as e:  # noqa: BLE001
+        errors.append(f"用户身份: {e}")
+
+    hint = ""
+    if any("99991672" in x for x in errors):
+        hint = (
+            "；应用身份缺 docs:event:subscribe，去开放平台按报错里的链接开通后，"
+            "自己发的评论才能触发机器人"
+        )
+    return FileSubscribeResult(url=ref.url, ok=False, error="；".join(errors) + hint)
+
+
+def file_subscription_on(
+    cfg: FeishuConfig,
+    document_id: str,
+    *,
+    config_path: Optional[str] = None,
+) -> bool:
+    """查一篇文档当前是否已按文件订阅（查不到就当作没订阅）。"""
+    if not feishu_configured(cfg) or not document_id:
+        return False
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+    url = f"{api_base}/open-apis/drive/v1/files/{document_id}/get_subscribe?file_type=docx"
+
+    def _read(token: str) -> bool:
+        data = _http_json("GET", url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout)
+        return bool((data.get("data") or {}).get("is_subscribe"))
+
+    try:
+        return _with_user_token(cfg, config_path, _read)[1]
+    except Exception:  # noqa: BLE001 - 查不到不该挡住调用方
+        return False
+
+
+def get_file_comment(
+    cfg: FeishuConfig,
+    ref: FeishuDocRef,
+    comment_id: str,
+    *,
+    config_path: Optional[str] = None,
+) -> FeishuCommentListResult:
+    """
+    只读：按 comment_id 精确取一条评论（含 quote 与全部回复）。
+
+    评论事件只带 comment_id、不带正文。用 list_docx_comments 拉全量再筛，一篇几百条
+    评论的文档每来一条评论就要翻好几页，所以走 batch_query 只取这一条。
+    """
+    if not comment_id:
+        return FeishuCommentListResult(url=ref.url, ok=False, error="未指定 comment_id")
+    if not feishu_configured(cfg):
+        return FeishuCommentListResult(
+            url=ref.url, ok=False, error="未配置飞书 app_id / app_secret"
+        )
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+
+    def _read(token: str) -> Tuple[str, str, List[FeishuComment]]:
+        document_id, title = _resolve_document_id(api_base, token, ref, timeout)
+        path = urllib.parse.quote(document_id, safe="")
+        query = urllib.parse.urlencode({"file_type": "docx", "user_id_type": "open_id"})
+        data = _http_json(
+            "POST",
+            f"{api_base}/open-apis/drive/v1/files/{path}/comments/batch_query?{query}",
+            headers={"Authorization": f"Bearer {token}"},
+            body={"comment_ids": [comment_id]},
+            timeout=timeout,
+        )
+        if data.get("code") != 0:
+            raise RuntimeError(f"读评论失败: {data.get('msg') or data}")
+        items = [_parse_comment(it) for it in (data.get("data") or {}).get("items") or []]
+        return document_id, title, items
+
+    try:
+        _tok, (document_id, title, items) = _with_user_token(cfg, config_path, _read)
+    except Exception as e:
+        err = str(e)
+        hint = ""
+        if "1069303" in err or "permission" in err.lower() or "20027" in err:
+            hint = "；读评论需要开通 docs:document.comment:read 并重新授权"
+        return FeishuCommentListResult(url=ref.url, ok=False, error=err + hint)
+    if not items:
+        return FeishuCommentListResult(
+            url=ref.url,
+            ok=False,
+            document_id=document_id,
+            title=title,
+            error=f"没查到评论 {comment_id}（可能已被删除）",
+        )
+    return FeishuCommentListResult(
+        url=ref.url, ok=True, document_id=document_id, title=title, comments=items
+    )
+
+
+def _comment_error_hint(err: str, replying: bool) -> str:
+    """把飞书的评论错误码翻成「该去改什么」。"""
+    if "1069303" in err or "permission" in err.lower() or "20027" in err:
+        return f"{err}；加评论需要开通 docs:document.comment:create 并重新授权"
+    if replying and "1069302" in err:
+        return f"{err}；已解决的评论不支持回复（先在飞书里取消解决）"
+    return err
+
+
 def _escape_comment_text(text: str) -> str:
     """new_comments 接口不接受裸 < >，要先转义，否则内容会被拒或截断。"""
     return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+
+
+# 评论表情用的是另一套枚举，不能直接拿 IM 那三个（OnIt / DONE 不在云文档的可选值里）
+DOC_REACTION_WORKING = "Typing"
+DOC_REACTION_DONE = "CheckMark"
+DOC_REACTION_FAILED = "CrossMark"
+
+
+def _app_token_or_empty(cfg: FeishuConfig) -> str:
+    """
+    应用身份的 token；拿不到就返回空串让调用方退回本人身份。
+
+    评论类接口两种 token 都收，但**署名跟着 token 走**：用 tenant 发出去在文档里
+    就是机器人，用 user 发出去署的是你本人的名字。所以能拿到应用身份就优先用它。
+    """
+    app_id, app_secret, _, api_base = _resolve_credentials(cfg)
+    if not (app_id and app_secret):
+        return ""
+    try:
+        return _tenant_access_token(api_base, app_id, app_secret, float(cfg.timeout or 30))
+    except Exception:  # noqa: BLE001 - 退回本人身份即可，不该让整次调用失败
+        return ""
+
+
+def update_comment_reaction(
+    cfg: FeishuConfig,
+    ref: FeishuDocRef,
+    reply_id: str,
+    reaction_type: str,
+    *,
+    action: str = "add",
+    config_path: Optional[str] = None,
+    confirmed: bool = False,
+) -> bool:
+    """
+    给文档评论里的某条回复贴 / 撤表情。贴上了返回 True，没开门禁 / 没配置返回 False，
+    请求真失败则抛异常——调用方要靠错误码分辨「权限没开」和「网络抖了」。
+
+    操作对象是 **reply_id 而不是 comment_id**：一条评论卡片下面挂着一串回复，
+    表情是挂在具体某条回复上的。走 v2 的 comments/reaction 单接口，用 action 区分
+    add / delete，所以撤销时不需要记什么 reaction_id（与 IM 那套不同）。
+
+    **优先用应用身份贴**，这样文档里显示的是机器人而不是你本人；应用对这篇文档没权限
+    时退回本人身份，至少表情还在。
+
+    和其它飞书写操作同一门禁：confirmed 必须显式传 True。表情比评论轻得多（不发通知），
+    但协作者一样看得见，不给绕过路径。
+    """
+    if not confirmed:
+        return False
+    if not reply_id or not reaction_type:
+        return False
+    if not feishu_configured(cfg):
+        return False
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+    body = {"action": action, "reply_id": reply_id, "reaction_type": reaction_type}
+
+    def _post(token: str, document_id: str) -> dict:
+        path = urllib.parse.quote(document_id, safe="")
+        query = urllib.parse.urlencode({"file_type": "docx"})
+        return _http_json(
+            "POST",
+            f"{api_base}/open-apis/drive/v2/files/{path}/comments/reaction?{query}",
+            headers={"Authorization": f"Bearer {token}"},
+            body=body,
+            timeout=timeout,
+        )
+
+    def _run(token: str) -> bool:
+        # 定位文档只能用 user token（wiki 节点解析走的是本人权限），署名只由发表情
+        # 那一次请求的 token 决定，所以这里读用 user、写优先 tenant
+        document_id, _title = _resolve_document_id(api_base, token, ref, timeout)
+        app_token = _app_token_or_empty(cfg)
+        if app_token:
+            try:
+                data = _post(app_token, document_id)
+                if data.get("code") == 0:
+                    return True
+            except Exception:  # noqa: BLE001 - 应用没这篇文档的权限就退回本人身份
+                pass
+        data = _post(token, document_id)
+        if data.get("code") != 0:
+            raise RuntimeError(f"{data.get('msg') or data}")
+        return True
+
+    _tok, ok = _with_user_token(cfg, config_path, _run)
+    return bool(ok)
 
 
 def create_docx_comment(
@@ -1566,6 +2114,7 @@ def create_docx_comment(
     anchor_text: str = "",
     config_path: Optional[str] = None,
     confirmed: bool = False,
+    as_app: bool = False,
 ) -> FeishuCommentResult:
     """
     给文档加评论。三种模式：
@@ -1578,6 +2127,10 @@ def create_docx_comment(
     局部评论走 v2 的 new_comments 接口（anchor.block_id）；v1 的 comments 接口
     只能建全文评论，传 is_whole / quote 会被静默忽略。anchor_text 会先列出所有
     块按文字定位，命中多个就报错而不是猜。
+
+    `as_app=True` 用应用身份发，文档里署名就是机器人（评论机器人走这条）；应用对这篇
+    文档没权限时自动退回本人身份，不会因此发不出去。默认仍是本人身份——AI 代你做文档
+    评审时那些意见署你的名，是你在说话。
 
     评论会通知文档协作者、别人立刻看得见，所以和改正文同一门禁：
     confirmed 必须显式传 True，否则直接返回错误且不发任何请求。
@@ -1624,12 +2177,19 @@ def create_docx_comment(
         return FeishuCommentResult(url=ref.url, ok=False, error=str(e))
 
     path = urllib.parse.quote(document_id, safe="")
+    query = urllib.parse.urlencode({"file_type": "docx"})
     payload: Dict
-    if anchor_block:
-        url = (
-            f"{api_base}/open-apis/drive/v1/files/{path}/new_comments"
-            f"?{urllib.parse.urlencode({'file_type': 'docx'})}"
-        )
+    if comment_id:
+        # 回复必须走 comments/{id}/replies。往 comments 接口的 body 里塞 comment_id
+        # 是**没用的**——那个字段只在响应里有，请求体规范里没有，会被静默忽略，
+        # 于是每次都在文档底部新建一条全文评论，看着像「机器人不回到串里」
+        cid = urllib.parse.quote(comment_id, safe="")
+        url = f"{api_base}/open-apis/drive/v1/files/{path}/comments/{cid}/replies?{query}"
+        payload = {
+            "content": {"elements": [{"type": "text_run", "text_run": {"text": body_text}}]}
+        }
+    elif anchor_block:
+        url = f"{api_base}/open-apis/drive/v1/files/{path}/new_comments?{query}"
         payload = {
             "file_type": "docx",
             "reply_elements": [
@@ -1638,10 +2198,7 @@ def create_docx_comment(
             "anchor": {"block_id": anchor_block},
         }
     else:
-        url = (
-            f"{api_base}/open-apis/drive/v1/files/{path}/comments"
-            f"?{urllib.parse.urlencode({'file_type': 'docx'})}"
-        )
+        url = f"{api_base}/open-apis/drive/v1/files/{path}/comments?{query}"
         payload = {
             "reply_list": {
                 "replies": [
@@ -1655,33 +2212,50 @@ def create_docx_comment(
                 ]
             }
         }
-        if comment_id:
-            payload["comment_id"] = comment_id
-    try:
-        data = _http_json(
+
+    def _send(access_token: str) -> dict:
+        return _http_json(
             "POST",
             url,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {access_token}"},
             body=payload,
             timeout=timeout,
         )
-    except Exception as e:
-        err = str(e)
-        hint = ""
-        if "1069303" in err or "permission" in err.lower() or "20027" in err:
-            hint = "；加评论需要开通 docs:document.comment:create 并重新授权"
-        return FeishuCommentResult(
-            url=ref.url, ok=False, document_id=document_id, title=title, error=err + hint
-        )
-    if data.get("code") != 0:
-        return FeishuCommentResult(
-            url=ref.url,
-            ok=False,
-            document_id=document_id,
-            title=title,
-            error=f"加评论失败: {data.get('msg') or data}",
-        )
-    new_id = str((data.get("data") or {}).get("comment_id") or "")
+
+    data: Optional[Dict] = None
+    if as_app:
+        app_token = _app_token_or_empty(cfg)
+        if app_token:
+            try:
+                sent = _send(app_token)
+                data = sent if sent.get("code") == 0 else None
+            except Exception:  # noqa: BLE001 - 应用没这篇文档的权限就退回本人身份
+                data = None
+    if data is None:
+        try:
+            data = _send(token)
+        except Exception as e:
+            return FeishuCommentResult(
+                url=ref.url,
+                ok=False,
+                document_id=document_id,
+                title=title,
+                error=_comment_error_hint(str(e), bool(comment_id)),
+            )
+        if data.get("code") != 0:
+            return FeishuCommentResult(
+                url=ref.url,
+                ok=False,
+                document_id=document_id,
+                title=title,
+                error=_comment_error_hint(
+                    f"加评论失败: {data.get('msg') or data}", bool(comment_id)
+                ),
+            )
+    payload_data = data.get("data") or {}
+    # 回复接口返回的是 reply_id；评论串还是原来那条，所以 comment_id 沿用入参
+    new_reply = str(payload_data.get("reply_id") or "")
+    new_id = str(payload_data.get("comment_id") or "") or comment_id
     return FeishuCommentResult(
         url=ref.url,
         ok=True,
@@ -1689,5 +2263,308 @@ def create_docx_comment(
         title=title,
         comment_id=new_id,
         replied_to=comment_id,
+        reply_id=new_reply,
         block_id=anchor_block,
     )
+
+
+def fetch_bot_message(cfg: FeishuConfig, message_id: str) -> Optional[Tuple[str, str]]:
+    """
+    按 message_id 拉一条消息，返回 (msg_type, content)；拿不到返回 None。
+
+    用来读「用户回复的那一条」——事件里只给 parent_id，正文得自己取回来。
+    群里读别人的消息需要 im:message.group_msg 权限，没开通时飞书返回 230027。
+    """
+    if not message_id:
+        return None
+    app_id, app_secret, _, api_base = _resolve_credentials(cfg)
+    if not app_id or not app_secret:
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    token = _tenant_access_token(api_base, app_id, app_secret, timeout)
+    url = f"{api_base}/open-apis/im/v1/messages/{message_id}"
+    try:
+        data = _http_json(
+            "GET", url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout
+        )
+    except Exception as e:  # noqa: BLE001
+        err = str(e)
+        if "230027" in err or "99991672" in err:
+            raise RuntimeError(
+                f"{err}；读群里被引用的消息需要开通 im:message.group_msg 权限并发布版本"
+            ) from e
+        raise
+    if data.get("code") != 0:
+        raise RuntimeError(f"读消息失败: {data.get('msg') or data}")
+    items = (data.get("data") or {}).get("items") or []
+    if not items:
+        return None
+    item = items[0] or {}
+    body = item.get("body") or {}
+    return str(item.get("msg_type") or ""), str(body.get("content") or "")
+
+
+def fetch_bot_identity(cfg: FeishuConfig) -> Tuple[str, str]:
+    """
+    机器人自己的 (open_id, 名字)。群里判断「这句是不是 @ 我」要用。
+
+    事件里的 mentions 只给被 @ 者的 open_id 和显示名，而配置里只有 app_id，
+    两者对不上，所以得先问一次飞书自己是谁。
+    """
+    app_id, app_secret, _user, api_base = _resolve_credentials(cfg)
+    if not app_id or not app_secret:
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    token = _tenant_access_token(api_base, app_id, app_secret, timeout)
+    data = _http_json(
+        "GET",
+        f"{api_base}/open-apis/bot/v3/info",
+        headers={"Authorization": f"Bearer {token}"},
+        timeout=timeout,
+    )
+    if data.get("code") != 0:
+        raise RuntimeError(f"读机器人信息失败: {data.get('msg') or data}")
+    bot = data.get("bot") or (data.get("data") or {}).get("bot") or {}
+    return str(bot.get("open_id") or ""), str(bot.get("app_name") or "")
+
+
+def fetch_message_as_user(
+    cfg: FeishuConfig,
+    message_id: str,
+    *,
+    config_path: Optional[str] = None,
+) -> Optional[Tuple[str, str]]:
+    """
+    以**用户身份**读一条消息，返回 (msg_type, content)；拿不到返回 None。
+
+    应用身份读别的应用发的卡片只能拿到 150~200 字节的摘要外壳（一个 image_key 加空文本），
+    实测同一个群里用户自己发的卡片则有完整正文——卡住的是跨应用。用户在客户端里看得见全文，
+    所以换用户身份还有一次机会。需要授权 im:message:readonly，没授权时飞书返回 99991679。
+    """
+    if not message_id:
+        return None
+    _app_id, _secret, _user, api_base = _resolve_credentials(cfg)
+    timeout = float(cfg.timeout or 30)
+    url = f"{api_base}/open-apis/im/v1/messages/{message_id}"
+
+    def _read(token: str) -> dict:
+        return _http_json(
+            "GET", url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout
+        )
+
+    try:
+        _tok, data = _with_user_token(cfg, config_path, _read)
+    except Exception as e:  # noqa: BLE001 - 缺权限是最常见的失败，得说清怎么补
+        err = str(e)
+        if "99991679" in err:
+            raise RuntimeError(
+                f"{err}；以用户身份读消息需要 im:message:readonly，"
+                "在开放平台后台补上这项用户身份权限后重跑 python3 scripts/feishu_login.py"
+            ) from e
+        raise
+    if data.get("code") != 0:
+        raise RuntimeError(f"读消息失败: {data.get('msg') or data}")
+    items = (data.get("data") or {}).get("items") or []
+    if not items:
+        return None
+    item = items[0] or {}
+    body = item.get("body") or {}
+    return str(item.get("msg_type") or ""), str(body.get("content") or "")
+
+
+def list_chat_messages(
+    cfg: FeishuConfig,
+    chat_id: str,
+    *,
+    before_message_id: str = "",
+    limit: int = 12,
+    max_pages: int = 4,
+) -> List[Dict[str, str]]:
+    """
+    读群里的一段历史，按时间**正序**返回 [{msg_type, content, sender_type}]。
+
+    用途是「被引用的那条读不出字」时去上游找料。实测过一次典型现场：Slardar 的结论
+    卡片是 157 字节空壳，但它上游第 6 条——**人转发进群的**告警卡片——有 6541 字节、
+    1115 个可读字，接口照给。别的机器人能就同一张卡片给出结论，靠的就是这段，
+    不是什么高级权限。
+
+    `before_message_id` 给的是被引用那条，只取它**之前**的消息：料在上游，
+    它后面多半是本轮的追问和自己的回复。接口只能按时间倒序整页翻，所以翻到那条
+    为止（最多 max_pages 页），再往前数 limit 条。翻不到就退回最近 limit 条。
+
+    走应用身份：同一个群实测应用身份能拿 25 条、用户身份只有 6 条（用户身份只给
+    本人可见的部分）。需要 im:message.group_msg，没开时飞书返回 230027。
+    """
+    if not chat_id:
+        return []
+    app_id, app_secret, _user, api_base = _resolve_credentials(cfg)
+    if not app_id or not app_secret:
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    token = _tenant_access_token(api_base, app_id, app_secret, timeout)
+    page_size = max(limit, 20)
+
+    newest_first: List[dict] = []
+    page_token = ""
+    for _ in range(max(1, max_pages)):
+        url = (
+            f"{api_base}/open-apis/im/v1/messages?container_id_type=chat"
+            f"&container_id={urllib.parse.quote(chat_id, safe='')}"
+            f"&sort_type=ByCreateTimeDesc&page_size={page_size}"
+        )
+        if page_token:
+            url += f"&page_token={urllib.parse.quote(page_token, safe='')}"
+        try:
+            data = _http_json(
+                "GET", url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout
+            )
+        except Exception as e:  # noqa: BLE001
+            err = str(e)
+            if "230027" in err or "99991672" in err:
+                raise RuntimeError(
+                    f"{err}；读群历史需要开通 im:message.group_msg 权限并发布版本"
+                ) from e
+            raise
+        if data.get("code") != 0:
+            raise RuntimeError(f"读群历史失败: {data.get('msg') or data}")
+        payload = data.get("data") or {}
+        newest_first.extend(x for x in (payload.get("items") or []) if isinstance(x, dict))
+        anchor = _index_of_message(newest_first, before_message_id)
+        # 锚点后面还得留够 limit 条才算够用，否则继续往前翻
+        if anchor >= 0 and len(newest_first) - anchor - 1 >= limit:
+            break
+        if not payload.get("has_more"):
+            break
+        page_token = str(payload.get("page_token") or "")
+        if not page_token:
+            break
+
+    anchor = _index_of_message(newest_first, before_message_id)
+    window = newest_first[anchor + 1 : anchor + 1 + limit] if anchor >= 0 else newest_first[:limit]
+
+    out: List[Dict[str, str]] = []
+    for item in reversed(window):  # 倒序翻页拿到的是新→旧，模型要读的是旧→新
+        sender = item.get("sender") or {}
+        # 自己说过的话不算上下文：机器人的帮助文本、上一轮回复混进去只会带偏模型
+        if str(sender.get("id") or "") == app_id:
+            continue
+        body = item.get("body") or {}
+        out.append(
+            {
+                "msg_type": str(item.get("msg_type") or ""),
+                "content": str(body.get("content") or ""),
+                "sender_type": str(sender.get("sender_type") or ""),
+            }
+        )
+    return out
+
+
+def _index_of_message(items: Sequence[dict], message_id: str) -> int:
+    if not message_id:
+        return -1
+    for i, item in enumerate(items):
+        if str(item.get("message_id") or "") == message_id:
+            return i
+    return -1
+
+
+# 机器人的「进度条」：开工贴 OnIt，收工换成 DONE，出错换成 CrossMark。
+# 大小写照抄飞书 emoji_type 文档（OnIt 与 DONE 不是一个风格，但都得原样传）
+REACTION_WORKING = "OnIt"
+REACTION_DONE = "DONE"
+REACTION_FAILED = "CrossMark"
+
+
+def _reaction_error(err: str) -> str:
+    if "231002" in err or "231008" in err or "99991672" in err:
+        return f"{err}；机器人贴表情需要开通 im:message.reactions:write_only 权限并发布版本"
+    return err
+
+
+def add_message_reaction(cfg: FeishuConfig, message_id: str, emoji_type: str) -> str:
+    """给一条消息贴表情回复，返回 reaction_id（删除时要用）。"""
+    if not message_id:
+        raise ValueError("message_id 不能为空")
+    app_id, app_secret, _, api_base = _resolve_credentials(cfg)
+    if not app_id or not app_secret:
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    token = _tenant_access_token(api_base, app_id, app_secret, timeout)
+    url = f"{api_base}/open-apis/im/v1/messages/{message_id}/reactions"
+    try:
+        data = _http_json(
+            "POST",
+            url,
+            headers={"Authorization": f"Bearer {token}"},
+            body={"reaction_type": {"emoji_type": emoji_type}},
+            timeout=timeout,
+        )
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(_reaction_error(str(e))) from e
+    if data.get("code") != 0:
+        raise RuntimeError(_reaction_error(f"加表情失败: {data.get('msg') or data}"))
+    return str((data.get("data") or {}).get("reaction_id") or "")
+
+
+def remove_message_reaction(cfg: FeishuConfig, message_id: str, reaction_id: str) -> None:
+    """撤掉之前贴的表情回复；reaction_id 来自 add_message_reaction。"""
+    if not (message_id and reaction_id):
+        return
+    app_id, app_secret, _, api_base = _resolve_credentials(cfg)
+    if not app_id or not app_secret:
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    token = _tenant_access_token(api_base, app_id, app_secret, timeout)
+    url = f"{api_base}/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}"
+    try:
+        data = _http_json(
+            "DELETE", url, headers={"Authorization": f"Bearer {token}"}, timeout=timeout
+        )
+    except Exception as e:  # noqa: BLE001
+        raise RuntimeError(_reaction_error(str(e))) from e
+    if data.get("code") != 0:
+        raise RuntimeError(_reaction_error(f"删表情失败: {data.get('msg') or data}"))
+
+
+def send_bot_text(
+    cfg: FeishuConfig,
+    text: str,
+    *,
+    reply_to: str = "",
+    chat_id: str = "",
+) -> str:
+    """
+    以机器人身份发一条纯文本，返回 message_id。
+
+    走 tenant_access_token：机器人说话是应用身份，与读文档用的 user token 无关，
+    所以这里不碰 OAuth 那套续期逻辑。传 reply_to 则回复到原消息（带引用）。
+    """
+    if not (reply_to or chat_id):
+        raise ValueError("reply_to 与 chat_id 至少要有一个")
+    app_id, app_secret, _, api_base = _resolve_credentials(cfg)
+    if not app_id or not app_secret:
+        raise RuntimeError("未配置飞书 app_id / app_secret")
+    timeout = float(cfg.timeout or 30)
+    token = _tenant_access_token(api_base, app_id, app_secret, timeout)
+    headers = {"Authorization": f"Bearer {token}"}
+    content = json.dumps({"text": text or ""}, ensure_ascii=False)
+
+    if reply_to:
+        url = f"{api_base}/open-apis/im/v1/messages/{reply_to}/reply"
+        body = {"content": content, "msg_type": "text"}
+    else:
+        url = f"{api_base}/open-apis/im/v1/messages?receive_id_type=chat_id"
+        body = {"receive_id": chat_id, "content": content, "msg_type": "text"}
+
+    try:
+        data = _http_json("POST", url, headers=headers, body=body, timeout=timeout)
+    except Exception as e:  # noqa: BLE001
+        err = str(e)
+        if "99991672" in err or "20027" in err or "permission" in err.lower():
+            raise RuntimeError(
+                f"{err}；机器人发消息需要开通 im:message:send_as_bot 权限并发布版本"
+            ) from e
+        raise
+    if data.get("code") != 0:
+        raise RuntimeError(f"发消息失败: {data.get('msg') or data}")
+    return str((data.get("data") or {}).get("message_id") or "")

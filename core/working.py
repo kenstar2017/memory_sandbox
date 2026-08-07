@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .rules import RuleEngine
 from .utils import cosine_similarity, extract_keywords, keyword_overlap
@@ -187,6 +187,21 @@ class WorkingMemory:
 
     def get_all_vectors(self) -> List[List[float]]:
         return [item["vec"] for item in self.window if item.get("vec")]
+
+    def last_exchange(self) -> Tuple[str, str]:
+        """最近一问一答，供「记一下这个结论」这类指代取内容。两者都可能为空。"""
+        answer, at = "", -1
+        for i in range(len(self.window) - 1, -1, -1):
+            if self.window[i].get("role") == "assistant":
+                answer = str(self.window[i].get("text") or "").strip()
+                at = i
+                break
+        if not answer:
+            return "", ""
+        for i in range(at - 1, -1, -1):
+            if self.window[i].get("role") == "user":
+                return str(self.window[i].get("text") or "").strip(), answer
+        return "", answer
 
     def recent_context_text(self, n: int = 4) -> str:
         parts = []

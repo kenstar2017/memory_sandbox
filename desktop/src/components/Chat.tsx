@@ -1,4 +1,4 @@
-import { useEffect, useRef } from 'react'
+import { useEffect, useRef, type ReactNode } from 'react'
 import type { ChatMessage } from '../api/types'
 import { THEME_OPTIONS, type ThemePreference } from '../theme'
 import { ToolBar } from './ToolBar'
@@ -29,6 +29,15 @@ type Props = {
   agentMode: AgentMode
   onAgentMode: (m: AgentMode) => void
   onToolAction: (id: string) => void
+  /** null = 还没问到（API 没起来或查询失败） */
+  botRunning: boolean | null
+  onBot: () => void
+  onConfig: () => void
+  /**
+   * 给了就顶掉消息区与输入框（点左侧标题看记忆详情用）。
+   * 顶栏与工具栏照旧显示，否则主题、「记忆」、「AI 门禁」这些入口会一起消失。
+   */
+  detail?: ReactNode
 }
 
 export function Chat({
@@ -44,6 +53,10 @@ export function Chat({
   agentMode,
   onAgentMode,
   onToolAction,
+  botRunning,
+  onBot,
+  onConfig,
+  detail,
 }: Props) {
   const bottomRef = useRef<HTMLDivElement>(null)
   useEffect(() => {
@@ -57,8 +70,9 @@ export function Chat({
         ? '当前指令：提炼 — 粘贴终端/日志，Enter 提炼候选'
         : null
 
-  return (
-    <section className="main">
+  // 顶栏与工具栏在对话和详情两种视图里都要在
+  const chrome = (
+    <>
       <header className="toolbar">
         <h1>BloomBox</h1>
         <div className="toolbar-actions">
@@ -83,6 +97,25 @@ export function Chat({
           >
             {inputMode === 'memory' ? '记忆中…' : '记忆'}
           </button>
+          <button
+            type="button"
+            className="bot-btn"
+            title={
+              botRunning === true
+                ? '飞书机器人运行中，点击查看日志或停止'
+                : botRunning === false
+                  ? '飞书机器人未运行，点击启动'
+                  : '飞书机器人状态未知'
+            }
+            onClick={onBot}
+          >
+            {/* 顶栏放它就是为了一眼看出在不在跑；停着是常态不是故障，所以不用红点 */}
+            <span className={`dot ${botRunning ? 'ok' : ''}`} />
+            飞书机器人
+          </button>
+          <button type="button" title="查看 / 修改生效的 config.yaml" onClick={onConfig}>
+            配置
+          </button>
         </div>
       </header>
       <ToolBar
@@ -91,6 +124,21 @@ export function Chat({
         busy={busy}
         onAction={onToolAction}
       />
+    </>
+  )
+
+  if (detail) {
+    return (
+      <section className="main">
+        {chrome}
+        {detail}
+      </section>
+    )
+  }
+
+  return (
+    <section className="main">
+      {chrome}
       {modeHint ? (
         <div className="mode-bar">
           <span>{modeHint}</span>
@@ -156,7 +204,7 @@ export function Chat({
               ? '记忆模式：输入问题（问），Enter 加入左侧'
               : inputMode === 'extract'
                 ? '提炼模式：粘贴终端输出或日志，Enter 提炼'
-                : '输入问题，或用上方工具栏 /「记忆」…'
+                : '问就直接问；要记东西说「记一下 …」即可'
           }
           rows={2}
           onChange={(e) => onInput(e.target.value)}

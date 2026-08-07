@@ -53,7 +53,7 @@ class MockLLM(BaseLLM):
         if context:
             hint += f"近期上下文:\n{context}\n"
         hint += (
-            "提示: 可用「记住：问 => 答」写入长时记忆；"
+            "提示: 说「记一下 <内容>」即可写入长时记忆；"
             "或在 config 将 llm.provider 设为 cursor / openai_compatible 并配置 API。"
         )
         return hint
@@ -425,6 +425,10 @@ class CursorLocalAgentLLM(BaseLLM):
         env = os.environ.copy()
         if self.api_key:
             env["CURSOR_API_KEY"] = self.api_key
+        # 告诉用户级 hook：这是记忆沙箱自己拉起来的嵌套 agent，读写两侧门禁都别管它。
+        # 不加这个标记，它会被 stop 门禁逼着自己 memory_remember 一条，而调用方
+        # （评论机器人 / IM 机器人）随后还会写一条，一次问答落两条互相打架的记忆。
+        env["MEMORY_SANDBOX_NESTED"] = "1"
 
         t0 = time.time()
         # 用 Popen 以便超时时 kill 并尽量拿到已缓冲的 stdout/stderr

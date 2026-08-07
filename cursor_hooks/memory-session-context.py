@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
 """sessionStart：把记忆沙箱调用协议注入每个会话的初始系统上下文。
 
-为什么用 sessionStart：这是文档里唯一端到端可用的注入点。
-beforeSubmitPrompt 只有 continue / user_message，返回 additional_context 会被静默忽略
-（日志里看着像成功）；postToolUse 的 additional_context 目前也到不了模型。
-
 作用等价于「所有项目都挂上了 memory-sandbox 规则」，不必再去 Customize → Rules 手填。
+
+**但不能只靠它**：additional_context 走 composer handle 写入，而 sessionStart 是异步的，
+常在 handle 建好之前就跑完了，于是被静默丢弃——日志里照样显示「Merged 1 valid response(s)」。
+最容易丢的恰好是新会话第一条消息。所以真正保证知识到位的是
+beforeSubmitPrompt 预取 + preToolUse 的 agent_message 投递（那是有官方文档的通道），
+这里的协议只当锦上添花。
 """
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 CONTEXT = """【记忆沙箱调用协议 · 本机全局】
@@ -17,7 +20,14 @@ CONTEXT = """【记忆沙箱调用协议 · 本机全局】
 
 1. 动手之前先查记忆：调用 memory_prepare，query 用用户原话。写文档、写方案、改代码、
    排障之前都要查——模板和规范往往记忆里已经有了，凭空写会跑偏。
+   本机还会在用户按下发送时就用原话预检索一次，把命中的参考问答通过工具拦截消息
+   直接交给你（开头是「记忆沙箱 · 已按用户原话预检索」）。收到那段就说明记忆已查过，
+   直接重试被拦下的操作即可，不必再调 memory_prepare。
 2. 返回的 references / context_pack 必须纳入本轮推理，但以当前仓库/现状为准，不要整段照抄。
+   发现某条与现状矛盾（取值变了、规范改了、结论被推翻）时，**必须顺手修掉**：
+   用该条的 id 调 memory_update 改正，整条已失效则 memory_delete。
+   只在回答里说一句「这条过时了」不算处理——它会继续误导后续每一次检索。
+   补充新结论用 memory_remember，但不要用「再写一条」代替「改掉旧的」：新旧并存会让检索打架。
 3. 不要因为 hit_local=true 就短路结束；改代码、查代码、排障仍要读代码再给结论。
 4. 结束前必须 memory_remember 固化本轮可复用结论：排障根因与修复步骤、代码改动与关键路径、
    需求字段模型与口径、调研与评审结论、方案取舍。question 用精简问法或用户原话
@@ -29,12 +39,28 @@ CONTEXT = """【记忆沙箱调用协议 · 本机全局】
 7. 纯寒暄、纯记忆管理指令（备份/清空/查状态/切场景）可跳过以上。"""
 
 
+def _nested_run() -> bool:
+    """记忆沙箱自己拉起来的嵌套 agent（`MEMORY_SANDBOX_NESTED=1`）不注入协议。
+
+    它是被当成「模型」调用的：只该按机器人给的提示产出一段文本，不该再去查记忆、
+    写记忆、动飞书。把这套协议塞给它反而会诱导它自己动手。
+    """
+    return (os.environ.get("MEMORY_SANDBOX_NESTED") or "").strip().lower() not in (
+        "",
+        "0",
+        "false",
+    )
+
+
 def main() -> int:
     # 注入失败也绝不能影响会话启动
     try:
         sys.stdin.read()
     except Exception:
         pass
+    if _nested_run():
+        print("{}")
+        return 0
     print(json.dumps({"additional_context": CONTEXT}, ensure_ascii=False))
     return 0
 

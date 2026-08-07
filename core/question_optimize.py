@@ -14,11 +14,14 @@ _TAIL_PATTERNS = [
     r"(?:的)?(?:文件)?位置(?:在哪(?:里|儿)?|是什么|是啥)?$",
     r"(?:在)?哪(?:里|儿)?(?:可以)?(?:找到|看|查)?$",
     r"(?:的)?(?:代码)?路径(?:是什么|在哪(?:里|儿)?)?$",
-    r"(?:怎么|如何)(?:找|查|定位|打开|进入|启动|运行|配置|使用).*$",
-    r"(?:是)?什么(?:意思|东西|组件|模块|文件)?$",
+    # 尾巴要有边界：`.*$` 会把「怎么启动并配置代理服务」整条吃掉，只剩个项目名
+    r"(?:怎么|如何)(?:找|查|定位|打开|进入|启动|运行|配置|使用)[^，,。；;]{0,4}$",
+    # 「为什么」不是「什么」：拆开会留下一个悬空的「为」
+    r"(?<!为)(?:是)?什么(?:意思|东西|组件|模块|文件)?$",
     r"(?:的)?(?:入口|目录|地址)(?:在哪(?:里|儿)?|是什么)?$",
     r"(?:在)?哪个(?:目录|文件夹|文件|模块|包)?(?:里|下)?$",
-    r"(?:请)?(?:告诉|问)?(?:我|下|一下)?$",
+    # 动词必须在，否则任何以「一下」收尾的句子都会被削一刀（「记一下」→「记」）
+    r"(?:请)?(?:告诉|问)(?:我|下|一下)?$",
 ]
 
 # 口语化前缀
@@ -90,7 +93,23 @@ def extract_core(question: str) -> str:
     return t or clean_text(question)
 
 
-def generate_aliases(original: str, canonical: str) -> List[str]:
+def safe_canonical(original: str) -> str:
+    """
+    存进库的问法：只清掉口水前缀和句末标点，**绝不截断**。
+
+    标题是用户回头认这条记忆的唯一凭据，砍尾巴看着更「核心」，实际是三重损失：
+    「…，为什么」剩「…，为」根本读不懂；「灰度开关的文件位置在哪里」剩「灰度开关」
+    丢了这条到底讲什么；「agency 项目怎么启动」剩「agency 项目」还会跟同项目的
+    其它记忆撞在一起。而且剥离不幂等——重跑一次「优化已有记忆」就再掉一个字。
+    检索侧完全不吃亏：核心词（extract_core）照样进 aliases 和向量文本。
+    """
+    plain = _strip_heads(re.sub(r"[？?!.。！]+$", "", clean_text(original)).strip())
+    if len(re.findall(r"[\w\u4e00-\u9fff]", plain)) < 2:
+        return clean_text(original) or original
+    return plain
+
+
+def generate_aliases(original: str, canonical: str, *, core: str = "") -> List[str]:
     aliases: Set[str] = set()
     for item in (original, canonical):
         item = clean_text(item)
@@ -98,8 +117,9 @@ def generate_aliases(original: str, canonical: str) -> List[str]:
             aliases.add(item)
             aliases.add(re.sub(r"[？?!.。！]+$", "", item).strip())
 
-    core = canonical or extract_core(original)
+    core = core or canonical or extract_core(original)
     if core:
+        aliases.add(core)
         for tpl in _ALIAS_TEMPLATES:
             aliases.add(tpl.format(core=core))
 
@@ -130,22 +150,20 @@ def generate_aliases(original: str, canonical: str) -> List[str]:
 def optimize_question(question: str) -> OptimizedQuestion:
     """
     存储前优化问题：
-    - canonical：去口语尾巴后的核心问法（提高泛化命中）
-    - aliases：常见变体，检索时用于加分
+    - canonical：存进库的问法。只清口水前缀，不截断（见 safe_canonical）
+    - aliases：常见变体（含更激进的核心词 extract_core），检索时用于加分
     - embed_text：原文+核心+别名拼接，向量覆盖更广
     """
     original = clean_text(question)
-    canonical = extract_core(original)
-    # 若剥离后过短，回退原文（去掉问号）
-    if len(re.findall(r"[\w\u4e00-\u9fff]", canonical)) < 2:
-        canonical = re.sub(r"[？?!.。！]+$", "", original).strip() or original
+    core = extract_core(original)
+    canonical = safe_canonical(original)
 
-    aliases = generate_aliases(original, canonical)
+    aliases = generate_aliases(original, canonical, core=core)
     # 关键词：核心 + 别名 + 原文
     kw_source = " ".join([canonical, original] + aliases[:8])
     keywords = extract_keywords(kw_source, top_k=20)
-    # 向量文本：核心优先，附带高频口语变体（控制长度）
-    embed_parts = [canonical]
+    # 向量文本：核心词必须在，否则整句标题会把它稀释掉
+    embed_parts = [canonical] + ([core] if core and core != canonical else [])
     for a in aliases:
         if a not in embed_parts:
             embed_parts.append(a)

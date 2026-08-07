@@ -66,11 +66,22 @@ class InstallTests(CursorHooksTestCase):
     def test_entries_carry_matcher_and_loop_limit(self):
         cursor_hooks.install(python=self.python)
         hooks = self._hooks_json()["hooks"]
-        self.assertEqual(hooks["preToolUse"][0]["matcher"], "Write|Delete|Task|MCP:")
         self.assertEqual(hooks["postToolUse"][0]["matcher"], "MCP:")
         self.assertEqual(hooks["stop"][0]["loop_limit"], 1)
-        # sessionStart 不该带 matcher（它没有可匹配的工具）
+        # sessionStart / beforeSubmitPrompt 没有可匹配的工具
         self.assertNotIn("matcher", hooks["sessionStart"][0])
+        self.assertNotIn("matcher", hooks["beforeSubmitPrompt"][0])
+
+    def test_pretooluse_matches_every_tool(self):
+        """有预取包时要拦住本轮第一个工具调用，Read/Grep 也算，所以不能限 matcher。"""
+        cursor_hooks.install(python=self.python)
+        entry = self._hooks_json()["hooks"]["preToolUse"][0]
+        self.assertNotIn("matcher", entry)
+
+    def test_prefetch_hook_registered(self):
+        cursor_hooks.install(python=self.python)
+        command = self._hooks_json()["hooks"]["beforeSubmitPrompt"][0]["command"]
+        self.assertIn("memory-prefetch.py", command)
 
     def test_command_uses_absolute_paths(self):
         cursor_hooks.install(python=self.python)
@@ -364,6 +375,8 @@ class SourceTests(unittest.TestCase):
             "os",
             "hashlib",
             "shutil",
+            # 预取 hook 用它调本机 API；标准库，装完仍与仓库解耦
+            "urllib",
         }
         for name in cursor_hooks.SCRIPT_NAMES:
             for line in (src / name).read_text(encoding="utf-8").splitlines():

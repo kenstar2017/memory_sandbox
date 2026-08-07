@@ -31,7 +31,10 @@ llm:
   # openai_compatible：OpenAI 兼容网关
   base_url: ""                # cursor cloud 默认 https://api.cursor.com；openai 填网关 /v1
   api_key: ""
-  model: ""                   # cursor 可空（用账号默认）；或 composer-2 / composer-2.5 等
+  # cursor 可空（用账号默认）。要指定：写 agent CLI 认的名字，
+  # 如 claude-opus-5-thinking-high / composer-2.5；名字错了不会提前报错，
+  # 只会在真正回退调模型那一刻失败，改完最好用一句话试一次
+  model: ""
   timeout: 600                # 本地 agent / cloud 建议 300~600
   cwd: ""                     # 空 = 启动时的 cwd；可填项目绝对路径
   runtime: local              # local=本机 agent 可读盘 | cloud=Cloud 无仓库
@@ -55,6 +58,16 @@ feishu:
   doc_host: ""                # 如 bytedance.larkoffice.com；用于把新建文档拼成可点链接
   timeout: 30
   max_chars: 80000
+  # 飞书机器人白名单（open_id）。留空 = 不服务任何人，只回对方自己的 open_id；
+  # 机器人默认全公司都能私聊，不设白名单等于把个人记忆库对全员开放
+  bot_allow_open_ids: []
+  bot_llm_timeout: 150        # 机器人问模型的超时上限（秒）；llm.timeout 更短则用更短的
+  # 文档评论机器人：被 @ 时在评论串里回答，要改正文先提方案等你回「确认」。
+  # 默认关：评论对整篇文档的协作者可见，且署名是你本人（评论接口只能用 user token）。
+  # 打开前先重跑 python3 scripts/feishu_login.py 授权 docs:event:subscribe
+  doc_bot_enabled: false
+  doc_bot_trigger: "@BloomBot"   # 评论正文含这个词才响应
+  doc_bot_ack_after_seconds: 8   # 超过这么久还没算完，先回一条「收到」
 
 sandbox:
   # 开发场景标签，用于情境依赖回忆

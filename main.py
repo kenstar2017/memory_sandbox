@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core import MemorySandbox, cursor_hooks
+from core import MemorySandbox, bot_process, cursor_hooks
 from core.cli_ui import CliUi
 from core.config import agent_ui_mode_from_config, load_config
 from core.paths import default_config_path, default_persist_dir
@@ -46,6 +46,30 @@ def _format_hooks_status(st: "cursor_hooks.HooksStatus") -> str:
     if st.missing_events:
         lines.append(f"- 未挂载事件：{', '.join(st.missing_events)}")
     lines.append(f"- 你自己的其它 hook：{st.foreign_entries} 条（安装/卸载都不会动）")
+    return "\n".join(lines)
+
+
+def _format_bot_status(st: "bot_process.BotStatus") -> str:
+    if st.running:
+        where = "" if st.owned else "，不是 BloomBox 起的"
+        head = f"运行中（PID {st.pid}{where}）"
+    elif not st.available:
+        head = f"未运行：找不到 {st.script}"
+    elif not st.sdk_installed:
+        head = "未运行：缺 lark-oapi（pip install lark-oapi）"
+    elif not st.configured:
+        head = "未运行：还没配 feishu.app_id / app_secret"
+    else:
+        head = "未运行"
+
+    lines = [head]
+    if st.started_at:
+        lines.append(f"- 启动时间：{st.started_at}")
+    lines.append(f"- 白名单：{st.allow_count} 人")
+    lines.append(f"- 文档评论机器人：{'开' if st.doc_bot_enabled else '关'}")
+    lines.append(f"- 日志：{st.log}")
+    if st.error:
+        lines.append(f"- 读配置：{st.error}")
     return "\n".join(lines)
 
 
@@ -123,6 +147,96 @@ def _remember_feishu_write(sb: MemorySandbox, **kw) -> None:
         return
     if msg:
         print(msg)
+
+
+def _feishu_board_cmd(sb: MemorySandbox, cmd: str, args) -> int:
+    """画板三条命令：列画板（只读）、建画板、往已有画板画。"""
+    from core.feishu_board import create_board, draw_board_flow, list_document_boards
+
+    config_path = args.config or str(default_config_path())
+
+    if cmd == "feishu-boards":
+        boards, err = list_document_boards(sb.config.feishu, args.url, config_path=config_path)
+        if err:
+            print(f"读取失败：{err}", file=sys.stderr)
+            return 2
+        if not boards:
+            print("这篇文档里没有画板")
+            return 0
+        for i, b in enumerate(boards, start=1):
+            print(f"{i}. whiteboard_id={b['whiteboard_id']}  block_id={b['block_id']}")
+        return 0
+
+    steps = [s for s in (args.steps or []) if s.strip()]
+    labels = list(args.labels or [])
+
+    if cmd == "feishu-board-draw":
+        if not steps:
+            print("至少要有一个 --step，否则没东西可画", file=sys.stderr)
+            return 2
+        if not args.yes:
+            print(f"将往画板 {args.whiteboard_id} 追加 {len(steps)} 个方框：")
+            print("  " + " → ".join(steps))
+            if input("确认？(y/N) ").strip().lower() not in {"y", "yes"}:
+                print("已取消")
+                return 1
+        res = draw_board_flow(
+            sb.config.feishu,
+            args.whiteboard_id,
+            steps,
+            direction=args.direction,
+            shape=args.shape,
+            edge_labels=labels,
+            config_path=config_path,
+            confirmed=True,
+        )
+        if not res.ok:
+            print(f"写入失败：{res.error}", file=sys.stderr)
+            return 2
+        print(f"已画上 {res.nodes_written} 个节点（含连线）")
+        return 0
+
+    if not args.yes:
+        where = f"已有文档 {args.url}" if args.url else f"新建文档《{args.title}》"
+        print(f"将在{where}里插入一个画板")
+        print("  " + (" → ".join(steps) if steps else "（空画板，不画内容）"))
+        if input("确认？(y/N) ").strip().lower() not in {"y", "yes"}:
+            print("已取消")
+            return 1
+    res = create_board(
+        sb.config.feishu,
+        url=args.url,
+        title=args.title,
+        folder_token=args.folder or "",
+        steps=steps,
+        direction=args.direction,
+        shape=args.shape,
+        edge_labels=labels,
+        config_path=config_path,
+        confirmed=True,
+    )
+    remember_kw = dict(
+        action="board",
+        url=res.url,
+        title=res.title,
+        document_id=res.document_id,
+        content="\n".join(f"- {s}" for s in steps),
+        blocks_written=res.nodes_written,
+        ok=res.ok,
+        error=res.error,
+    )
+    if not res.ok:
+        print(f"建画板失败：{res.error}", file=sys.stderr)
+        if res.whiteboard_id:
+            # 画板已经建出来了（只是没画上内容），id 必须给出去，否则用户既
+            # 找不到它也不知道有个空画板要清理
+            print(f"画板已存在：whiteboard_id={res.whiteboard_id}", file=sys.stderr)
+            _remember_feishu_write(sb, **remember_kw)
+        return 2
+    print(f"已建画板：whiteboard_id={res.whiteboard_id}（画上 {res.nodes_written} 个节点）")
+    print(res.url or f"document_id={res.document_id}（配置 feishu.doc_host 可输出链接）")
+    _remember_feishu_write(sb, **remember_kw)
+    return 0
 
 
 def interactive(sandbox: MemorySandbox, as_json: bool = False, local_only: bool = False) -> None:
@@ -269,8 +383,28 @@ def build_parser() -> argparse.ArgumentParser:
     sub.add_parser("status", help="打印各层统计")
 
     # backup / restore / pack / archive
-    sp = sub.add_parser("backup", help="备份长时记忆")
+    sp = sub.add_parser("backup", help="备份长时记忆（连同知识库快照）")
     sp.add_argument("--dest", default=None, help="备份文件或目录路径")
+
+    sp = sub.add_parser(
+        "feishu-subscribe",
+        help="按文件订阅飞书文档事件，让这篇文档的评论能推到机器人",
+    )
+    sp.add_argument("url", help="飞书 wiki 或 docx 链接")
+
+    # knowledge base
+    sp = sub.add_parser("knowledge-add", help="把一篇飞书文档收进知识库")
+    sp.add_argument("url", help="飞书 wiki 或 docx 链接")
+
+    sub.add_parser("knowledge-list", help="列出知识库里已收录的文档")
+
+    sp = sub.add_parser(
+        "knowledge-backfill",
+        help="全量扫描长时记忆，把里面的飞书链接补录进知识库",
+    )
+    sp.add_argument("--dry-run", action="store_true", help="只列出要抓哪些，不真抓")
+    sp.add_argument("--refresh", action="store_true", help="已入库的也重抓一遍")
+    sp.add_argument("--limit", type=int, default=0, help="最多抓几篇（0 = 不限）")
 
     sp = sub.add_parser("pack-export", help="导出可分享知识包（无向量、已脱敏）")
     sp.add_argument("--name", default="memory-pack", help="包名")
@@ -310,6 +444,14 @@ def build_parser() -> argparse.ArgumentParser:
     sp = sub.add_parser("feishu-bookmark", help="把飞书链接拉成待确认记忆候选")
     sp.add_argument("text", nargs="+", help="含飞书链接的文本")
 
+    sp = sub.add_parser("feishu-read", help="读飞书文档正文（只读）")
+    sp.add_argument("url", help="飞书 wiki 或 docx 链接")
+    sp.add_argument(
+        "--no-widgets",
+        action="store_true",
+        help="不读画板等组件，只取正文（默认会把画板读成文字附在末尾）",
+    )
+
     sp = sub.add_parser("feishu-set-title", help="改飞书 wiki 节点标题（写操作）")
     sp.add_argument("url", help="飞书 wiki 链接")
     sp.add_argument("title", help="新标题")
@@ -333,6 +475,68 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="跳过交互确认；仅限本人执行，AI 不得自行使用",
     )
+
+    sp = sub.add_parser(
+        "feishu-create-board", help="新建飞书画板，可顺手画流程图（写操作）"
+    )
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--url", default="", help="把画板插进这篇已有文档")
+    g.add_argument("--title", default="", help="先建一篇这个标题的文档，画板插在里面")
+    sp.add_argument("--folder", default="", help="新建文档时的目标文件夹 token")
+    sp.add_argument(
+        "--step",
+        action="append",
+        default=[],
+        dest="steps",
+        help="流程图的一个方框，按出现顺序连线；可重复传。不传则只建空画板",
+    )
+    sp.add_argument(
+        "--label",
+        action="append",
+        default=[],
+        dest="labels",
+        help="连线上的文字，第 i 个标在第 i 与 i+1 个方框之间；可重复传",
+    )
+    sp.add_argument(
+        "--direction", default="down", choices=["down", "right"], help="流程走向"
+    )
+    sp.add_argument(
+        "--shape",
+        default="round_rect",
+        choices=["round_rect", "rect", "ellipse", "diamond", "parallelogram"],
+        help="方框图形",
+    )
+    sp.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过交互确认；仅限本人执行，AI 不得自行使用",
+    )
+
+    sp = sub.add_parser("feishu-board-draw", help="往已有飞书画板里画流程图（写操作）")
+    sp.add_argument("whiteboard_id", help="画板 id，用 feishu-boards 查")
+    sp.add_argument(
+        "--step", action="append", default=[], dest="steps", help="一个方框；可重复传"
+    )
+    sp.add_argument(
+        "--label", action="append", default=[], dest="labels", help="连线文字；可重复传"
+    )
+    sp.add_argument(
+        "--direction", default="down", choices=["down", "right"], help="流程走向"
+    )
+    sp.add_argument(
+        "--shape",
+        default="round_rect",
+        choices=["round_rect", "rect", "ellipse", "diamond", "parallelogram"],
+        help="方框图形",
+    )
+    sp.add_argument(
+        "--yes",
+        action="store_true",
+        help="跳过交互确认；仅限本人执行，AI 不得自行使用",
+    )
+
+    sp = sub.add_parser("feishu-boards", help="列出文档里的画板与 whiteboard_id（只读）")
+    sp.add_argument("url", help="飞书 wiki 或 docx 链接")
 
     sp = sub.add_parser("feishu-edit-body", help="改飞书文档正文（写操作）")
     sp.add_argument("url", help="飞书 wiki 或 docx 链接")
@@ -382,7 +586,7 @@ def build_parser() -> argparse.ArgumentParser:
         help="跳过交互确认；仅限本人执行，AI 不得自行使用",
     )
 
-    sp = sub.add_parser("restore", help="从备份恢复长时记忆（覆盖）")
+    sp = sub.add_parser("restore", help="从备份恢复长时记忆与知识库（覆盖）")
     sp.add_argument("--path", default=None, help="备份文件；省略则用最新一份")
     sp.add_argument("--yes", action="store_true", help="跳过确认")
 
@@ -396,6 +600,27 @@ def build_parser() -> argparse.ArgumentParser:
         help="默认 long_term",
     )
     sp.add_argument("--yes", action="store_true", help="清空时跳过确认")
+
+    sp = sub.add_parser("update", help="原地修正一条长时记忆（结论过时了用这个）")
+    g = sp.add_mutually_exclusive_group(required=True)
+    g.add_argument("--id", dest="memory_id", help="记忆 id")
+    g.add_argument("--question", help="问题原文或核心问法")
+    sp.add_argument("answer", help="修正后的完整结论正文（整段替换原答案）")
+    sp.add_argument("--new-question", default="", help="要改问法时才传")
+    sp.add_argument("--scene", default="", help="省略沿用原值")
+    sp.add_argument(
+        "--tag",
+        action="append",
+        default=None,
+        dest="tags",
+        help="标签，可重复；不传则沿用原值",
+    )
+    sp.add_argument(
+        "--kind",
+        default="",
+        choices=["", "qa", "command", "path", "env", "pitfall", "decision"],
+        help="省略沿用原值",
+    )
 
     sp = sub.add_parser("delete", help="删除单条长时记忆")
     g = sp.add_mutually_exclusive_group(required=True)
@@ -433,6 +658,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     sub.add_parser("hooks-uninstall", help="移除 Cursor hook 门禁（保留你其它 hook）")
+
+    # 飞书机器人常驻进程（与 BloomBox 工具栏「飞书机器人」同一套托管）
+    sub.add_parser("bot-status", help="查看飞书机器人进程状态")
+    sub.add_parser("bot-start", help="后台启动飞书机器人（日志写到文件，退出终端也不掉）")
+    sub.add_parser("bot-stop", help="停止飞书机器人")
+    sub.add_parser("bot-restart", help="重启飞书机器人")
 
     sub.add_parser("seed", help="写入一组开发常用种子记忆")
 
@@ -651,6 +882,26 @@ def main(argv=None) -> int:
         print(json.dumps(sb.bookmark_feishu(text), ensure_ascii=False, indent=2))
         return 0
 
+    if cmd == "feishu-read":
+        from core.feishu import extract_feishu_urls, fetch_feishu_document
+
+        refs = extract_feishu_urls(args.url)
+        if not refs:
+            print("不是有效的飞书文档链接", file=sys.stderr)
+            return 2
+        res = fetch_feishu_document(
+            sb.config.feishu,
+            refs[0],
+            config_path=args.config or str(default_config_path()),
+            include_widgets=not args.no_widgets,
+        )
+        if not res.ok:
+            print(res.error, file=sys.stderr)
+            return 2
+        print(f"# {res.title}\n")
+        print(res.content)
+        return 0
+
     if cmd == "feishu-set-title":
         from core.feishu import extract_feishu_urls, update_wiki_node_title
 
@@ -733,6 +984,9 @@ def main(argv=None) -> int:
         print(res.url or f"document_id={res.document_id}（配置 feishu.doc_host 可输出链接）")
         _remember_feishu_write(sb, **remember_kw)
         return 0
+
+    if cmd in ("feishu-create-board", "feishu-board-draw", "feishu-boards"):
+        return _feishu_board_cmd(sb, cmd, args)
 
     if cmd == "feishu-edit-body":
         from core.feishu import (
@@ -894,7 +1148,7 @@ def main(argv=None) -> int:
             print(f"评论失败：{res.error}", file=sys.stderr)
             return 2
         if res.replied_to:
-            print(f"已回复评论 {res.replied_to}（新 comment_id={res.comment_id}）")
+            print(f"已回复评论 {res.replied_to}（新 reply_id={res.reply_id}）")
         elif res.block_id:
             print(
                 f"已添加局部评论（comment_id={res.comment_id}，锚定块 {res.block_id}）"
@@ -926,6 +1180,80 @@ def main(argv=None) -> int:
         print(sb.backup_long_term(args.dest))
         return 0
 
+    if cmd == "feishu-subscribe":
+        from core.feishu import extract_feishu_urls, subscribe_file_events
+
+        refs = extract_feishu_urls(args.url)
+        if not refs:
+            print("不是可识别的飞书文档链接", file=sys.stderr)
+            return 2
+        res = subscribe_file_events(sb.config.feishu, refs[0], config_path=sb.config_path)
+        if not res.ok:
+            print(f"订阅失败：{res.error}", file=sys.stderr)
+            return 1
+        who = "应用身份（谁评论都推，包括你自己发的）" if res.identity == "tenant" else (
+            "用户身份（只有会给你产生飞书通知的评论才推，自己发的不算）"
+        )
+        print(f"已订阅 {res.document_id}，{who}")
+        return 0
+
+    if cmd == "knowledge-add":
+        res = sb.add_knowledge(args.url)
+        doc = res.get("doc") or {}
+        if not res.get("ok"):
+            print(f"入库失败：{res.get('error')}", file=sys.stderr)
+            return 1
+        if res.get("skipped"):
+            print(f"知识库里已有《{doc.get('title')}》，跳过重复抓取")
+            return 0
+        print(
+            f"已收进知识库：《{doc.get('title')}》"
+            f"（{doc.get('char_count', 0)} 字 / {doc.get('chunk_count', 0)} 块）"
+        )
+        return 0
+
+    if cmd == "knowledge-list":
+        docs = sb.knowledge.list_docs()
+        if not docs:
+            print("知识库还是空的。用 knowledge-add <链接> 或 knowledge-backfill 收一些进来。")
+            return 0
+        for d in docs:
+            mark = f"  [失败] {d['last_error']}" if d.get("last_error") else ""
+            print(f"- 《{d['title']}》 {d.get('char_count', 0)} 字 / {d.get('chunk_count', 0)} 块{mark}")
+            print(f"  {d['url']}")
+        print(f"共 {len(docs)} 篇")
+        return 0
+
+    if cmd == "knowledge-backfill":
+        pending = sb.scan_memory_links(refresh=args.refresh)
+        if args.limit > 0:
+            pending = pending[: args.limit]
+        if not pending:
+            print("长时记忆里的飞书文档都已在知识库中，没有要补录的。")
+            return 0
+        if args.dry_run:
+            for item in pending:
+                flag = "（已入库，将重抓）" if item["in_kb"] else ""
+                print(f"- {item['url']}{flag}\n  来自记忆：{item['question']}")
+            print(f"共 {len(pending)} 篇待补录（--dry-run，未抓取）")
+            return 0
+
+        def _tick(i, total, item):
+            print(f"[{i}/{total}] 抓取 {item['url']}", flush=True)
+
+        res = sb.backfill_knowledge(
+            refresh=args.refresh, limit=args.limit, on_progress=_tick
+        )
+        for d in res["done"]:
+            print(f"  ✓ 《{d['title']}》")
+        for f in res["failed"]:
+            print(f"  ✗ {f['url']}：{f['error']}", file=sys.stderr)
+        print(
+            f"扫描 {res['scanned']} 条记忆，候选 {res['candidates']} 篇，"
+            f"成功 {len(res['done'])} 篇，失败 {len(res['failed'])} 篇"
+        )
+        return 1 if res["failed"] and not res["done"] else 0
+
     if cmd == "restore":
         if not args.yes:
             print("将覆盖当前长时记忆。确认请加 --yes", file=sys.stderr)
@@ -939,6 +1267,19 @@ def main(argv=None) -> int:
             return 2
         print(sb.forget(keyword=args.keyword, layer=args.layer))
         return 0
+
+    if cmd == "update":
+        msg = sb.update_memory(
+            memory_id=args.memory_id or "",
+            question=args.question or "",
+            answer=args.answer,
+            new_question=args.new_question or None,
+            scene=args.scene or None,
+            tags=args.tags,
+            kind=args.kind or None,
+        )
+        print(msg)
+        return 0 if not msg.startswith(("未找到", "answer 不能为空")) else 2
 
     if cmd == "delete":
         print(sb.delete_memory(memory_id=args.memory_id or "", question=args.question or ""))
@@ -988,6 +1329,22 @@ def main(argv=None) -> int:
         if res.backup:
             print(f"- 原配置已备份：{res.backup}")
         return 0
+
+    if cmd == "bot-status":
+        st = bot_process.status()
+        if as_json:
+            print(json.dumps(st.to_dict(), ensure_ascii=False, indent=2))
+            return 0
+        print(_format_bot_status(st))
+        return 0 if st.running else 1
+
+    if cmd in ("bot-start", "bot-stop", "bot-restart"):
+        res = getattr(bot_process, cmd.split("-", 1)[1])()
+        if as_json:
+            print(json.dumps(res.to_dict(), ensure_ascii=False, indent=2))
+            return 0 if res.ok else 1
+        print(res.message, file=sys.stdout if res.ok else sys.stderr)
+        return 0 if res.ok else 1
 
     if cmd == "scene":
         sb.working.set_scene(args.name)

@@ -23,7 +23,7 @@ from core.utils import assemble_long_term_query
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-sandbox"
-SERVER_VERSION = "0.1.10"
+SERVER_VERSION = "0.1.12"
 
 # 懒加载：initialize / tools/list 不触盘，避免多窗口 createClient 卡在启动
 _SANDBOX: Optional[MemorySandbox] = None
@@ -130,6 +130,8 @@ TOOLS: List[Dict[str, Any]] = [
             "把一条问答/知识点写入长时记忆，供后续 memory_prepare / memory_ask 命中。"
             "适合固化：启动命令、环境注意点、踩坑结论、团队约定。"
             "可用 tags / kind / facts；写入前自动脱敏 token/.env/密钥。"
+            "注意：若本轮发现某条**已有**记忆的说法过时了，别只是再写一条新的"
+            "（新旧并存会让检索打架），改用 memory_update 修正那一条。"
         ),
         "inputSchema": {
             "type": "object",
@@ -213,7 +215,10 @@ TOOLS: List[Dict[str, Any]] = [
     },
     {
         "name": "memory_backup",
-        "description": "手动备份长时陈述性记忆到本地 backups 目录（或指定路径）。",
+        "description": (
+            "手动备份长时陈述性记忆到本地 backups 目录（或指定路径）。"
+            "同时落一份配对的知识库快照（knowledge_<同一时间戳>.json），memory_restore 会一并恢复。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -324,6 +329,49 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_knowledge_add",
+        "description": (
+            "把整篇飞书文档收进知识库：按小节切块存下来，之后 memory_prepare / memory_ask "
+            "会在 context_pack 里带出相关原文片段。"
+            "区分：整篇长期备查用本工具；只想把文档摘成一条待确认记忆用 memory_feishu_bookmark；"
+            "只是这一次要看正文用 memory_feishu_read。"
+            "记忆里带的飞书链接会自动入库，一般不必手动调。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 或 docx 链接"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "可选标签",
+                },
+            },
+            "required": ["url"],
+        },
+    },
+    {
+        "name": "memory_knowledge_list",
+        "description": "列出知识库里已收录的文档（标题、链接、字数、块数、失败原因）。",
+        "inputSchema": {"type": "object", "properties": {}},
+    },
+    {
+        "name": "memory_knowledge_backfill",
+        "description": (
+            "全量扫描长时记忆，把里面出现过、但还没入库的飞书文档补录进知识库。"
+            "自动入库只在写记忆那一刻触发，启用知识库之前的存量记忆要靠这个补齐。"
+            "串行抓取，十几篇要一分钟；先用 dry_run=true 看会抓哪些。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "dry_run": {"type": "boolean", "description": "只列出候选，不抓取"},
+                "refresh": {"type": "boolean", "description": "已入库的也重抓一遍"},
+                "limit": {"type": "integer", "description": "最多抓几篇；0 或省略为不限"},
+            },
+        },
+    },
+    {
         "name": "memory_feishu_bookmark",
         "description": (
             "把飞书文档链接拉成「待确认记忆」候选（需已配置并登录飞书）。"
@@ -361,6 +409,15 @@ TOOLS: List[Dict[str, Any]] = [
                     "type": "integer",
                     "description": "从第几个字符开始读，配合 next_offset 续读，默认 0",
                     "default": 0,
+                },
+                "include_widgets": {
+                    "type": "boolean",
+                    "description": (
+                        "默认 true：额外把画板（流程图/架构图）读成文字附在正文后。"
+                        "画板内容不在正文里，关掉就完全看不到它存在。"
+                        "只想快速取正文、且确认文档没有画板时可设 false，省两次请求。"
+                    ),
+                    "default": True,
                 },
             },
             "required": ["url"],
@@ -524,8 +581,122 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_feishu_create_board",
+        "description": (
+            "新建飞书画板，可顺手把一串步骤画成流程图（写操作）。"
+            "飞书没有独立的画板文件：画板永远是某篇文档里的一个块，所以要么给 url "
+            "把画板插进已有文档，要么给 title 先建一篇新文档再插。"
+            "【硬性约定】必须先在对话里说明「插到哪篇文档、画什么内容」，"
+            "取得用户本轮明确同意后才能传 confirmed=true；上一轮批准过不算本次的确认。"
+            "返回里的 whiteboard_id 可交给 memory_feishu_board_draw 继续画。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "把画板插进这篇文档（wiki 或 docx 链接）；与 title 二选一",
+                },
+                "title": {
+                    "type": "string",
+                    "description": "没有 url 时新建文档的标题，画板插在这篇新文档里",
+                },
+                "folder_token": {
+                    "type": "string",
+                    "description": "新建文档时的目标文件夹 token；省略则建在云空间根目录",
+                },
+                "steps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "流程图的各个方框文字，按顺序连线；省略则只建一个空画板",
+                },
+                "edge_labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "连线上的文字，第 i 个标在第 i 与 i+1 个方框之间；可省略",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["down", "right"],
+                    "description": "流程走向：down=从上往下，right=从左往右",
+                    "default": "down",
+                },
+                "shape": {
+                    "type": "string",
+                    "enum": ["round_rect", "rect", "ellipse", "diamond", "parallelogram"],
+                    "description": "方框图形",
+                    "default": "round_rect",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "必须为 true 才执行；仅在用户本轮明确同意后传",
+                    "default": False,
+                },
+            },
+            "required": ["confirmed"],
+        },
+    },
+    {
+        "name": "memory_feishu_board_draw",
+        "description": (
+            "往已有飞书画板里画一串流程图节点（写操作，内容是追加的，不会清空原有图形）。"
+            "whiteboard_id 在界面上看不见：给文档链接调 memory_feishu_list_boards 可以列出来。"
+            "【硬性约定】必须先在对话里说明「往哪个画板画什么」，"
+            "取得用户本轮明确同意后才能传 confirmed=true。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "whiteboard_id": {"type": "string", "description": "画板 id"},
+                "steps": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "流程图的各个方框文字，按顺序连线",
+                },
+                "edge_labels": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "连线上的文字；可省略",
+                },
+                "direction": {
+                    "type": "string",
+                    "enum": ["down", "right"],
+                    "default": "down",
+                },
+                "shape": {
+                    "type": "string",
+                    "enum": ["round_rect", "rect", "ellipse", "diamond", "parallelogram"],
+                    "default": "round_rect",
+                },
+                "confirmed": {
+                    "type": "boolean",
+                    "description": "必须为 true 才执行；仅在用户本轮明确同意后传",
+                    "default": False,
+                },
+            },
+            "required": ["whiteboard_id", "steps", "confirmed"],
+        },
+    },
+    {
+        "name": "memory_feishu_list_boards",
+        "description": (
+            "列出一篇飞书文档里的所有画板及其 whiteboard_id（只读，无需确认）。"
+            "whiteboard_id 在飞书界面上看不到，要往已有画板里画东西就得先用它查。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "url": {"type": "string", "description": "飞书 wiki 或 docx 链接"},
+            },
+            "required": ["url"],
+        },
+    },
+    {
         "name": "memory_restore",
-        "description": "从备份恢复长时记忆（覆盖当前）。不传 path 则恢复最新一份备份。",
+        "description": (
+            "从备份恢复长时记忆（覆盖当前）。不传 path 则恢复最新一份备份。"
+            "同一时间戳的知识库快照会一并恢复；老备份没有那份快照时知识库不动。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -539,8 +710,63 @@ TOOLS: List[Dict[str, Any]] = [
         },
     },
     {
+        "name": "memory_update",
+        "description": (
+            "原地修正一条已有记忆，用于**记忆已过时/被现状推翻**的情况："
+            "取值变了、规范改了、方案被替换、结论被证伪。"
+            "id 从 memory_prepare / memory_ask 的 references 或 context_pack 里的 id= 取。"
+            "省略的字段沿用原值（只改答案就只传 answer）。"
+            "定位不到原条目会报错而不是新建——同一件事留着新旧两种说法比不更新更糟。"
+            "整条已无价值就用 memory_delete；只是补充新增结论请用 memory_remember。"
+        ),
+        "inputSchema": {
+            "type": "object",
+            "properties": {
+                "memory_id": {
+                    "type": "string",
+                    "description": "记忆 id（首选，来自 references / context_pack 的 id=）",
+                },
+                "question": {
+                    "type": "string",
+                    "description": "没有 id 时用问法或别名精确定位",
+                },
+                "answer": {
+                    "type": "string",
+                    "description": (
+                        "修正后的完整结论正文（会整段替换原答案）。"
+                        "建议保留「旧值已废弃」这类线索，别让读者以为从来如此。"
+                        "**修订说明要写在开头**：context_pack 只带答案前 800 字，"
+                        "写在末尾的更正会被截掉，检索方只看到旧结论。"
+                    ),
+                },
+                "new_question": {
+                    "type": "string",
+                    "description": "要改问法时才传；省略则保持原问法不动",
+                },
+                "scene": {"type": "string", "description": "场景，省略沿用原值"},
+                "tags": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "标签，省略沿用原值（传了则整体替换）",
+                },
+                "kind": {
+                    "type": "string",
+                    "description": "qa/command/path/env/pitfall/decision，省略沿用原值",
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "为什么要改（写进回执便于用户核对，不入库）",
+                },
+            },
+            "required": ["answer"],
+        },
+    },
+    {
         "name": "memory_delete",
-        "description": "删除单条已记住的问答。优先传 memory_id；否则传 question 精确匹配。",
+        "description": (
+            "删除单条已记住的问答。优先传 memory_id；否则传 question 精确匹配。"
+            "记忆整条都已失效（讲的东西不存在了）时用它；只是内容过时应优先 memory_update。"
+        ),
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -622,6 +848,8 @@ def _context_pack_from_dicts(
     blocks: List[str] = [
         "【记忆沙箱 · 参考问答】以下为相关历史结论，供结合当前项目上下文使用；"
         "可能过时，以仓库/现状为准，勿直接当作最终实现。"
+        "若某条与现状矛盾，用它的 id 调 memory_update 修正或 memory_delete 删除，"
+        "别留着误导后续检索。"
     ]
     for i, r in enumerate(refs, 1):
         ans = str(r.get("answer") or "").strip()
@@ -636,7 +864,8 @@ def _context_pack_from_dicts(
             score_s = f"{float(score):.2f}"
         except (TypeError, ValueError):
             score_s = str(score or "")
-        meta = f"score={score_s}{tag_s}"
+        # id 必须给：hook 投递的是纯文本，没有 id 就没法回头修这条
+        meta = f"id={r.get('id') or ''} score={score_s}{tag_s}"
         if reason_s:
             meta += f" reasons={reason_s}"
         blocks.append(
@@ -725,7 +954,8 @@ def _ask_payload(
                 "explain": [],
             }
     else:
-        result = sb.ask_local(query)
+        # MCP 这条路是只读的：memory_ask("记一下这个") 不该悄悄写一条库
+        result = sb.ask_local(query, allow_commands=False)
         hit_local = result.source not in ("miss", "sensory_reject", "llm")
         hit_meta = list((result.meta or {}).get("hits") or [])
         payload = {
@@ -750,6 +980,82 @@ def _feishu_ref(url: str):
 
     refs = extract_feishu_urls(url or "")
     return refs[0] if refs else None
+
+
+def _call_board_tool(
+    sb: MemorySandbox,
+    name: str,
+    args: Dict[str, Any],
+    cfg: Any,
+    config_path: str,
+    remember,
+    need_confirm,
+) -> Dict[str, Any]:
+    """
+    画板的两个写工具。单独抽出来是因为它们的参数与文档写操作差得远
+    （steps / direction / shape），塞进 _call_feishu_tool 会把那个函数撑成一团。
+    """
+    from core.feishu_board import create_board, draw_board_flow
+
+    if not bool(args.get("confirmed")):
+        return need_confirm()
+    steps = [str(s) for s in (args.get("steps") or [])]
+    labels = [str(s) for s in (args.get("edge_labels") or [])]
+    common = {
+        "direction": (args.get("direction") or "down").strip() or "down",
+        "shape": (args.get("shape") or "round_rect").strip() or "round_rect",
+        "edge_labels": labels,
+        "config_path": config_path,
+        "confirmed": True,
+    }
+
+    if name == "memory_feishu_board_draw":
+        res = draw_board_flow(
+            cfg, (args.get("whiteboard_id") or "").strip(), steps, **common
+        )
+        payload = {
+            "ok": res.ok,
+            "whiteboard_id": res.whiteboard_id,
+            "nodes_written": res.nodes_written,
+            "error": res.error,
+        }
+        # 这条不自动落库：往已有画板追加图形没有稳定的「哪篇文档」可挂，
+        # 硬记会生成一条只有 whiteboard_id 的孤儿记忆。结论请自己 memory_remember
+        return _tool_result(
+            json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+        )
+
+    res = create_board(
+        cfg,
+        url=(args.get("url") or "").strip(),
+        title=(args.get("title") or "").strip(),
+        folder_token=(args.get("folder_token") or "").strip(),
+        steps=steps,
+        **common,
+    )
+    payload = {
+        "ok": res.ok,
+        "whiteboard_id": res.whiteboard_id,
+        "block_id": res.block_id,
+        "document_id": res.document_id,
+        "url": res.url,
+        "title": res.title,
+        "nodes_written": res.nodes_written,
+        "error": res.error,
+    }
+    payload["remembered"] = remember(
+        action="board",
+        url=res.url,
+        title=res.title,
+        document_id=res.document_id,
+        content="\n".join(f"- {s}" for s in steps),
+        blocks_written=res.nodes_written,
+        ok=res.ok,
+        error=res.error,
+    )
+    return _tool_result(
+        json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+    )
 
 
 def _call_feishu_tool(
@@ -795,7 +1101,13 @@ def _call_feishu_tool(
         ref = _feishu_ref(args.get("url") or "")
         if ref is None:
             return _tool_result("不是有效的飞书文档链接", is_error=True)
-        res = fetch_feishu_document(cfg, ref, config_path=config_path)
+        want_widgets = args.get("include_widgets")
+        res = fetch_feishu_document(
+            cfg,
+            ref,
+            config_path=config_path,
+            include_widgets=True if want_widgets is None else bool(want_widgets),
+        )
         if not res.ok:
             return _tool_result(
                 json.dumps(
@@ -901,8 +1213,9 @@ def _call_feishu_tool(
             "document_id": res.document_id,
             "comment_id": res.comment_id,
             "replied_to": res.replied_to,
+            "reply_id": res.reply_id,
             "block_id": res.block_id,
-            "is_whole": not res.block_id,
+            "is_whole": not (res.block_id or res.replied_to),
             "error": res.error,
         }
         payload["remembered"] = _remember(
@@ -949,6 +1262,20 @@ def _call_feishu_tool(
         )
         return _tool_result(
             json.dumps(payload, ensure_ascii=False, indent=2), is_error=not res.ok
+        )
+
+    if name in ("memory_feishu_create_board", "memory_feishu_board_draw"):
+        return _call_board_tool(sb, name, args, cfg, config_path, _remember, _need_confirm)
+
+    if name == "memory_feishu_list_boards":
+        from core.feishu_board import list_document_boards
+
+        boards, err = list_document_boards(
+            cfg, args.get("url") or "", config_path=config_path
+        )
+        payload = {"ok": not err, "boards": boards, "count": len(boards), "error": err}
+        return _tool_result(
+            json.dumps(payload, ensure_ascii=False, indent=2), is_error=bool(err)
         )
 
     if name == "memory_feishu_edit_body":
@@ -1248,6 +1575,69 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             )
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
 
+        if name == "memory_knowledge_add":
+            url = (args.get("url") or "").strip()
+            if not url:
+                return _tool_result("url 不能为空", is_error=True)
+            tags = args.get("tags")
+            if isinstance(tags, str):
+                tags = [tags]
+            res = sb.add_knowledge(url, tags=tags)
+            if not res.get("ok"):
+                return _tool_result(res.get("error") or "入库失败", is_error=True)
+            doc = res.get("doc") or {}
+            if res.get("skipped"):
+                return _tool_result(f"知识库里已有《{doc.get('title')}》，跳过重复抓取")
+            return _tool_result(
+                f"已收进知识库：《{doc.get('title')}》"
+                f"（{doc.get('char_count', 0)} 字 / {doc.get('chunk_count', 0)} 块）"
+            )
+
+        if name == "memory_knowledge_list":
+            payload = {
+                "stats": sb.knowledge.stats(),
+                "docs": [
+                    {
+                        "id": d.get("id"),
+                        "title": d.get("title"),
+                        "url": d.get("url"),
+                        "char_count": d.get("char_count"),
+                        "chunk_count": d.get("chunk_count"),
+                        "last_error": d.get("last_error"),
+                    }
+                    for d in sb.knowledge.list_docs()
+                ],
+            }
+            return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
+
+        if name == "memory_knowledge_backfill":
+            refresh = bool(args.get("refresh"))
+            try:
+                limit = int(args.get("limit") or 0)
+            except (TypeError, ValueError):
+                limit = 0
+            if bool(args.get("dry_run")):
+                pending = sb.scan_memory_links(refresh=refresh)
+                if limit > 0:
+                    pending = pending[:limit]
+                return _tool_result(
+                    json.dumps(
+                        {"candidates": len(pending), "docs": pending},
+                        ensure_ascii=False,
+                        indent=2,
+                    )
+                )
+            res = sb.backfill_knowledge(refresh=refresh, limit=limit)
+            return _tool_result(
+                f"扫描 {res['scanned']} 条记忆，候选 {res['candidates']} 篇，"
+                f"成功 {len(res['done'])} 篇，失败 {len(res['failed'])} 篇\n"
+                + json.dumps(
+                    {"done": res["done"], "failed": res["failed"]},
+                    ensure_ascii=False,
+                    indent=2,
+                )
+            )
+
         if name == "memory_feishu_bookmark":
             text = (args.get("text") or "").strip()
             if not text:
@@ -1263,6 +1653,9 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             "memory_feishu_create_doc",
             "memory_feishu_edit_body",
             "memory_feishu_set_title",
+            "memory_feishu_create_board",
+            "memory_feishu_board_draw",
+            "memory_feishu_list_boards",
         }:
             return _call_feishu_tool(sb, name, args)
 
@@ -1274,6 +1667,37 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 )
             path = (args.get("path") or "").strip() or None
             return _tool_result(sb.restore_long_term(path))
+
+        if name == "memory_update":
+            memory_id = (args.get("memory_id") or "").strip()
+            question = (args.get("question") or "").strip()
+            if not memory_id and not question:
+                return _tool_result(
+                    "请提供 memory_id（首选）或 question 以定位要修正的记忆", is_error=True
+                )
+            tags = args.get("tags")
+            before = sb.find_memory(memory_id=memory_id, question=question)
+            msg = sb.update_memory(
+                memory_id=memory_id,
+                question=question,
+                answer=args.get("answer") or "",
+                new_question=args.get("new_question"),
+                scene=(args.get("scene") or "").strip() or None,
+                tags=[str(t) for t in tags] if isinstance(tags, list) else None,
+                kind=(args.get("kind") or "").strip() or None,
+            )
+            failed = msg.startswith(("未找到", "answer 不能为空"))
+            if failed:
+                return _tool_result(msg, is_error=True)
+            reason = (args.get("reason") or "").strip()
+            # 回执带上旧答案摘要：用户能直接看出改掉了什么
+            old = (before.answer or "").strip() if before else ""
+            parts = [msg]
+            if reason:
+                parts.append(f"原因：{reason}")
+            if old:
+                parts.append(f"原答案（前 200 字）：{old[:200]}")
+            return _tool_result("\n".join(parts))
 
         if name == "memory_delete":
             msg = sb.delete_memory(

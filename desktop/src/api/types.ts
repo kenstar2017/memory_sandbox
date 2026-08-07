@@ -31,6 +31,46 @@ export type MemoryRecord = {
   tags?: string[]
   kind?: string
   facts?: Record<string, string>
+  weight?: number
+  hit_count?: number
+  /** 秒级时间戳。created_at 决定列表顺序，updated_at 会被检索命中刷新 */
+  created_at?: number
+  updated_at?: number
+}
+
+/** 知识库里的一篇文档。正文不在这里，要 getKnowledgeDoc 才带 chunks */
+export type KnowledgeDoc = {
+  id: string
+  url: string
+  title: string
+  document_id?: string
+  source?: string
+  /** manual = 手动录入；memory:<记忆id> = 跟着某条记忆里的链接自动抓的 */
+  origin?: string
+  scene?: string
+  tags?: string[]
+  char_count?: number
+  chunk_count?: number
+  fetched_at?: number
+  updated_at?: number
+  /** 非空表示上次抓取失败，列表里要标出来 */
+  last_error?: string
+}
+
+export type KnowledgeChunk = {
+  id: string
+  seq: number
+  heading_path: string
+  text: string
+}
+
+export type KnowledgeDocDetail = KnowledgeDoc & { chunks: KnowledgeChunk[] }
+
+export type KnowledgeStats = {
+  doc_count: number
+  chunk_count: number
+  failed_count: number
+  persist_dir?: string
 }
 
 export type RememberPayload = {

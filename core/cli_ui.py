@@ -185,7 +185,7 @@ class CliUi:
         if llm_line:
             self._write_err(f"│  {self._c(_DIM, 'LLM')}   {llm_line}")
         self._write_err(
-            self._c(_DIM, "│  指令  切换Agent模式：ask|plan|agent · 记住：问 => 答 · 帮助 · quit")
+            self._c(_DIM, "│  指令  切换Agent模式：ask|plan|agent · 记一下 <内容> · 帮助 · quit")
         )
         self._write_err(self._c(_DIM, "╰────────────────────────────────────────────"))
         self._write_err(self._c(_DIM, "  进度在下方滚动；答案在回复区。长等待会显示旋转指示。"))

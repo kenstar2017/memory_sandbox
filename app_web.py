@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import queue
@@ -24,15 +25,62 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from core import MemorySandbox, cursor_hooks
+from core import MemorySandbox, bot_process, config_edit, cursor_hooks
 from core.config import load_config
 from core.paths import app_support_dir, default_config_path, default_persist_dir, is_frozen
 
 HOST = "127.0.0.1"
 PREFERRED_PORT = 8765
 # 前端/协议版本：用于识别旧进程（无思考过程流）并提示重启
-UI_BUILD = "20260731-desktop-api"
-UI_FEATURES = ("chat_stream", "think_card", "api_only", "cors", "cursor_hooks")
+UI_BUILD = "20260804-code-stamp"
+UI_FEATURES = (
+    "chat_stream",
+    "think_card",
+    "api_only",
+    "cors",
+    "cursor_hooks",
+    "long_term_revision",
+    "prompt_prefetch",
+    "feishu_bot",
+    "config_edit",
+    "knowledge_base",
+    # 指纹比对本身要靠特性名兜底：更早的后端 health 里没有 code_stamp 字段，
+    # 指纹判定会当「无意见」放过它，只有列成特性才认得出那是旧进程
+    "code_stamp",
+)
+
+
+def compute_code_stamp(root: Optional[Path] = None) -> str:
+    """app_web.py + core/*.py 的内容指纹，读不全时返回空串。
+
+    为什么需要它：UI_FEATURES 只在「加了新接口」时才会动，而大量改动只落在 core/
+    里（检索、拼包、记忆读写）。那种情况下旧进程照样 200、features 也齐全，于是被
+    当成新鲜的复用下去，行为却是上一个版本的。今天两次都栽在这：一次新接口 404，
+    一次 context_pack 少了记忆 id，门禁因此发不出可操作的 id。
+
+    只哈希内容、不看 mtime：Tauri 打包会重写 mtime，用时间戳会每次都判成不一致。
+    Rust 侧 api_server.rs::expected_code_stamp 必须与本函数逐字节同算法，
+    两边各有一个对同一组样例文件断言同一指纹的测试守着。
+    """
+    base = Path(root) if root else ROOT
+    names = ["app_web.py"]
+    try:
+        names += sorted(f"core/{p.name}" for p in (base / "core").glob("*.py"))
+    except OSError:
+        return ""
+    lines = []
+    for rel in names:
+        try:
+            data = (base / rel).read_bytes()
+        except OSError:
+            # 缺文件说明这不是一份完整的源码树，别拿半份指纹去判定谁旧
+            return ""
+        lines.append(f"{rel}:{hashlib.sha256(data).hexdigest()}\n")
+    return hashlib.sha256("".join(lines).encode("utf-8")).hexdigest()[:12]
+
+
+# 启动时算一次：进程要报的是「自己正在跑的代码」，不是磁盘上的最新代码
+CODE_STAMP = compute_code_stamp()
 # API-only：只提供 /api/*，供 desktop/（Vite+Tauri）调用；可用 --api-only 或 MS_API_ONLY=1
 API_ONLY = False
 # 开发/桌面允许的跨域来源（逗号分隔可用 MS_CORS_ORIGINS 覆盖）
@@ -982,7 +1030,7 @@ const COMMANDS = [
   { id: 'working', name: '短时记忆', desc: '查看工作记忆窗口', icon: '短', run: '查看短时记忆' },
   { id: 'long', name: '长时记忆', desc: '查看长时记忆清单', icon: '长', run: '查看长时记忆' },
   { id: 'clear_w', name: '清空工作记忆', desc: '清空短时滑动窗口', icon: '清', run: '清空工作记忆' },
-  { id: 'backup_l', name: '备份长时记忆', desc: '导出陈述性问答到 backups/', icon: '备', run: '备份长时记忆' },
+  { id: 'backup_l', name: '备份长时记忆', desc: '导出陈述性问答与知识库到 backups/', icon: '备', run: '备份长时记忆' },
   { id: 'clear_l', name: '清空长时记忆', desc: '清空持久化问答（需确认）', icon: '删', confirmClear: 'long' },
   { id: 'extract', name: '提炼候选', desc: '从粘贴的终端/日志提炼候选记忆', icon: '炼', extract: true },
   { id: 'retrieval', name: '检索设置', desc: '调整向量/关键词/BM25 权重与命中阈值', icon: '检', openRetrieval: true },
@@ -1784,7 +1832,8 @@ async function sendText(text) {
       }
     }
     if (finalData.status_line) footer.textContent = finalData.status_line;
-    if (text.startsWith('记住') || text.includes('清空长时') || text.includes('清空全部')) {
+    // 指令都可能改库（记一下 / 忘记 / 清空 / 删除），按前缀猜会漏掉自然语言的说法
+    if (finalData.source === 'command') {
       await refreshSaved();
       renderQaList();
     }
@@ -2161,7 +2210,7 @@ if (agentModeSel) {
   };
 }
 
-append('优先检索本地三级记忆。\\n提问后会显示「思考中」过程（本地检索 → LLM）。\\n新方式：输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n原有指令仍可用：记住：问 => 答 | 备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏：Agent 模式 · 「检索设置」（向量/关键词/BM25 权重，每项有说明）。', 'sys');
+append('优先检索本地三级记忆。\\n提问后会显示「思考中」过程（本地检索 → LLM）。\\n想记东西说人话就行：记一下 <内容> | 把 <内容> 存到记忆库 | <内容>，记下来；只说「记一下这个」则记上一轮对话。\\n要自己分问答：记住：问 => 答。也可输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n其它指令：备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏：Agent 模式 · 「检索设置」（向量/关键词/BM25 权重，每项有说明）。', 'sys');
 refreshSaved();
 renderQaList();
 refreshAgentMode();
@@ -2194,9 +2243,11 @@ class AppState:
     def status_line(self) -> str:
         st = self.sandbox.status()
         am = (st.get("llm") or {}).get("agent_mode") or "ask"
+        kb = st.get("knowledge") or {}
         return (
             f"工作记忆 {st['working']['size']}/{st['working']['max_size']} · "
             f"长时记忆 {st['long_term']['declarative_count']} 条 · "
+            f"知识库 {kb.get('doc_count', 0)} 篇 · "
             f"场景 {st['working']['scene']} · "
             f"Agent {am} · "
             f"数据 {app_support_dir()}"
@@ -2238,6 +2289,14 @@ def _apply_cors(handler: BaseHTTPRequestHandler) -> None:
         "Content-Type, Authorization, X-Requested-With",
     )
     handler.send_header("Access-Control-Max-Age", "86400")
+
+
+def _clamp_int(raw, default: int, low: int, high: int) -> int:
+    try:
+        val = int(raw if raw is not None else default)
+    except (TypeError, ValueError):
+        val = default
+    return max(low, min(val, high))
 
 
 def _json_response(handler: BaseHTTPRequestHandler, code: int, payload: dict):
@@ -2289,6 +2348,28 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         return
 
+    def send_error(self, code, message=None, explain=None):
+        """
+        错误也要回 JSON + CORS 头。
+
+        默认错误页不带 Access-Control-Allow-Origin，跨域调用时浏览器会把整个响应
+        拦掉，前端只剩一句没信息量的 TypeError: Load failed，看不出是 404 还是 500。
+        """
+        path = getattr(self, "path", "") or ""
+        error = message or f"HTTP {code}"
+        payload = {"ok": False, "error": error, "path": path, "build": UI_BUILD}
+        if code == 404 and path.startswith("/api/"):
+            payload["hint"] = (
+                "未知接口。若这是新加的功能，多半是旧版后端仍在运行，"
+                "重启 BloomBox 或后端进程即可。"
+            )
+            # 前端只展示 error 字段，提示折进去才看得到
+            payload["error"] = f"{path} 不存在（HTTP {code}，后端 build {UI_BUILD}）。{payload['hint']}"
+        try:
+            _json_response(self, code, payload)
+        except Exception:
+            super().send_error(code, message, explain)
+
     def do_OPTIONS(self):
         self.send_response(204)
         _apply_cors(self)
@@ -2322,6 +2403,7 @@ class Handler(BaseHTTPRequestHandler):
                     "ok": True,
                     "app": "memory-sandbox",
                     "build": UI_BUILD,
+                    "code_stamp": CODE_STAMP,
                     "features": list(UI_FEATURES),
                     "api_only": bool(API_ONLY),
                 },
@@ -2329,6 +2411,26 @@ class Handler(BaseHTTPRequestHandler):
             return
         if path == "/api/cursor_hooks/status":
             _json_response(self, 200, cursor_hooks.status().to_dict())
+            return
+        if path == "/api/feishu_bot/status":
+            _json_response(self, 200, {"ok": True, **bot_process.status().to_dict()})
+            return
+        if path == "/api/config":
+            view = config_edit.read_view()
+            _json_response(self, 200, {"ok": not view.error, **view.to_dict()})
+            return
+        if path == "/api/long_term_revision":
+            # 供前端轮询：只 stat 文件，不解析、不返回记忆内容
+            # 知识库的 revision 一起给：后台抓完文档也要让列表自动刷新
+            _json_response(
+                self,
+                200,
+                {
+                    "ok": True,
+                    "revision": STATE.sandbox.long_term.revision(),
+                    "knowledge_revision": STATE.sandbox.knowledge.revision(),
+                },
+            )
             return
         self.send_error(404)
 
@@ -2349,6 +2451,41 @@ class Handler(BaseHTTPRequestHandler):
             if path == "/api/cursor_hooks/uninstall":
                 res = cursor_hooks.uninstall()
                 _json_response(self, 200 if res.ok else 500, res.to_dict())
+                return
+            if path == "/api/config/save":
+                res = config_edit.save(str(data.get("text") or ""))
+                # 校验不通过属于「你写的内容有问题」，回 200 让前端把 error 原样展示
+                _json_response(self, 200, res.to_dict())
+                return
+            if path in ("/api/feishu_bot/start", "/api/feishu_bot/stop", "/api/feishu_bot/restart"):
+                action = path.rsplit("/", 1)[-1]
+                res = getattr(bot_process, action)()
+                # 启停失败多半是配置/依赖问题，属于「你得改点什么」而不是服务器炸了，
+                # 所以回 200 让前端照常展示 message，不必区分 HTTP 错误
+                _json_response(self, 200, res.to_dict())
+                return
+            if path == "/api/prepare":
+                # 给 beforeSubmitPrompt hook 预取上下文用：只做软召回，
+                # 不拼「记录到长期记忆」、不造待补全、不 reinforce——
+                # 每条用户消息都会打这个接口，有副作用就会污染记忆与权重
+                query = (data.get("query") or data.get("text") or "").strip()
+                if not query:
+                    _json_response(self, 400, {"ok": False, "error": "query 不能为空"})
+                    return
+                pack = STATE.sandbox.build_reference_pack(
+                    query, top_k=_clamp_int(data.get("top_k"), 5, 1, 10)
+                )
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "query": query,
+                        "context_pack": pack["context_pack"],
+                        "reference_count": len(pack["references"]),
+                        "ref_threshold": pack["ref_threshold"],
+                    },
+                )
                 return
             if path == "/api/chat":
                 text = (data.get("text") or "").strip()
@@ -2740,6 +2877,12 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/list_memory":
                 layer = (data.get("layer") or "all").strip()
+                # 不传 limit 就是全给。截断过的列表最老那批在界面上点不开，
+                # 侧栏条数也会跟状态栏的总数对不上（曾经默认 200，实测 222 条时少 22 条）
+                try:
+                    limit = int(data.get("limit") or 0)
+                except (TypeError, ValueError):
+                    limit = 0
                 text = STATE.sandbox.format_memory_view(layer)
                 payload = {
                     "layer": layer,
@@ -2749,11 +2892,63 @@ class Handler(BaseHTTPRequestHandler):
                 if layer in ("working", "short"):
                     payload["items"] = STATE.sandbox.list_working()
                 elif layer in ("long_term", "long"):
-                    payload["data"] = STATE.sandbox.list_long_term()
+                    payload["data"] = STATE.sandbox.list_long_term(limit=limit)
                 else:
                     payload["working"] = STATE.sandbox.list_working()
-                    payload["long_term"] = STATE.sandbox.list_long_term()
+                    payload["long_term"] = STATE.sandbox.list_long_term(limit=limit)
                 _json_response(self, 200, payload)
+                return
+            if path == "/api/knowledge/list":
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "ok": True,
+                        "docs": STATE.sandbox.knowledge.list_docs(),
+                        "stats": STATE.sandbox.knowledge.stats(),
+                        "status_line": STATE.status_line(),
+                    },
+                )
+                return
+            if path == "/api/knowledge/add":
+                url = (data.get("url") or "").strip()
+                if not url:
+                    _json_response(self, 400, {"ok": False, "error": "缺少 url"})
+                    return
+                # 同步抓：用户点了按钮就是在等结果。抓不动会带着原因回来
+                res = STATE.sandbox.add_knowledge(url, tags=data.get("tags") or None)
+                _json_response(self, 200, {**res, "status_line": STATE.status_line()})
+                return
+            if path == "/api/knowledge/backfill":
+                # 十几篇要抓一分钟，HTTP 不能干等：丢进后台队列，
+                # 前端靠 knowledge_revision 轮询看着列表一篇篇长出来
+                res = STATE.sandbox.queue_backfill_knowledge(
+                    refresh=bool(data.get("refresh"))
+                )
+                _json_response(self, 200, {**res, "status_line": STATE.status_line()})
+                return
+            if path == "/api/knowledge/get":
+                doc = STATE.sandbox.knowledge.read_doc((data.get("id") or "").strip())
+                if doc is None:
+                    _json_response(self, 404, {"ok": False, "error": "知识库里没有这篇"})
+                    return
+                _json_response(self, 200, {"ok": True, "doc": doc})
+                return
+            if path == "/api/knowledge/refresh":
+                res = STATE.sandbox.refresh_knowledge((data.get("id") or "").strip())
+                _json_response(self, 200, {**res, "status_line": STATE.status_line()})
+                return
+            if path == "/api/knowledge/delete":
+                ok = STATE.sandbox.knowledge.delete((data.get("id") or "").strip())
+                _json_response(
+                    self,
+                    200 if ok else 404,
+                    {
+                        "ok": ok,
+                        "error": "" if ok else "知识库里没有这篇",
+                        "status_line": STATE.status_line(),
+                    },
+                )
                 return
             if path == "/api/clear_working":
                 STATE.sandbox.working.clear()
@@ -2809,7 +3004,7 @@ class Handler(BaseHTTPRequestHandler):
                     ("如何启动本地前端", "在项目根目录执行 pnpm install && pnpm start，注意检查 .npmrc 私源配置。"),
                     ("agency 项目怎么跑", "进入 live_web_agency，执行 pnpm install，再 pnpm start；e2e 用 agency-e2e。"),
                     ("切换开发环境要注意什么", "确认当前 Node/pnpm 版本、hosts/代理、环境变量（.env）以及对应业务的 mock 开关。"),
-                    ("记忆沙箱怎么减少 token", "优先把高频问答用「记住：问 => 答」写入长时记忆；重复问题会直接命中沙箱，不走大模型。"),
+                    ("记忆沙箱怎么减少 token", "优先把高频问答用「记一下 <内容>」写入长时记忆；重复问题会直接命中沙箱，不走大模型。"),
                     ("git 提交规范", "使用简洁祈使句说明 why；不要自动 push；不要改 git config。"),
                 ]
                 for q, a in samples:
@@ -2884,12 +3079,35 @@ def probe_running_sandbox(
                     "url": f"http://{HOST}:{port}/",
                     "port": port,
                     "build": data.get("build") or "",
+                    "code_stamp": data.get("code_stamp") or "",
                     "features": list(data.get("features") or []),
                     "api_only": bool(data.get("api_only")),
                 }
         except Exception:
             continue
     return None
+
+
+def missing_features(existing: dict) -> List[str]:
+    """
+    跑着的实例缺哪些本版本已有的能力。
+
+    只对比某一个特性（以前是 chat_stream）认不出「加了新接口的旧进程」：
+    它照样自称健康，新接口却 404。所以拿整套 UI_FEATURES 比。
+    """
+    have = set(existing.get("features") or [])
+    return [f for f in UI_FEATURES if f not in have]
+
+
+def has_stale_code(existing: dict) -> bool:
+    """
+    跑着的实例代码是否和本份源码不一致（特性名相同也算旧）。
+
+    任一侧算不出指纹（老版本后端没这个字段、或源码树不完整）就当「无意见」，
+    宁可放过也不要每次启动都误杀一个好后端。
+    """
+    theirs = str(existing.get("code_stamp") or "")
+    return bool(CODE_STAMP and theirs and theirs != CODE_STAMP)
 
 
 def find_running_sandbox(start: int = PREFERRED_PORT, span: int = 20) -> Optional[str]:
@@ -3042,7 +3260,9 @@ def main():
 
     # 已有实例：API-only 复用同模式 / 关掉完整 UI 再起；非 API-only 则刷新浏览器标签
     existing = probe_running_sandbox()
-    if existing and "chat_stream" in (existing.get("features") or []):
+    lacking = missing_features(existing) if existing else []
+    stale_code = bool(existing) and has_stale_code(existing)
+    if existing and not lacking and not stale_code:
         if API_ONLY:
             if existing.get("api_only"):
                 print(
@@ -3068,17 +3288,21 @@ def main():
             return
 
     if existing:
-        reason = (
-            "无 chat_stream，正在重启…"
-            if "chat_stream" not in (existing.get("features") or [])
-            else "端口占用，正在重启…"
-        )
+        if lacking:
+            reason = f"缺少能力 {','.join(lacking)}，正在重启…"
+        elif stale_code:
+            reason = (
+                f"代码指纹不一致（它 {existing.get('code_stamp') or '?'} / "
+                f"本份 {CODE_STAMP}），正在重启…"
+            )
+        else:
+            reason = "端口占用，正在重启…"
         print(f"检测到旧版服务 {existing['url']}（{reason}）")
         request_shutdown_sandbox(existing["url"])
         if not wait_until_port_free(int(existing["port"]), timeout_s=3.0):
             force_free_port(int(existing["port"]))
         again = probe_running_sandbox()
-        if again and "chat_stream" not in (again.get("features") or []):
+        if again and (missing_features(again) or has_stale_code(again)):
             force_free_port(int(again["port"]))
 
     STATE = AppState()

@@ -6,6 +6,13 @@
 
 BloomBox（`tauri:dev` / 打包后的 `.app`）会**自动**在本机拉起 `python3 app_web.py --api-only`（默认 `127.0.0.1:8765`）。若该端口已有健康服务则复用；退出应用时仅杀掉自己拉起的进程。
 
+复用前会做两道新旧判定，因为「后端是常驻进程、改了代码不会热更」这件事很容易被忽略：
+
+1. `UI_FEATURES`：随包 `app_web.py` 声明的能力，跑着的实例缺任何一项就换掉（认出「加了新接口的旧进程」）
+2. `code_stamp`：`app_web.py` + `core/*.py` 的内容指纹。改动只落在 `core/` 时特性名不会变，旧进程照样 200，只有指纹能认出来
+
+指纹算法在 `app_web.py::compute_code_stamp` 与 `src-tauri/src/api_server.rs::expected_code_stamp` 各实现一份，必须逐字节一致，两边各有一个断言同一样例指纹（`ca0f047bc734`）的测试守着。任一侧算不出就当「无意见」不重启，避免误杀。开发态 `resolve_api_root` 优先仓库根，手动起的调试后端不会被换掉。
+
 ```bash
 cd desktop
 npm install
@@ -25,6 +32,12 @@ npm run dev         # → http://localhost:5173
 | `BLOOMBOX_API_ROOT` | 含 `app_web.py` 的目录（开发默认同仓库根；发布包用内置 `resources/api`） |
 
 仍需本机已装 Python 3 与 `pip install -r requirements.txt`（尚未内嵌 PyInstaller sidecar）。
+
+## 新记忆提醒
+
+`src/hooks/useMemoryWatch.ts` 每 5 秒问一次 `GET /api/long_term_revision`（只回 `mtime:size`，不回内容），
+变了就刷新列表并标出新增：侧栏「N 条新」胶囊 + 高亮圆点，对话区留一条提示。这样别的项目里 agent
+通过 MCP 写入的记忆也能看见。窗口不可见时停止轮询；首个标记只作基线，否则一进来全量都算新。
 
 ### 若报错 `failed to run 'cargo metadata' ... No such file or directory`
 
@@ -65,7 +78,7 @@ cd desktop && npm run tauri:dev
 | `npm run dev` | Vite 开发服（5173） |
 | `npm run tauri:dev` | Tauri 窗口 + Vite |
 | `npm run build` | 构建前端到 `dist/` |
-| `npm run sync-api` | 把 `app_web.py` / `core/` / `cursor_hooks/` 等同步到 `src-tauri/resources/api` |
+| `npm run sync-api` | 把 `app_web.py` / `feishu_bot.py` / `core/` / `cursor_hooks/` 等同步到 `src-tauri/resources/api` |
 | `npm run tauri:build` | sync-api + 打包可安装桌面应用 |
 
 ## 生成可安装应用（macOS）
@@ -98,6 +111,19 @@ AI 动手前先查记忆、结束前落库）；同意即装，拒绝后可在�
   ——**漏了这步装机后会提示「安装包里缺少 hook 脚本」**
 
 说明：打包时会把 API 源码打进 `Resources`；启动时自动执行 `--api-only`。请确保系统有可用的 `python3` 与依赖。
+
+## 飞书机器人（顶栏「飞书机器人」）
+
+常驻的长连接进程原先只能自己开终端跑，这里把它托管起来：状态、日志尾巴、启动/重启/停止。
+
+- 入口在顶栏（主题、「记忆」同一排），不在下面那排工具栏：它是「现在在不在跑」的
+  常驻指示，按钮上带一颗点，`App.tsx` 每 20 秒轮询一次（窗口不可见时跳过）
+- 前端：`src/components/FeishuBotModal.tsx`，走 `/api/feishu_bot/{status,start,stop,restart}`
+- 后端：`core/bot_process.py`（pidfile + 命令行比对判活，日志写 Application Support）
+- 脚本源：仓库根的 `feishu_bot.py`，由 `npm run sync-api` 拷进 `resources/api/`
+  ——**漏了这步装机后点启动只会说「找不到 feishu_bot.py」**
+- 机器人自成会话，**退出 BloomBox 不会把它带走**；Rust 那边只管 `app_web.py`，
+  别把机器人也塞进 `ApiServerState`，那样每次关窗口飞书就掉线
 
 未签名时，首次打开若被拦截：系统设置 → 隐私与安全性 → 仍要打开；或：
 

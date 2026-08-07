@@ -3,9 +3,13 @@
 import json
 import shutil
 import tempfile
+import time
 import unittest
 import urllib.parse
+from pathlib import Path
 from unittest import mock
+
+import yaml
 
 from core import MemorySandbox
 from core.config import (
@@ -302,6 +306,170 @@ class FeishuQuestionRewriteTests(unittest.TestCase):
         self.assertNotIn("飞书文档：技术要点", out)
 
 
+class FileSubscribeTests(unittest.TestCase):
+    """按文件订阅：用户维度订阅只在「你本人收到通知」时推，自己发的评论永远不触发。"""
+
+    def setUp(self):
+        self.cfg = FeishuConfig(enabled=True, app_id="cli_x", app_secret="s")
+        self.ref = FeishuDocRef(
+            url="https://x.larkoffice.com/wiki/WikiTok1", kind="wiki", token="WikiTok1"
+        )
+
+    def _run(self, responses):
+        """responses: 按调用顺序返回，值为 dict 或要抛的异常。"""
+        calls = []
+
+        def fake_http(method, url, **kw):
+            calls.append((method, url, kw.get("headers", {}).get("Authorization", "")))
+            got = responses.pop(0)
+            if isinstance(got, Exception):
+                raise got
+            return got
+
+        with mock.patch("core.feishu._http_json", side_effect=fake_http), mock.patch(
+            "core.feishu._with_user_token", lambda c, p, step: ("u-tok", step("u-tok"))
+        ), mock.patch("core.feishu._resolve_document_id", return_value=("DocxTok1", "标题")):
+            from core.feishu import subscribe_file_events
+
+            res = subscribe_file_events(self.cfg, self.ref)
+        return res, calls
+
+    def test_prefers_the_app_identity(self):
+        """应用身份订阅之后谁评论都推，包括自己发的——所以要先试它。"""
+        with mock.patch("core.feishu._tenant_access_token", return_value="t-tok"):
+            res, calls = self._run([{"code": 0}])
+        self.assertTrue(res.ok)
+        self.assertEqual(res.identity, "tenant")
+        self.assertEqual(res.document_id, "DocxTok1")
+        self.assertIn("Bearer t-tok", calls[0][2])
+
+    def test_resolves_a_wiki_link_to_its_docx_token(self):
+        """wiki token 不能直接喂给订阅接口。"""
+        with mock.patch("core.feishu._tenant_access_token", return_value="t-tok"):
+            _res, calls = self._run([{"code": 0}])
+        self.assertIn("/files/DocxTok1/subscribe", calls[0][1])
+        self.assertNotIn("WikiTok1/subscribe", calls[0][1])
+
+    def test_falls_back_to_the_user_identity(self):
+        with mock.patch("core.feishu._tenant_access_token", return_value="t-tok"):
+            res, calls = self._run([{"code": 99991672, "msg": "denied"}, {"code": 0}])
+        self.assertTrue(res.ok)
+        self.assertEqual(res.identity, "user")
+        self.assertIn("Bearer u-tok", calls[1][2])
+
+    def test_missing_app_scope_is_spelled_out(self):
+        with mock.patch("core.feishu._tenant_access_token", return_value="t-tok"):
+            res, _ = self._run(
+                [{"code": 99991672, "msg": "denied"}, {"code": 1061045, "msg": "nope"}]
+            )
+        self.assertFalse(res.ok)
+        self.assertIn("docs:event:subscribe", res.error)
+        self.assertIn("自己发的评论", res.error)
+
+    def test_unconfigured_feishu_does_not_call_out(self):
+        from core.feishu import subscribe_file_events
+
+        res = subscribe_file_events(FeishuConfig(enabled=True), self.ref)
+        self.assertFalse(res.ok)
+        self.assertIn("app_id", res.error)
+
+
+class SharedRefreshTokenTests(unittest.TestCase):
+    """App / MCP / 机器人共用一份配置，而 refresh_token 是一次性的。
+
+    谁先刷新，其它常驻进程内存里那个就作废了，再拿去刷只会得到 invalid_grant，
+    于是那个进程一直失效到重启为止（机器人表现为「评论事件到了但读评论失败」）。
+    """
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp(prefix="oauth_race_")
+        self.path = Path(self.tmp) / "config.yaml"
+
+    def tearDown(self):
+        shutil.rmtree(self.tmp, ignore_errors=True)
+
+    def _write_disk(self, **feishu):
+        self.path.write_text(
+            yaml.safe_dump({"feishu": feishu}, allow_unicode=True), encoding="utf-8"
+        )
+
+    def _stale(self):
+        return FeishuConfig(
+            app_id="cli_x",
+            app_secret="s",
+            user_access_token="old-access",
+            refresh_token="old-refresh",
+            user_token_expires_at=int(time.time()) - 10,
+        )
+
+    def test_picks_up_the_token_another_process_just_wrote(self):
+        from core.feishu_oauth import ensure_user_access_token
+
+        self._write_disk(
+            user_access_token="fresh-access",
+            refresh_token="fresh-refresh",
+            user_token_expires_at=int(time.time()) + 3600,
+        )
+        cfg = self._stale()
+        with mock.patch("core.feishu_oauth.refresh_user_access_token") as refresh:
+            got = ensure_user_access_token(cfg, config_path=str(self.path))
+        self.assertEqual(got, "fresh-access")
+        refresh.assert_not_called()  # 别再去烧那个已经作废的 refresh_token
+
+    def test_uses_the_newest_refresh_token_when_the_disk_one_also_expired(self):
+        from core.feishu_oauth import ensure_user_access_token
+
+        self._write_disk(
+            user_access_token="also-old",
+            refresh_token="fresh-refresh",
+            user_token_expires_at=int(time.time()) - 5,
+        )
+        cfg = self._stale()
+        seen = {}
+
+        def fake_refresh(c):
+            seen["refresh"] = c.refresh_token
+            return {"access_token": "brand-new", "refresh_token": "r2", "expires_in": 7200}
+
+        # persist_feishu_auth 会无视 config_path 强行写用户目录（防密钥进 git），
+        # 单测不能让它去动真配置
+        with mock.patch("core.feishu_oauth.refresh_user_access_token", fake_refresh), mock.patch(
+            "core.feishu_oauth.persist_feishu_auth"
+        ):
+            got = ensure_user_access_token(cfg, config_path=str(self.path))
+        self.assertEqual(seen["refresh"], "fresh-refresh")
+        self.assertEqual(got, "brand-new")
+
+    def test_a_refresh_lost_by_a_hair_falls_back_to_disk(self):
+        """就在我们要刷的那一瞬间被别的进程抢先了。"""
+        from core.feishu_oauth import ensure_user_access_token
+
+        cfg = self._stale()
+
+        def fake_refresh(c):
+            self._write_disk(
+                user_access_token="winner-access",
+                refresh_token="winner-refresh",
+                user_token_expires_at=int(time.time()) + 3600,
+            )
+            raise RuntimeError("刷新 user_access_token 失败：invalid_grant")
+
+        with mock.patch("core.feishu_oauth.refresh_user_access_token", fake_refresh):
+            got = ensure_user_access_token(cfg, config_path=str(self.path))
+        self.assertEqual(got, "winner-access")
+
+    def test_a_genuine_failure_still_raises(self):
+        from core.feishu_oauth import ensure_user_access_token
+
+        cfg = self._stale()
+        with mock.patch(
+            "core.feishu_oauth.refresh_user_access_token",
+            side_effect=RuntimeError("刷新 user_access_token 失败：invalid_grant"),
+        ):
+            with self.assertRaises(RuntimeError):
+                ensure_user_access_token(cfg, config_path=str(self.path))
+
+
 class FeishuWriteScopeTests(unittest.TestCase):
     def test_merged_scopes_adds_write_scope_to_stale_config(self):
         """旧配置会覆盖 DEFAULT_SCOPES，必须取并集才能带上新增写权限。"""
@@ -333,6 +501,23 @@ class FeishuWriteScopeTests(unittest.TestCase):
         self.assertIn("docx:document:write_only", merged)
         self.assertNotIn("docx:document", merged)
 
+    def test_comment_and_event_scopes_reach_stale_configs(self):
+        """
+        文档评论机器人要的四项权限必须并进旧配置。
+
+        踩过：docs:event:subscribe 当初只加在 FeishuConfig.oauth_scope 的默认值上，
+        而存过配置的机器会用自己那份旧 scope 覆盖默认值，于是重跑授权也不请求它，
+        订阅评论事件时才报权限不足。
+        """
+        from core.feishu_oauth import _merged_scopes
+
+        cfg = FeishuConfig(app_id="cli_x", oauth_scope="offline_access wiki:node:read")
+        merged = _merged_scopes(cfg).split()
+        self.assertIn("docs:document.comment:read", merged)
+        self.assertIn("docs:document.comment:create", merged)
+        self.assertIn("docs:event:subscribe", merged)
+        self.assertIn("docs:document.subscription", merged)
+
     def test_retired_scope_dropped_from_stale_config(self):
         """旧配置里残留的 docx:document 会让整个授权页失败，必须剔掉而不是并进去。"""
         from core.feishu_oauth import _merged_scopes
@@ -355,7 +540,9 @@ class FeishuWriteScopeTests(unittest.TestCase):
                 "offline_access docs:document.content:read wiki:wiki:readonly "
                 "wiki:node:read wiki:node:update docx:document:create "
                 "docx:document:readonly "
-                "docs:document.comment:read docs:document.comment:create"
+                "docs:document.comment:read docs:document.comment:create "
+                "docs:event:subscribe docs:document.subscription im:message:readonly "
+                "board:whiteboard:node:read board:whiteboard:node:create"
             ),
         }
         self.assertEqual(
@@ -1350,15 +1537,22 @@ class FeishuCommentTests(unittest.TestCase):
         self.assertEqual(el["text_run"]["text"], "这里建议补充埋点")
         self.assertNotIn("comment_id", post[2])
 
-    def test_reply_carries_comment_id(self):
+    def test_reply_goes_into_the_thread_not_the_bottom_of_the_doc(self):
+        """
+        回复必须打到 comments/{id}/replies。
+
+        往 comments 接口的 body 里塞 comment_id 是没用的——那个字段只在响应里有，
+        请求体规范没有它，会被静默忽略，于是每条「回复」都变成文档底部一条新的
+        全文评论（2026-08-07 实测）。
+        """
         from core.feishu import create_docx_comment
 
-        bodies = []
+        posts = []
 
         def fake(method, url, **kw):
             if method == "POST":
-                bodies.append(kw.get("body"))
-                return {"code": 0, "data": {"comment_id": "c-new"}}
+                posts.append((url, kw.get("body")))
+                return {"code": 0, "data": {"reply_id": "r-new"}}
             return {"code": 0, "data": {"document": {"title": "t"}}}
 
         with mock.patch("core.feishu._http_json", side_effect=fake), mock.patch(
@@ -1371,8 +1565,17 @@ class FeishuCommentTests(unittest.TestCase):
                 comment_id="c-old",
                 confirmed=True,
             )
-        self.assertEqual(bodies[0]["comment_id"], "c-old")
+        url, body = posts[0]
+        self.assertIn("/comments/c-old/replies", url)
+        self.assertIn("file_type=docx", url)
+        self.assertEqual(
+            body["content"]["elements"][0]["text_run"]["text"], "同意"
+        )
+        self.assertNotIn("reply_list", body, "回复接口的 body 不是全文评论那套结构")
         self.assertEqual(res.replied_to, "c-old")
+        self.assertEqual(res.reply_id, "r-new")
+        # 评论串还是原来那条，别让调用方以为新开了一条评论
+        self.assertEqual(res.comment_id, "c-old")
 
     def test_permission_error_names_the_scope(self):
         from core.feishu import create_docx_comment
@@ -2063,6 +2266,98 @@ class AnchoredCommentTests(unittest.TestCase):
         self.assertFalse(res.ok)
         self.assertIn("没找到", res.error)
         self.assertFalse([c for c in calls if "comments" in c[1]])
+
+
+class ChatHistoryTests(unittest.TestCase):
+    """
+    读群历史：被引用的卡片读不出字时去上游找料。
+
+    接口只能整页按时间倒序翻，所以要一直翻到被引用那条，再往前数几条；
+    翻不到就退回最近几条。返回给模型的必须是时间正序。
+    """
+
+    APP_ID = "cli_me"
+
+    def _cfg(self):
+        return FeishuConfig(enabled=True, app_id=self.APP_ID, app_secret="s")
+
+    def _msg(self, mid: str, text: str, *, sender="ou_user", stype="user") -> dict:
+        return {
+            "message_id": mid,
+            "msg_type": "text",
+            "body": {"content": json.dumps({"text": text})},
+            "sender": {"id": sender, "sender_type": stype},
+        }
+
+    def _run(self, pages, **kwargs):
+        urls = []
+
+        def fake(method, url, **kw):
+            if "tenant_access_token" in url:
+                return {"code": 0, "tenant_access_token": "t"}
+            urls.append(url)
+            return {"code": 0, "data": pages[len(urls) - 1]}
+
+        from core.feishu import list_chat_messages
+
+        with mock.patch("core.feishu._http_json", side_effect=fake):
+            return list_chat_messages(self._cfg(), "oc_1", **kwargs), urls
+
+    def test_walks_back_to_the_quoted_message_and_takes_what_is_before_it(self):
+        page1 = {
+            "items": [self._msg("om_new", "记下来"), self._msg("om_card", "卡片")],
+            "has_more": True,
+            "page_token": "p2",
+        }
+        page2 = {
+            "items": [self._msg("om_ask", "分析这个告警"), self._msg("om_alert", "告警详情")],
+            "has_more": False,
+        }
+        got, urls = self._run([page1, page2], before_message_id="om_card", limit=2)
+        # 只要卡片**之前**的，且按时间正序交给模型
+        self.assertEqual(
+            [json.loads(m["content"])["text"] for m in got], ["告警详情", "分析这个告警"]
+        )
+        self.assertEqual(len(urls), 2)
+        self.assertIn("page_token=p2", urls[1])
+
+    def test_stops_paging_once_it_has_enough(self):
+        page1 = {
+            "items": [
+                self._msg("om_card", "卡片"),
+                self._msg("om_a", "一"),
+                self._msg("om_b", "二"),
+            ],
+            "has_more": True,
+            "page_token": "p2",
+        }
+        _got, urls = self._run([page1], before_message_id="om_card", limit=2)
+        self.assertEqual(len(urls), 1)
+
+    def test_our_own_messages_are_not_context(self):
+        """机器人上一轮的回复混进去只会带偏模型。"""
+        page = {
+            "items": [
+                self._msg("om_mine", "已记住：…", sender=self.APP_ID, stype="app"),
+                self._msg("om_alert", "告警详情"),
+            ],
+            "has_more": False,
+        }
+        got, _urls = self._run([page], limit=5)
+        self.assertEqual([json.loads(m["content"])["text"] for m in got], ["告警详情"])
+
+    def test_missing_scope_says_which_one(self):
+        def fake(method, url, **kw):
+            if "tenant_access_token" in url:
+                return {"code": 0, "tenant_access_token": "t"}
+            raise RuntimeError('HTTP 403: {"code":230027}')
+
+        from core.feishu import list_chat_messages
+
+        with mock.patch("core.feishu._http_json", side_effect=fake):
+            with self.assertRaises(RuntimeError) as caught:
+                list_chat_messages(self._cfg(), "oc_1")
+        self.assertIn("im:message.group_msg", str(caught.exception))
 
 
 class McpFeishuConfigFreshnessTests(unittest.TestCase):

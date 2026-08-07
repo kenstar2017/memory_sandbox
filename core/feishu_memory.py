@@ -20,6 +20,7 @@ ACTION_LABELS = {
     "replace": "替换正文",
     "title": "改标题",
     "comment": "加评论",
+    "board": "新建画板",
 }
 
 _HEADING_RE = re.compile(r"^\s{0,3}(#{1,6})\s+(.+?)\s*#*\s*$")
@@ -87,8 +88,8 @@ def _changed_feishu_side(
         return True
     if blocks_written or blocks_deleted:
         return True
-    # 建文档分两步：文档已建出来但正文写失败，这个半成品必须留档好去清理
-    return action == "create" and bool(document_id)
+    # 建文档、建画板都分两步：壳已经建出来、内容写失败，这个半成品必须留档好去清理
+    return action in ("create", "board") and bool(document_id)
 
 
 def build_write_memory(
@@ -122,7 +123,9 @@ def build_write_memory(
 
     # 评论必须与正文用不同问法：问法相同会被 save_memory 当同一条去重更新，
     # 于是一条评论就把整篇正文的大纲与摘录覆盖掉了
-    topic = "评论记录" if action == "comment" else "正文与写入记录"
+    # 三种问法互不覆盖：问法相同会被 save_memory 当同一条去重更新，
+    # 于是一条评论、一个画板就把整篇正文的大纲与摘录顶掉了
+    topic = {"comment": "评论记录", "board": "画板记录"}.get(action, "正文与写入记录")
     if is_real_doc_title(doc_title):
         question = f"《{doc_title}》飞书文档{topic} {url}".strip()
     else:
@@ -141,7 +144,7 @@ def build_write_memory(
     if blocks_deleted:
         lines.append(f"- 删除原有块：{blocks_deleted}")
     if blocks_written:
-        lines.append(f"- 写入块：{blocks_written}")
+        lines.append(("- 画板节点：" if action == "board" else "- 写入块：") + str(blocks_written))
     if not ok and error:
         lines.append(f"- 未完成原因：{clean_text(error)}")
 

@@ -32,10 +32,10 @@ MANIFEST_NAME = ".memory-sandbox-hooks.json"
 # 事件 → 脚本与配置。改这里就等于改产物，装过的机器会被识别为「需升级」。
 HOOK_SPECS: Dict[str, Dict[str, Any]] = {
     "sessionStart": {"script": "memory-session-context.py"},
-    "preToolUse": {
-        "script": "memory-require-prepare.py",
-        "matcher": "Write|Delete|Task|MCP:",
-    },
+    "beforeSubmitPrompt": {"script": "memory-prefetch.py"},
+    # 不限 matcher：有预取包时要拦住本轮**第一个**工具调用（含 Read/Grep）把记忆交出去。
+    # 脚本自己走快路径（一次 stat 就放行），所以每次工具调用的开销可以忽略
+    "preToolUse": {"script": "memory-require-prepare.py"},
     "postToolUse": {"script": "memory-mark.py", "matcher": "MCP:"},
     "stop": {"script": "memory-ensure-remember.py", "loop_limit": 1},
 }

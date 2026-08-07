@@ -36,7 +36,22 @@ DEFAULT_SCOPES = (
     # 评论：read 拉评论列表，create 加评论/回复评论。聚合权限 docs:doc、drive:drive
     # 也能调通，但范围大到整个云空间，且聚合名有被拆分后报 20027 的先例
     "docs:document.comment:read "
-    "docs:document.comment:create"
+    "docs:document.comment:create "
+    # 文档评论机器人靠它以用户身份订阅 drive.notice.comment_add_v1；
+    # 只写进 FeishuConfig.oauth_scope 的默认值不够——存过配置的机器（也就是所有
+    # 老用户）会用自己那份旧 scope 覆盖掉默认值，重跑授权也拿不到这一项
+    "docs:event:subscribe "
+    # 订阅单篇文档的「评论更新」（等同文档里点「订阅文档动态」）。comment_add 事件只在
+    # 授权用户收到飞书通知时才推，这项决定了这类通知会不会产生
+    "docs:document.subscription "
+    # 读被引用的消息：应用身份拿别的应用发的卡片只有摘要外壳，换用户身份还有一次机会
+    # （用户在客户端里本来就看得见）。后台要单独勾「获取与发送单聊、群组消息」的用户身份权限
+    "im:message:readonly "
+    # 画板：文档里的流程图/架构图是独立资源，正文里只有一个 token，
+    # 不开这项就完全读不到画板里写了什么；create 是往画板里画东西用的，
+    # 建画板本身走 docx 创建块接口，不吃这项权限
+    "board:whiteboard:node:read "
+    "board:whiteboard:node:create"
 )
 
 # 已被开放平台拆分、后台再也勾不到的聚合权限。请求它会让整个授权页报
@@ -275,6 +290,50 @@ def _app_access_token(api_base: str, app_id: str, app_secret: str, timeout: floa
     return token
 
 
+def _auth_from_disk(config_path: Optional[str] = None) -> Dict[str, Any]:
+    """读用户配置里当前的 token。任何异常都当作「盘上没有」。"""
+    path = Path(config_path) if config_path else (app_support_dir() / "config.yaml")
+    try:
+        if not path.is_file():
+            return {}
+        raw = yaml.safe_load(path.read_text(encoding="utf-8")) or {}
+    except (OSError, ValueError, yaml.YAMLError):
+        return {}
+    feishu = raw.get("feishu")
+    return feishu if isinstance(feishu, dict) else {}
+
+
+def _adopt_disk_tokens(cfg: FeishuConfig, config_path: Optional[str]) -> bool:
+    """
+    把别的进程刚刷出来的 token 捡回来，返回是否已拿到可用的 access_token。
+
+    refresh_token 是一次性的：App、MCP、飞书机器人共用同一份配置，谁先刷新，
+    其它常驻进程内存里那个就作废了，再拿去刷只会得到 invalid_grant，于是那个
+    进程一直失效到重启为止（机器人表现为「评论事件到了但读评论失败」）。
+    所以刷新之前先看一眼盘上有没有更新的。
+    """
+    disk = _auth_from_disk(config_path)
+    if not disk:
+        return False
+    changed = False
+    disk_refresh = str(disk.get("refresh_token") or "").strip()
+    if disk_refresh and disk_refresh != (cfg.refresh_token or "").strip():
+        cfg.refresh_token = disk_refresh
+        changed = True
+    disk_token = str(disk.get("user_access_token") or "").strip()
+    disk_exp = int(disk.get("user_token_expires_at") or 0)
+    if (
+        changed
+        and disk_token
+        and disk_token != (cfg.user_access_token or "").strip()
+        and (not disk_exp or int(time.time()) < disk_exp)
+    ):
+        cfg.user_access_token = disk_token
+        cfg.user_token_expires_at = disk_exp
+        return True
+    return False
+
+
 def ensure_user_access_token(
     cfg: FeishuConfig,
     *,
@@ -291,6 +350,8 @@ def ensure_user_access_token(
     need = force_refresh or (not token) or (exp and now >= exp)
     if not need:
         return token
+    if _adopt_disk_tokens(cfg, config_path):
+        return cfg.user_access_token
     if not (cfg.refresh_token or "").strip():
         if token and not force_refresh:
             return token
@@ -298,7 +359,13 @@ def ensure_user_access_token(
             "user_access_token 无效/过期且无 refresh_token。"
             "请执行：python3 scripts/feishu_login.py"
         )
-    data = refresh_user_access_token(cfg)
+    try:
+        data = refresh_user_access_token(cfg)
+    except RuntimeError:
+        # 就在刚才那一瞬间可能被别的进程抢先刷走了，再捡一次盘上的才放弃
+        if _adopt_disk_tokens(cfg, config_path):
+            return cfg.user_access_token
+        raise
     access = data.get("access_token") or data.get("user_access_token") or ""
     new_refresh = data.get("refresh_token") or cfg.refresh_token
     expires_in = int(data.get("expires_in") or 7200)

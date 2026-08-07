@@ -217,6 +217,16 @@ class LongTermMemory:
         """从磁盘重新加载（多进程：App / MCP / CLI 共用同一记忆文件时必需）。"""
         self._load(declarative_only=False)
 
+    def revision(self) -> str:
+        """
+        declarative.json 的变更标记（mtime_ns:size），不解析文件内容。
+
+        App / MCP / CLI 是三个进程共用同一份记忆文件，原子写会同时改 mtime 与 size，
+        前端据此轮询「别处有没有写入」，不必每次把整份记忆拉下来比对。
+        """
+        stamp = self._decl_stamp_now()
+        return "" if stamp is None else f"{stamp[0]}:{stamp[1]}"
+
     def _decl_stamp_now(self) -> Optional[Tuple[int, int]]:
         """declarative.json 的 (mtime_ns, size)；不存在时 None。"""
         try:
@@ -413,6 +423,8 @@ class LongTermMemory:
         blocks: List[str] = [
             "【记忆沙箱 · 参考问答】以下为相关历史结论，供结合当前项目上下文使用；"
             "可能过时，以仓库/现状为准，勿直接当作最终实现。"
+            "若某条与现状矛盾，用它的 id 调 memory_update 修正或 memory_delete 删除，"
+            "别留着误导后续检索。"
         ]
         for i, hit in enumerate(hits, 1):
             rec = hit.record
@@ -422,7 +434,8 @@ class LongTermMemory:
             tags = ",".join(rec.tags or [])
             tag_s = f" tags={tags}" if tags else ""
             reason_s = "/".join(hit.reasons[:4]) if hit.reasons else ""
-            meta = f"score={hit.score:.2f}{tag_s}"
+            # id 必须给：hook 投递的是纯文本，没有 id 就没法回头修这条
+            meta = f"id={rec.id} score={hit.score:.2f}{tag_s}"
             if reason_s:
                 meta += f" reasons={reason_s}"
             blocks.append(
@@ -914,23 +927,40 @@ class LongTermMemory:
         return self._mutate_declarative(_mut)
 
     def reoptimize_all(self) -> int:
-        """对已有记忆重新跑问题优化（补 aliases / 刷新向量），提升旧数据命中率。"""
+        """
+        对已有记忆重新跑问题优化（补 aliases / 刷新向量），提升旧数据命中率。
+
+        问法只在**看得出是被砍出来的前缀**时才用原文重算——老版本的
+        optimize_question 会把「…要改什么」削成「…要改」，这里正好能补回来。
+        其它情况一律沿用现有问法：飞书那类《标题》式问法是特意重写过的，
+        拿 original_question 覆盖等于把它退回成粗糙的原始输入。
+        """
 
         def _mut() -> int:
             n = 0
             for rec in self.records:
-                opt = optimize_question(rec.question)
                 original = (rec.meta or {}).get("original_question") or rec.question
-                opt2 = optimize_question(original)
-                aliases = list(dict.fromkeys(opt.aliases + opt2.aliases + [rec.question, original]))
-                rec.question = opt2.canonical or opt.canonical or rec.question
-                rec.keywords = list(dict.fromkeys(opt2.keywords + extract_keywords(rec.answer, top_k=8)))
-                rec.vector = self.embedder.embed(opt2.embed_text)
+                truncated = (
+                    original != rec.question
+                    and rec.question
+                    and original.startswith(rec.question)
+                )
+                source = original if truncated else rec.question
+                opt = optimize_question(source)
+                aliases = list(
+                    dict.fromkeys(opt.aliases + [rec.question, original, source])
+                )
+                rec.question = opt.canonical or rec.question
+                rec.keywords = list(
+                    dict.fromkeys(opt.keywords + extract_keywords(rec.answer, top_k=8))
+                )
+                rec.vector = self.embedder.embed(opt.embed_text)
                 rec.tags = normalize_tags(rec.tags)
                 rec.meta = {
                     **(rec.meta or {}),
-                    **opt2.as_meta(),
-                    "aliases": aliases[:32],
+                    **opt.as_meta(),
+                    "original_question": original,
+                    "aliases": [a for a in aliases if a][:32],
                 }
                 rec.updated_at = time.time()
                 n += 1

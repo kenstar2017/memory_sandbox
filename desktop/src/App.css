@@ -1,0 +1,960 @@
+:root,
+html[data-theme='dark'] {
+  --bg: #0f1419;
+  --panel: #1a222c;
+  --border: #2a3542;
+  --text: #e7eef7;
+  --muted: #8b9bb0;
+  --accent: #3d8bfd;
+  --accent-dim: #2456a0;
+  --accent-soft: rgba(61, 139, 253, 0.12);
+  --mode-bar-bg: rgba(61, 139, 253, 0.1);
+  --mode-bar-text: #b7d4ff;
+  --sys: #7dd3a0;
+  --danger: #e85d5d;
+  --pending: #e0a84a;
+  --badge-bg: #243040;
+  --badge-kind: #9ec5ff;
+  --user-msg: #cfe2ff;
+  --bot-bg: rgba(255, 255, 255, 0.04);
+  --item-bg: rgba(0, 0, 0, 0.15);
+  --think-bg: rgba(0, 0, 0, 0.2);
+  --status-bg: #121820;
+  --done: #6f9f7f;
+  --overlay: rgba(0, 0, 0, 0.55);
+  --dot-idle: #555;
+  --primary-fg: #fff;
+  color-scheme: dark;
+}
+
+html[data-theme='light'] {
+  --bg: #f4f6f9;
+  --panel: #ffffff;
+  --border: #d5dde8;
+  --text: #1a2330;
+  --muted: #5a6b80;
+  --accent: #2563eb;
+  --accent-dim: #93b4f5;
+  --accent-soft: rgba(37, 99, 235, 0.1);
+  --mode-bar-bg: rgba(37, 99, 235, 0.08);
+  --mode-bar-text: #1e4bb8;
+  --sys: #0f8a4b;
+  --danger: #d64545;
+  --pending: #b7791f;
+  --badge-bg: #e8eef6;
+  --badge-kind: #2563eb;
+  --user-msg: #1e4bb8;
+  --bot-bg: #f0f4f8;
+  --item-bg: #f7f9fc;
+  --think-bg: #eef2f7;
+  --status-bg: #e9eef5;
+  --done: #2f8f5b;
+  --overlay: rgba(15, 23, 42, 0.4);
+  --dot-idle: #9aa8b8;
+  --primary-fg: #fff;
+  color-scheme: light;
+}
+
+:root {
+  font-family: 'SF Pro Text', 'PingFang SC', 'Helvetica Neue', sans-serif;
+  color: var(--text);
+  background: var(--bg);
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  background: var(--bg);
+  color: var(--text);
+}
+
+.app {
+  display: grid;
+  grid-template-columns: 300px 1fr;
+  height: 100%;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.side {
+  display: flex;
+  flex-direction: column;
+  border-right: 1px solid var(--border);
+  background: var(--panel);
+  min-height: 0;
+  /* grid item 默认 min-width:auto，会被长标签撑宽 */
+  min-width: 0;
+  overflow: hidden;
+}
+
+.side-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 14px 16px 8px;
+  font-weight: 600;
+  font-size: 14px;
+}
+
+/* 别处（MCP / CLI）刚写入的条数；点一下标为已看 */
+.side-new {
+  border: none;
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+  background: var(--accent);
+  color: #fff;
+}
+
+.side-new.edited {
+  background: var(--pending);
+}
+
+.side-tabs {
+  display: flex;
+  gap: 4px;
+  padding: 0 12px 8px;
+}
+
+.side-tabs button {
+  flex: 1;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 6px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.side-tabs button.active {
+  color: var(--text);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* 搜索 + 标签下拉各占一行；标签曾铺成 chip 云，上百个直接把列表顶出可视区 */
+.side-filters {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 0 12px 10px;
+  min-width: 0;
+}
+
+.side-search,
+.side-tag-select {
+  width: 100%;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--item-bg);
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.side-search:focus,
+.side-tag-select:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+/* 知识库录入：输入框吃掉剩余宽度，按钮不被挤变形 */
+.side-add-doc {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.side-add-doc input {
+  flex: 1;
+  min-width: 0;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--item-bg);
+  color: var(--text);
+  padding: 5px 8px;
+  font-size: 12px;
+}
+
+.side-add-doc input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.side-add-doc button {
+  flex: 0 0 auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--accent);
+  color: var(--primary-fg);
+  padding: 5px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.side-add-doc button:disabled {
+  background: var(--item-bg);
+  color: var(--muted);
+  cursor: default;
+}
+
+.side-backfill {
+  width: 100%;
+  box-sizing: border-box;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--item-bg);
+  color: var(--muted);
+  padding: 5px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.side-backfill:hover:not(:disabled) {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.side-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 8px 12px;
+  border-top: 1px solid var(--border);
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.side-foot button {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 0;
+}
+
+.tool-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+  padding: 8px 12px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.agent-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--muted);
+  white-space: nowrap;
+}
+
+.agent-label select {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+}
+
+.tool-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex: 1;
+}
+
+.tool-actions button {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 8px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.tool-actions button:hover {
+  border-color: var(--accent-dim);
+}
+
+.tool-actions button.danger {
+  color: var(--danger);
+  border-color: color-mix(in srgb, var(--danger) 40%, var(--border));
+}
+
+.bot-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.toolbar-actions .active-btn {
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+.modal-hint {
+  margin: 0;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.modal-inline-actions {
+  display: flex;
+  gap: 8px;
+}
+
+button.ghost {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--muted);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.retrieval-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 10px;
+}
+
+.retrieval-grid .check {
+  flex-direction: row;
+  align-items: center;
+  gap: 8px;
+}
+
+.hooks-ok,
+.hooks-warn {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.hooks-ok {
+  color: var(--accent);
+}
+
+.hooks-warn {
+  color: var(--danger);
+}
+
+.hooks-meta {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  font-size: 12px;
+}
+
+.hooks-meta > div {
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+  min-width: 0;
+}
+
+.hooks-meta span {
+  flex: 0 0 84px;
+  color: var(--muted);
+}
+
+.hooks-meta code {
+  flex: 1;
+  min-width: 0;
+  word-break: break-all;
+  font-size: 11px;
+}
+
+/* 机器人日志尾巴：长连接掉线、缺权限的报错都在这儿，出问题第一眼就该看到 */
+.bot-log {
+  margin: 0;
+  max-height: 220px;
+  overflow: auto;
+  padding: 8px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--status-bg);
+  color: var(--muted);
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+}
+
+.qa-list {
+  flex: 1;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 8px;
+  min-height: 0;
+}
+
+.qa-empty {
+  padding: 12px;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+/* 一条记忆一行，只放标题：正文摘要与徽标会把列表撑成卡片墙，翻不动 */
+.qa-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  padding: 7px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+  color: var(--text);
+}
+
+.qa-row:hover {
+  background: var(--accent-soft);
+}
+
+.qa-row.active {
+  background: var(--accent-soft);
+  color: var(--accent);
+}
+
+.qa-row-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.qa-row-dot {
+  flex: 0 0 auto;
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: var(--pending);
+}
+
+.qa-row-dot.fresh {
+  background: var(--accent);
+}
+
+/* 原地被改写：和「新增」区分开，否则条数不变时看不出发生过什么 */
+.qa-row-dot.edited {
+  background: var(--pending);
+}
+
+/* 知识库里抓取失败的文档：标题压暗，免得看着像正常入库了 */
+.qa-row-dot.failed {
+  background: var(--danger);
+}
+
+.qa-row.failed .qa-row-title {
+  color: var(--muted);
+}
+
+.qa-row.fresh .qa-row-title {
+  font-weight: 600;
+}
+
+/* 删除键平时不占视觉位置，指到这行才露出来 */
+.qa-row-del {
+  flex: 0 0 auto;
+  border: none;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+  padding: 0 2px;
+  opacity: 0;
+}
+
+.qa-row:hover .qa-row-del,
+.qa-row-del:focus-visible {
+  opacity: 1;
+}
+
+.qa-row-del:hover {
+  color: var(--danger);
+}
+
+/* 点左侧标题后顶掉对话区的记忆详情 */
+.detail {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  min-width: 0;
+  padding: 16px 20px 0;
+  overflow: hidden;
+}
+
+.detail-head {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.detail-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: 16px;
+  font-weight: 600;
+  overflow-wrap: anywhere;
+}
+
+.detail-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 6px;
+}
+
+.detail-actions button {
+  border: 1px solid var(--border);
+  background: transparent;
+  color: var(--text);
+  border-radius: 6px;
+  padding: 4px 10px;
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.detail-actions button:hover {
+  border-color: var(--accent);
+}
+
+.detail-actions .detail-danger:hover {
+  border-color: var(--danger);
+  color: var(--danger);
+}
+
+.detail-meta {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  margin: 10px 0 0;
+}
+
+.detail-chip {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: 999px;
+  background: var(--badge-bg);
+  color: var(--muted);
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.detail-chip.kind {
+  color: var(--badge-kind);
+}
+
+.detail-dim {
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.detail-facts {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px 16px;
+  margin: 10px 0 0;
+  font-size: 12px;
+}
+
+.detail-fact {
+  display: flex;
+  gap: 6px;
+  min-width: 0;
+}
+
+.detail-fact dt {
+  color: var(--muted);
+}
+
+.detail-fact dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.detail-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  margin-top: 12px;
+  padding-bottom: 16px;
+}
+
+/* 知识库正文按块显示：块之间要看得出分界，否则整篇糊成一坨 */
+.kb-chunk + .kb-chunk {
+  margin-top: 14px;
+  padding-top: 14px;
+  border-top: 1px dashed var(--border);
+}
+
+.kb-chunk-head {
+  margin-bottom: 6px;
+  font-size: 11px;
+  color: var(--muted);
+}
+
+.detail-body pre {
+  margin: 0;
+  font-family: inherit;
+  font-size: 13px;
+  line-height: 1.65;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+
+.main-col {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+  background: var(--bg);
+}
+
+.main {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.toolbar h1 {
+  margin: 0;
+  font-size: 18px;
+  letter-spacing: 0.02em;
+}
+
+.toolbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.theme-select {
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 13px;
+  cursor: pointer;
+}
+
+.toolbar-actions button,
+.mode-bar button,
+.composer button,
+.modal-actions button {
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  border-radius: 6px;
+  padding: 6px 12px;
+  cursor: pointer;
+  font-size: 13px;
+}
+
+button.primary {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: var(--primary-fg);
+}
+
+button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.mode-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 16px;
+  background: var(--mode-bar-bg);
+  border-bottom: 1px solid var(--border);
+  font-size: 13px;
+  color: var(--mode-bar-text);
+}
+
+.chat {
+  flex: 1;
+  overflow: auto;
+  padding: 16px;
+  min-height: 0;
+}
+
+.msg {
+  margin-bottom: 12px;
+  max-width: 920px;
+}
+
+.msg-label {
+  font-size: 11px;
+  color: var(--muted);
+  margin-bottom: 4px;
+}
+
+.msg-body {
+  margin: 0;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-family: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+}
+
+.msg.user .msg-body {
+  color: var(--user-msg);
+}
+
+.msg.sys .msg-body {
+  color: var(--sys);
+  font-size: 13px;
+}
+
+.msg.meta .msg-body {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.msg.bot .msg-body {
+  background: var(--bot-bg);
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+}
+
+.think-card {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+  background: var(--think-bg);
+}
+
+.think-head {
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 6px;
+}
+
+.think-steps {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+
+.think-steps li {
+  display: flex;
+  gap: 8px;
+  font-size: 13px;
+  color: var(--muted);
+  margin: 4px 0;
+}
+
+.think-steps li.active {
+  color: var(--text);
+}
+
+.think-steps li.done {
+  color: var(--done);
+}
+
+.composer {
+  display: flex;
+  gap: 8px;
+  padding: 12px 16px;
+  border-top: 1px solid var(--border);
+  background: var(--panel);
+}
+
+.composer textarea {
+  flex: 1;
+  resize: none;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--bg);
+  color: var(--text);
+  padding: 10px 12px;
+  font: inherit;
+}
+
+.status-bar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+  background: var(--status-bg);
+}
+
+.dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--dot-idle);
+}
+
+.dot.ok {
+  background: #3ecf8e;
+}
+
+.dot.bad {
+  background: var(--danger);
+}
+
+.status-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: var(--overlay);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 50;
+  padding: 24px;
+}
+
+.modal {
+  width: min(640px, 100%);
+  max-height: min(90vh, 800px);
+  overflow: auto;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  color: var(--text);
+}
+
+.modal-wide {
+  width: min(900px, 100%);
+}
+
+/* 配置编辑器：改的是 YAML，缩进一错就读不出来，所以必须等宽字体 + 不换行 */
+.config-editor {
+  flex: 1;
+  min-height: 340px;
+  resize: vertical;
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+  overflow: auto;
+  tab-size: 2;
+}
+
+.modal h3 {
+  margin: 0 0 4px;
+}
+
+.modal label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  font-size: 12px;
+  color: var(--muted);
+}
+
+.modal textarea,
+.modal input,
+.modal select {
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg);
+  color: var(--text);
+  padding: 8px 10px;
+  font: inherit;
+  font-size: 14px;
+  max-width: 100%;
+}
+
+.modal textarea {
+  resize: vertical;
+}
+
+.modal-row {
+  display: flex;
+  gap: 10px;
+}
+
+.modal-row .grow {
+  flex: 1;
+}
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-top: 4px;
+}
+
+.confirm-modal {
+  width: min(420px, 100%);
+}
+
+.confirm-message {
+  margin: 0;
+  font-size: 13px;
+  line-height: 1.6;
+  color: var(--text);
+  overflow-wrap: anywhere;
+}
+
+.modal-actions button.danger {
+  background: var(--danger);
+  border-color: var(--danger);
+  color: #fff;
+}

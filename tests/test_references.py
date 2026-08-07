@@ -140,6 +140,26 @@ class McpReferenceHelperTests(unittest.TestCase):
         self.assertIn("context_pack", hint)
         self.assertIn("仓库", hint)
 
+    def test_context_pack_from_dicts_exposes_id(self):
+        """agent 要能按 id 修掉过时的那条。"""
+        from mcp_server import _context_pack_from_dicts
+
+        text = _context_pack_from_dicts(
+            [{"id": "abc123", "question": "Q1", "answer": "A1", "score": 0.7}]
+        )
+        self.assertIn("id=abc123", text)
+        self.assertIn("memory_update", text)
+
+    def test_update_tool_is_registered(self):
+        from mcp_server import TOOLS
+
+        by_name = {t["name"]: t for t in TOOLS}
+        self.assertIn("memory_update", by_name)
+        spec = by_name["memory_update"]
+        self.assertEqual(spec["inputSchema"]["required"], ["answer"])
+        for field in ("memory_id", "new_question", "tags", "reason"):
+            self.assertIn(field, spec["inputSchema"]["properties"])
+
 
 if __name__ == "__main__":
     unittest.main()

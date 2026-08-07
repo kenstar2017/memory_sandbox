@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 import time
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 from .rules import RuleEngine
 from .utils import cosine_similarity, extract_keywords, keyword_overlap
@@ -26,11 +26,21 @@ _NON_REUSABLE_ANS = re.compile(
 )
 
 
+# 排障笔记必然引用错误码与失败文本（如「强刷只匹配 99991668/Invalid access token」），
+# 但它带的是修复结论、属于要复用的知识，不能和纯错误回显一起丢掉。
+_TROUBLESHOOTING_NOTE = re.compile(
+    r"(?:根因|修法|已修|改法|修复|解决办法|解决方法|处理步骤|排查步骤|规避)",
+)
+
+
 def is_non_reusable_answer(answer: str) -> bool:
     text = (answer or "").strip()
     if not text:
         return True
-    return bool(_NON_REUSABLE_ANS.search(text))
+    if not _NON_REUSABLE_ANS.search(text):
+        return False
+    # 命中失败特征后再看是不是排障笔记：错误回显只陈述失败，不给修复结论
+    return not (len(text) >= 120 and _TROUBLESHOOTING_NOTE.search(text))
 
 
 class WorkingMemory:
@@ -177,6 +187,21 @@ class WorkingMemory:
 
     def get_all_vectors(self) -> List[List[float]]:
         return [item["vec"] for item in self.window if item.get("vec")]
+
+    def last_exchange(self) -> Tuple[str, str]:
+        """最近一问一答，供「记一下这个结论」这类指代取内容。两者都可能为空。"""
+        answer, at = "", -1
+        for i in range(len(self.window) - 1, -1, -1):
+            if self.window[i].get("role") == "assistant":
+                answer = str(self.window[i].get("text") or "").strip()
+                at = i
+                break
+        if not answer:
+            return "", ""
+        for i in range(at - 1, -1, -1):
+            if self.window[i].get("role") == "user":
+                return str(self.window[i].get("text") or "").strip(), answer
+        return "", answer
 
     def recent_context_text(self, n: int = 4) -> str:
         parts = []

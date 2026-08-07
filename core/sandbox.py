@@ -9,6 +9,8 @@ from typing import Any, Dict, Optional, Sequence
 
 from .config import AppConfig, load_config
 from .embedding import LocalHasherEmbedder
+from .knowledge import KnowledgeBase, format_knowledge_pack, paired_backup_path
+from .knowledge_ingest import KnowledgeIngestWorker
 from .llm import BaseLLM, ProgressCallback, build_llm
 from .long_term import LongTermMemory
 from .paths import default_config_path, default_persist_dir, is_frozen, resource_root
@@ -75,6 +77,9 @@ class MemorySandbox:
             aging_min_hits=getattr(lt, "aging_min_hits", 0),
             aging_decay=getattr(lt, "aging_decay", 0.15),
         )
+        # 知识库与长时记忆平级、共用同一个 embedder（同维同算法，向量才可比）
+        self.knowledge = KnowledgeBase(persist_dir, embedder=self.embedder)
+        self._knowledge_worker: Optional[KnowledgeIngestWorker] = None
         self.llm: Optional[BaseLLM] = build_llm(self.config.llm)
         self.last_remembered = None
 
@@ -83,10 +88,15 @@ class MemorySandbox:
         self,
         input_text: str,
         on_progress: Optional[ProgressCallback] = None,
+        *,
+        allow_commands: bool = True,
     ) -> ChatResult:
         """
         仅检索感觉 / 工作 / 长时（含程序性）记忆，绝不调用沙箱内 LLM。
         供外部 AI 工具（Cursor MCP 等）使用：未命中由外部模型继续推理。
+
+        `allow_commands=False` 用于纯检索入口：指令里有会写盘的（记一下 / 忘记 / 清空），
+        而 MCP 的 memory_ask 对调用方来说是只读的，检索一句话不该顺手改库。
         """
         def _p(msg: str) -> None:
             if on_progress:
@@ -95,7 +105,7 @@ class MemorySandbox:
                 except Exception:
                     pass
 
-        cmd = self._handle_command(input_text)
+        cmd = self._handle_command(input_text) if allow_commands else None
         if cmd is not None:
             return cmd
 
@@ -310,6 +320,7 @@ class MemorySandbox:
         original_question: Optional[str] = None,
         *,
         update_only: bool = False,
+        dedup_facet: str = "",
     ) -> str:
         from .feishu import extract_feishu_urls
         from .feishu_question import rewrite_feishu_memory_question
@@ -362,9 +373,16 @@ class MemorySandbox:
             record_id=memory_id,
             original_question=orig_q,
             require_existing=must_update,
+            dedup_facet=dedup_facet,
         )
         self.last_remembered = rec
         self.last_remembered_updated = len(self.long_term.records) == n_before
+        # 记忆里带的飞书链接顺手抓进知识库（后台，抓不到不影响这次写入）
+        self.queue_knowledge_from_text(
+            f"{question}\n{answer}\n{facts_in.get('path', '')}",
+            origin=f"memory:{rec.id}",
+            scene=rec.scene,
+        )
         self.working.add_context(opt.canonical, opt.keywords, rec.vector, role="user")
         self.working.add_context(rec.answer, extract_keywords(rec.answer), role="assistant")
         alias_hint = ""
@@ -542,6 +560,56 @@ class MemorySandbox:
             cfg, text, config_path=self.config_path
         )
 
+    def remember_feishu_write(
+        self,
+        *,
+        action: str,
+        url: str,
+        title: str = "",
+        document_id: str = "",
+        content: str = "",
+        blocks_written: int = 0,
+        blocks_deleted: int = 0,
+        old_title: str = "",
+        ok: bool = True,
+        error: str = "",
+        scene: Optional[str] = None,
+    ) -> str:
+        """
+        把一次飞书写操作落库到长时记忆。
+
+        飞书侧没有实际改动时不写（返回空串），避免把「未确认被拒」这类
+        无副作用的调用也记成一条改动史。
+        """
+        from .feishu_memory import build_write_memory
+
+        mem = build_write_memory(
+            action=action,
+            url=url,
+            title=title,
+            document_id=document_id,
+            content=content,
+            blocks_written=blocks_written,
+            blocks_deleted=blocks_deleted,
+            old_title=old_title,
+            ok=ok,
+            error=error,
+        )
+        if mem is None:
+            return ""
+        # 评论与正文是同一篇文档的两个侧面：同 token 会被去重合并，
+        # 不分侧面的话一条评论就把正文的大纲与摘录冲掉了
+        facet = "feishu-comment" if action == "comment" else ""
+        tag = "doc-comment" if action == "comment" else "doc-write"
+        return self.remember(
+            mem.question,
+            mem.answer,
+            scene=scene,
+            tags=["feishu", "docs", tag],
+            facts=mem.facts,
+            dedup_facet=facet,
+        )
+
     def forget(self, keyword: Optional[str] = None, layer: str = "all") -> str:
         """主动遗忘。layer: sensory|working|long_term|all"""
         counts = {}
@@ -556,31 +624,120 @@ class MemorySandbox:
         return f"已按关键词「{keyword}」遗忘 {layer}: {counts}"
 
     def backup_long_term(self, dest: Optional[str] = None) -> str:
-        """手动备份长时陈述性记忆。"""
+        """备份长时陈述性记忆，并配一份同名的知识库快照。
+
+        知识库和记忆是同一份资产的两半，只备份其中一半，恢复出来的库是残的。
+        两者写成配对的两个文件（见 `paired_backup_path`）。
+        """
         self.long_term.reload()
         path = self.long_term.backup_declarative(dest)
         n = len(self.long_term.records)
-        return f"已备份长时记忆 {n} 条 → {path}"
+
+        kb_hint = ""
+        try:
+            kb_path = self.knowledge.backup(paired_backup_path(path))
+            kb_hint = f" + 知识库 {len(self.knowledge.docs)} 篇（{kb_path.name}）"
+        except Exception as e:  # noqa: BLE001 - 知识库出问题不能让记忆备份也失败
+            kb_hint = f"（知识库快照失败：{e}）"
+        return f"已备份长时记忆 {n} 条{kb_hint} → {path}"
 
     def restore_long_term(self, path: Optional[str] = None) -> str:
-        """从备份恢复长时陈述性记忆（覆盖当前）。"""
+        """从备份恢复长时陈述性记忆（覆盖当前），有配对的知识库快照就一并恢复。"""
         try:
             n = self.long_term.restore_declarative(path)
         except FileNotFoundError as e:
             return f"恢复失败：{e}"
         except ValueError as e:
             return f"恢复失败：{e}"
-        return f"已从备份恢复长时记忆 {n} 条" + (f"（{path}）" if path else "（最新备份）")
+
+        used = Path(path) if path else (self.long_term.list_backups() or [None])[0]
+        kb_hint = "；备份里没有知识库快照，知识库未改动"
+        if used is not None:
+            kb_backup = paired_backup_path(used)
+            if kb_backup.is_file():
+                try:
+                    kb_hint = f"、知识库 {self.knowledge.restore(kb_backup)} 篇"
+                except Exception as e:  # noqa: BLE001
+                    kb_hint = f"；知识库恢复失败：{e}"
+        return (
+            f"已从备份恢复长时记忆 {n} 条{kb_hint}"
+            + (f"（{path}）" if path else "（最新备份）")
+        )
 
     def clear_long_term(self, *, backup_first: bool = False) -> str:
-        """清空长时陈述性记忆（供已确认的 UI/API 调用）。"""
+        """清空长时陈述性记忆（供已确认的 UI/API 调用）。知识库不在清空范围内。"""
         self.long_term.reload()
         backup_msg = ""
-        if backup_first and self.long_term.records:
+        # 记忆为空但知识库有东西时也要备：这个判断只是为了别落一份空备份，
+        # 不是「只备记忆」
+        if backup_first and (self.long_term.records or self.knowledge.docs):
             backup_msg = self.backup_long_term() + "\n"
         n = self.long_term.forget()
         return (
             f"{backup_msg}长时记忆已清空（移除陈述性记忆 {n} 条）。程序性模板保留。"
+        )
+
+    def find_memory(self, memory_id: str = "", question: str = ""):
+        """按 id 或问法（含别名）定位一条长时记忆；找不到返回 None。"""
+        self.long_term.reload()
+        rid = (memory_id or "").strip()
+        if rid:
+            for rec in self.long_term.records:
+                if rec.id == rid:
+                    return rec
+            return None
+        q = (question or "").strip()
+        if not q:
+            return None
+        for rec in self.long_term.records:
+            aliases = [rec.question] + list((rec.meta or {}).get("aliases") or [])
+            if q == rec.question or q in aliases:
+                return rec
+        return None
+
+    def update_memory(
+        self,
+        *,
+        memory_id: str = "",
+        question: str = "",
+        answer: str = "",
+        new_question: Optional[str] = None,
+        scene: Optional[str] = None,
+        tags: Optional[Sequence[str]] = None,
+        kind: Optional[str] = None,
+        facts: Optional[dict] = None,
+    ) -> str:
+        """
+        原地改写一条已有长时记忆，用于修正过时/已被现状推翻的结论。
+
+        必须能定位到原条目，否则报错而不是新建——「更新」写成新增会让库里
+        同时留着新旧两种说法，检索时打架，比不更新更糟。
+
+        省略的字段沿用原值：只想改答案时不必把问法和标签重报一遍。
+        """
+        rec = self.find_memory(memory_id=memory_id, question=question)
+        if rec is None:
+            hint = f"id={memory_id}" if memory_id else f"问法「{question}」"
+            return f"未找到要更新的记忆（{hint}）。可用 memory_ask / memory_list 先查到 id。"
+
+        body = (answer or "").strip()
+        if not body:
+            return "answer 不能为空：更新记忆必须给出新的结论正文。"
+
+        # 问法默认不动：库里的问法常是精心调过的（如飞书《标题》式），
+        # 每次更新都重报一遍容易越改越偏
+        q_new = (new_question or "").strip() or rec.question
+        return self.remember(
+            q_new,
+            body,
+            scene=scene or rec.scene,
+            tags=tags if tags is not None else list(rec.tags or []),
+            kind=kind or rec.kind,
+            facts=facts if facts is not None else dict(rec.facts or {}),
+            memory_id=rec.id,
+            original_question=rec.question,
+            update_only=True,
+            dedup_facet=str((rec.meta or {}).get("facet") or ""),
         )
 
     def delete_memory(self, memory_id: str = "", question: str = "") -> str:
@@ -648,6 +805,161 @@ class MemorySandbox:
             threshold=threshold,
         )
 
+    # ---------- 知识库 ----------
+    def knowledge_worker(self) -> Optional[KnowledgeIngestWorker]:
+        """按需起后台抓取线程。没配飞书就不起——省得每次记忆都白排一次队。"""
+        from .feishu import feishu_configured
+
+        if not feishu_configured(self.config.feishu):
+            return None
+        if self._knowledge_worker is None:
+            self._knowledge_worker = KnowledgeIngestWorker(
+                self.knowledge,
+                self.config.feishu,
+                config_path=self.config_path,
+            )
+        return self._knowledge_worker
+
+    def queue_knowledge_from_text(
+        self,
+        text: str,
+        *,
+        origin: str = "manual",
+        scene: str = "general",
+    ) -> list:
+        """扫文本里的飞书链接丢进后台抓取队列。任何异常都吞掉：这是附加能力。"""
+        try:
+            worker = self.knowledge_worker()
+            if worker is None:
+                return []
+            return worker.submit_text(text, origin=origin, scene=scene)
+        except Exception:  # noqa: BLE001 - 入库失败绝不能连累写记忆
+            return []
+
+    def scan_memory_links(self, *, refresh: bool = False, include_dead: bool = False) -> list:
+        """
+        全量扫一遍长时记忆，挑出还没进知识库的飞书文档。
+
+        自动入库只在 `remember()` 时触发，启用知识库之前写下的那些记忆里的链接
+        一条都没抓过。这个方法就是把存量补上——只列不抓，抓由调用方决定同步还是排队。
+
+        `refresh=True` 时连已入库的也列出来（用于「重新拉一遍全部」）。
+        已确认失效（文档被删/找不到）的链接默认跳过：重试多少次都一样，
+        白抓一轮不说，还会把用户刚删掉的失败条目又建回列表里。
+        """
+        from .feishu import extract_feishu_urls
+        from .knowledge import is_dead_link_error
+
+        self.long_term.reload()
+        seen: set = set()
+        out: list = []
+        for rec in self.long_term.records:
+            blob = "\n".join(
+                [rec.question or "", rec.answer or "", " ".join((rec.facts or {}).values())]
+            )
+            for ref in extract_feishu_urls(blob):
+                if ref.token in seen:
+                    continue
+                seen.add(ref.token)
+                stored = self.knowledge.find_by_document_id(ref.token)
+                if not include_dead and stored is not None and is_dead_link_error(stored.last_error):
+                    continue
+                in_kb = self.knowledge.has_document(ref.token)
+                if in_kb and not refresh:
+                    continue
+                out.append(
+                    {
+                        "url": ref.url,
+                        "token": ref.token,
+                        "memory_id": rec.id,
+                        "question": rec.question,
+                        "in_kb": in_kb,
+                    }
+                )
+        return out
+
+    def backfill_knowledge(
+        self,
+        *,
+        refresh: bool = False,
+        limit: int = 0,
+        on_progress=None,
+    ) -> dict:
+        """同步补录：逐篇抓取记忆里出现过的飞书文档。给 CLI / MCP 用。
+
+        串行抓是有意的：飞书接口有频控，十几篇并发打过去只会被限流。
+        单篇失败只记在结果里继续下一篇，不中断整轮。
+        """
+        pending = self.scan_memory_links(refresh=refresh)
+        if limit > 0:
+            pending = pending[:limit]
+        done, failed = [], []
+        for i, item in enumerate(pending, 1):
+            if on_progress:
+                on_progress(i, len(pending), item)
+            res = self.add_knowledge_from_memory(item["url"], memory_id=item["memory_id"])
+            (done if res.get("ok") else failed).append(
+                {"url": item["url"], "title": (res.get("doc") or {}).get("title"), "error": res.get("error")}
+            )
+        return {
+            "scanned": len(self.long_term.records),
+            "candidates": len(pending),
+            "done": done,
+            "failed": failed,
+        }
+
+    def queue_backfill_knowledge(self, *, refresh: bool = False) -> dict:
+        """把补录丢进后台队列（给 App：十几篇要抓一分钟，HTTP 不能干等）。"""
+        worker = self.knowledge_worker()
+        if worker is None:
+            return {"ok": False, "error": "没有配置飞书（feishu.enabled / app_id / app_secret）", "queued": 0}
+        pending = self.scan_memory_links(refresh=refresh)
+        queued = 0
+        for item in pending:
+            if worker.submit(
+                item["url"], origin=f"memory:{item['memory_id']}", force=refresh
+            ):
+                queued += 1
+        return {"ok": True, "candidates": len(pending), "queued": queued}
+
+    def add_knowledge_from_memory(self, url: str, *, memory_id: str) -> dict:
+        """补录用：origin 记成来源记忆，方便在 tab 里看出这篇是跟着谁进来的。"""
+        return self.add_knowledge(url, origin=f"memory:{memory_id}")
+
+    def add_knowledge(self, url: str, *, scene: Optional[str] = None, tags=None, origin: str = "manual") -> dict:
+        """手动录入一篇飞书文档（同步：用户点了按钮就是在等结果）。"""
+        from .knowledge_ingest import ingest_url
+
+        res = ingest_url(
+            self.knowledge,
+            self.config.feishu,
+            url,
+            origin=origin,
+            scene=scene or self.working.scene,
+            tags=tags,
+            config_path=self.config_path,
+        )
+        return {
+            "ok": res.ok,
+            "error": res.error,
+            "skipped": res.skipped,
+            "doc": res.doc.as_dict() if res.doc else None,
+        }
+
+    def refresh_knowledge(self, doc_id: str) -> dict:
+        """重新拉一遍原文档。别人改过之后用得上。"""
+        doc = self.knowledge.find(doc_id)
+        if doc is None:
+            return {"ok": False, "error": f"知识库里没有 {doc_id}"}
+        return self.add_knowledge(doc.url, scene=doc.scene, tags=doc.tags)
+
+    def collect_knowledge(self, query: str, *, top_k: int = 3) -> list:
+        """软召回知识库文档片段，返回 ChunkHit 列表。抓取/读盘出问题不能拖垮检索。"""
+        try:
+            return self.knowledge.search_chunks(query, top_k=top_k)
+        except Exception:  # noqa: BLE001 - 知识库是增量能力，坏了也要能正常查记忆
+            return []
+
     def build_reference_pack(
         self,
         query: str,
@@ -656,16 +968,25 @@ class MemorySandbox:
         top_k: int = 5,
         threshold: Optional[float] = None,
         max_answer_chars: int = 800,
+        knowledge_top_k: int = 3,
     ) -> dict:
-        """供 MCP：references 列表 + context_pack 文本。"""
+        """供 MCP：references 列表 + context_pack 文本（含知识库原文摘录）。"""
         hits = self.collect_references(
             query, tags=tags, top_k=top_k, threshold=threshold
         )
+        pack = self.long_term.format_context_pack(hits, max_answer_chars=max_answer_chars)
+
+        # 知识库单独成节，绝不混进 references：那个列表里的 id 是拿来 memory_update 的，
+        # 文档块没有记忆 id，混进去 Agent 会拿着块 id 去改一条不存在的记忆
+        kb_hits = self.collect_knowledge(query, top_k=knowledge_top_k)
+        kb_pack = format_knowledge_pack(kb_hits)
+        if kb_pack:
+            pack = f"{pack}\n\n{kb_pack}" if pack else kb_pack
+
         return {
             "references": [h.as_dict() for h in hits],
-            "context_pack": self.long_term.format_context_pack(
-                hits, max_answer_chars=max_answer_chars
-            ),
+            "knowledge": [h.as_dict() for h in kb_hits],
+            "context_pack": pack,
             "ref_threshold": (
                 threshold
                 if threshold is not None
@@ -756,6 +1077,7 @@ class MemorySandbox:
             "sensory": self.sensory.stats(),
             "working": self.working.stats(),
             "long_term": self.long_term.stats(),
+            "knowledge": self.knowledge.stats(),
             "llm": {
                 "enabled": self.config.llm.enabled,
                 "provider": self.config.llm.provider,
@@ -796,10 +1118,30 @@ class MemorySandbox:
         return items
 
     def list_long_term(self, limit: int = 200) -> dict:
-        """长时记忆：陈述性 + 程序性（不含向量）。"""
+        """
+        长时记忆：陈述性 + 程序性（不含向量），新记的在前。
+
+        `limit <= 0` 表示全给。列表界面必须传 0：截断过的列表既让侧栏条数
+        对不上状态栏的总数，更糟的是最老的那批在界面上**根本点不开**，
+        看着像被吞了。返回里的 `declarative_total` 始终是不截断的真实条数。
+
+        原来是 records[:limit]（插入顺序）：新记忆排在最底下，
+        而且条数超过 limit 后截掉的正好是最新的那批。
+
+        按 created_at 而不是 updated_at 排：每次检索命中都会
+        reinforce 一下 updated_at，别的项目里 agent 查一次记忆
+        就会把用户的列表重排一遍。
+        """
         self.long_term.reload()
         declarative = []
-        for rec in self.long_term.records[: max(0, limit)]:
+        recent = sorted(
+            self.long_term.records,
+            key=lambda r: float(r.created_at or 0),
+            reverse=True,
+        )
+        if limit > 0:
+            recent = recent[:limit]
+        for rec in recent:
             declarative.append({
                 "id": rec.id,
                 "question": rec.question,
@@ -811,6 +1153,8 @@ class MemorySandbox:
                 "weight": round(rec.weight, 3),
                 "hit_count": rec.hit_count,
                 "keywords": rec.keywords,
+                "updated_at": rec.updated_at,
+                "created_at": rec.created_at,
             })
         return {
             "declarative": declarative,
@@ -848,6 +1192,10 @@ class MemorySandbox:
                         f"     A: {rec['answer']}  "
                         f"(命中{rec['hit_count']} 权重{rec['weight']})"
                     )
+                # 表头是总数、列表是截断后的。不说一句，看的人只会以为记忆丢了
+                hidden = data["declarative_total"] - len(data["declarative"])
+                if hidden > 0:
+                    parts.append(f"  …… 还有 {hidden} 条较早的没列出来（只显示最新 {len(data['declarative'])} 条）")
             parts.append("")
             parts.append(f"【长时记忆 / 程序性】{len(data['procedural'])} 条")
             if not data["procedural"]:
@@ -898,23 +1246,6 @@ class MemorySandbox:
         text = (raw or "").strip()
         if not text:
             return None
-
-        # 记住：问 => 答  /  记住 问 => 答
-        m = re.match(
-            r"^(?:记住[:：]\s*|记住\s+)(.+?)\s*(?:=>|→|->|＝|=)\s*(.+)$",
-            text,
-            re.DOTALL,
-        )
-        if m:
-            msg = self.remember(m.group(1).strip(), m.group(2).strip())
-            return ChatResult(answer=msg, source="command")
-
-        # 记住：纯知识片段
-        m = re.match(r"^记住[:：]\s*(.+)$", text, re.DOTALL)
-        if m:
-            content = m.group(1).strip()
-            msg = self.remember(content, content)
-            return ChatResult(answer=msg, source="command")
 
         # 忘记刚才内容
         if text in {"忘记刚才内容", "忘记刚才", "忘掉刚才"}:
@@ -1130,4 +1461,37 @@ class MemorySandbox:
                 return ChatResult(answer=str(e), source="command")
             return ChatResult(answer=msg, source="command")
 
-        return None
+        # 自然语言写入放在最后：先让「备份长时记忆」这类固定指令认领自己，
+        # 否则它们会被当成「要记的内容」写进库
+        return self._handle_remember(text)
+
+    def _handle_remember(self, text: str) -> Optional[ChatResult]:
+        """「记一下…」「把这个存到记忆库」「…，记下来」都算写入。"""
+        from .intent import detect_remember, split_question_answer
+
+        intent = detect_remember(text)
+        if intent is None:
+            return None
+
+        pair = split_question_answer(intent.body)
+        if pair:
+            return ChatResult(answer=self.remember(pair[0], pair[1]), source="command")
+
+        if intent.content:
+            return ChatResult(
+                answer=self.remember(intent.content, intent.content), source="command"
+            )
+
+        # 只说了「记一下这个」：指的多半是刚才那轮对话
+        question, answer = self.working.last_exchange()
+        if answer:
+            if not question:
+                question = answer.split("\n")[0].strip()
+            return ChatResult(answer=self.remember(question, answer), source="command")
+        return ChatResult(
+            answer=(
+                "要记什么？把内容一起发给我，例如\n"
+                "  记一下：飞书长连接怎么保存 => 先跑本地进程，再回后台点保存"
+            ),
+            source="command",
+        )

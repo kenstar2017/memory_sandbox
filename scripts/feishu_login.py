@@ -45,8 +45,14 @@ def main() -> int:
         return 2
 
     print(f"已写入: {written}")
-    print("已保存 user_access_token + refresh_token（明文不打印）。")
-    print("之后 token 过期会自动用 refresh_token 续期；长期失效再跑本脚本。")
+    # 没拿到 refresh_token 时不能谎报已保存，否则用户以为能自动续期
+    saved = load_config(written).feishu
+    if saved.refresh_token:
+        print("已保存 user_access_token + refresh_token（明文不打印）。")
+        print("之后 token 过期会自动用 refresh_token 续期；长期失效再跑本脚本。")
+    else:
+        print("已保存 user_access_token（明文不打印）；本次没有 refresh_token。")
+        print("token 到期后需重跑本脚本，除非按上面三步开通自动续期。")
     return 0
 
 

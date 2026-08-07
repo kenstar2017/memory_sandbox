@@ -137,6 +137,11 @@ class LongTermMemory:
 
         self.records: List[MemoryRecord] = []
         self.procedural: Dict[str, str] = {}
+        # declarative.json 的 (mtime_ns, size)：未变则跳过重新解析
+        self._decl_stamp: Optional[Tuple[int, int]] = None
+        # records 文本内容的版本号，BM25 索引据此判断能否复用
+        self._records_version: int = 0
+        self._bm25_cache: Optional[Tuple[int, BM25Index]] = None
         self._load()
 
     def _hybrid_weights(self) -> Tuple[float, float, float]:
@@ -147,6 +152,16 @@ class LongTermMemory:
         if total <= 0:
             return 0.70, 0.30, 0.0
         return vw / total, kw / total, bw / total
+
+    def _bm25_index(self) -> BM25Index:
+        """按 records 版本复用 BM25 索引；reinforce 只改权重不动文本，无需重建。"""
+        cached = self._bm25_cache
+        if cached is not None and cached[0] == self._records_version:
+            return cached[1]
+        index = BM25Index()
+        index.rebuild([self._record_doc_text(r) for r in self.records])
+        self._bm25_cache = (self._records_version, index)
+        return index
 
     @staticmethod
     def _record_doc_text(rec: MemoryRecord) -> str:
@@ -202,14 +217,39 @@ class LongTermMemory:
         """从磁盘重新加载（多进程：App / MCP / CLI 共用同一记忆文件时必需）。"""
         self._load(declarative_only=False)
 
+    def revision(self) -> str:
+        """
+        declarative.json 的变更标记（mtime_ns:size），不解析文件内容。
+
+        App / MCP / CLI 是三个进程共用同一份记忆文件，原子写会同时改 mtime 与 size，
+        前端据此轮询「别处有没有写入」，不必每次把整份记忆拉下来比对。
+        """
+        stamp = self._decl_stamp_now()
+        return "" if stamp is None else f"{stamp[0]}:{stamp[1]}"
+
+    def _decl_stamp_now(self) -> Optional[Tuple[int, int]]:
+        """declarative.json 的 (mtime_ns, size)；不存在时 None。"""
+        try:
+            st = self.declarative_path.stat()
+        except OSError:
+            return None
+        return (st.st_mtime_ns, st.st_size)
+
     def _load(self, declarative_only: bool = False) -> None:
         with self._file_lock(self._declarative_lock_path, exclusive=False):
-            if self.declarative_path.is_file():
+            stamp = self._decl_stamp_now()
+            # 原子写会更新 mtime/size，据此判断别的进程有没有改过盘
+            if stamp is None:
+                if self.records or self._decl_stamp is not None:
+                    self.records = []
+                    self._records_version += 1
+                self._decl_stamp = None
+            elif stamp != self._decl_stamp:
                 with open(self.declarative_path, "r", encoding="utf-8") as f:
                     raw = json.load(f) or []
                 self.records = [_record_from_dict(item) for item in raw]
-            else:
-                self.records = []
+                self._decl_stamp = stamp
+                self._records_version += 1
 
         if declarative_only:
             return
@@ -233,6 +273,8 @@ class LongTermMemory:
         data = [asdict(r) for r in self.records]
         with self._file_lock(self._declarative_lock_path, exclusive=True):
             self._atomic_write_json(self.declarative_path, data)
+            self._decl_stamp = self._decl_stamp_now()
+            self._records_version += 1
 
     def _save_procedural(self) -> None:
         with self._file_lock(self._procedural_lock_path, exclusive=True):
@@ -249,6 +291,8 @@ class LongTermMemory:
                 self.records = []
             result = mutator()
             self._atomic_write_json(self.declarative_path, [asdict(r) for r in self.records])
+            self._decl_stamp = self._decl_stamp_now()
+            self._records_version += 1
             return result
 
     # ---------- procedural ----------
@@ -379,6 +423,8 @@ class LongTermMemory:
         blocks: List[str] = [
             "【记忆沙箱 · 参考问答】以下为相关历史结论，供结合当前项目上下文使用；"
             "可能过时，以仓库/现状为准，勿直接当作最终实现。"
+            "若某条与现状矛盾，用它的 id 调 memory_update 修正或 memory_delete 删除，"
+            "别留着误导后续检索。"
         ]
         for i, hit in enumerate(hits, 1):
             rec = hit.record
@@ -388,7 +434,8 @@ class LongTermMemory:
             tags = ",".join(rec.tags or [])
             tag_s = f" tags={tags}" if tags else ""
             reason_s = "/".join(hit.reasons[:4]) if hit.reasons else ""
-            meta = f"score={hit.score:.2f}{tag_s}"
+            # id 必须给：hook 投递的是纯文本，没有 id 就没法回头修这条
+            meta = f"id={rec.id} score={hit.score:.2f}{tag_s}"
             if reason_s:
                 meta += f" reasons={reason_s}"
             blocks.append(
@@ -442,12 +489,10 @@ class LongTermMemory:
 
         required_feishu_tokens = extract_feishu_tokens(query)
 
-        # BM25：对当前库重建轻量索引（本地体量可接受）
+        # BM25：索引随记忆版本缓存，避免每次检索都重建
         bm25_norm = [0.0] * len(self.records)
         if bw > 0 and self.records:
-            bm25 = BM25Index()
-            bm25.rebuild([self._record_doc_text(r) for r in self.records])
-            raw_bm25 = bm25.score(q_raw + " " + q_core)
+            raw_bm25 = self._bm25_index().score(q_raw + " " + q_core)
             mx_b = max(raw_bm25) if raw_bm25 else 0.0
             if mx_b > 0:
                 bm25_norm = [s / mx_b for s in raw_bm25]
@@ -519,6 +564,23 @@ class LongTermMemory:
                 score = min(1.0, score + contain_boost)
                 reasons.append(f"alias:{matched_alias[:40]}")
 
+            # 短主题词：整词出现在问句/别名中且 BM25 有信号时再抬一档，
+            # 避免长标题技术文档卡在阈值下（0.66 < 0.70）而本地未命中。
+            title_l = (rec.question or "").lower()
+            short_topic = (
+                2 <= len(q_core_l) <= 8
+                and bscore >= 0.45
+                and (
+                    q_core_l in title_l
+                    or any(q_core_l in a for a in aliases if a)
+                )
+            )
+            if short_topic:
+                # 越短的主题词越依赖字面包含，加分略高
+                topic_boost = 0.14 if len(q_core_l) <= 4 else 0.08
+                score = min(1.0, score + topic_boost)
+                reasons.append("title_topic")
+
             # facts 文本包含
             if fact_blob and (q_core_l in fact_blob.lower() or any(w in fact_blob.lower() for w in qkw[:4])):
                 score = min(1.0, score + 0.08)
@@ -562,8 +624,18 @@ class LongTermMemory:
         scored.sort(key=lambda x: x.score, reverse=True)
         return scored[:k]
 
-    def _find_by_feishu_tokens(self, *texts: str) -> Optional[MemoryRecord]:
-        """正文/链接含相同飞书 wiki/docx token 的记忆视为同一文档，合并更新。"""
+    def _record_facet(self, rec: MemoryRecord) -> str:
+        return str((rec.meta or {}).get("facet") or "")
+
+    def _find_by_feishu_tokens(
+        self, *texts: str, facet: str = ""
+    ) -> Optional[MemoryRecord]:
+        """
+        正文/链接含相同飞书 wiki/docx token 的记忆视为同一文档，合并更新。
+
+        facet 区分同一篇文档的不同侧面（如正文 vs 评论）：只有同一侧面才合并，
+        否则一条评论会把整篇正文的记录覆盖掉。
+        """
         from .feishu import extract_feishu_tokens
 
         tokens: Set[str] = set()
@@ -573,6 +645,8 @@ class LongTermMemory:
             return None
         best: Optional[MemoryRecord] = None
         for rec in self.records:
+            if self._record_facet(rec) != facet:
+                continue
             blob = "\n".join(
                 [
                     rec.question or "",
@@ -642,12 +716,15 @@ class LongTermMemory:
         record_id: Optional[str] = None,
         original_question: Optional[str] = None,
         require_existing: bool = False,
+        dedup_facet: str = "",
     ) -> MemoryRecord:
         """记忆巩固：写入前优化问题，提升后续口语/Cursor 检索命中。
 
         record_id：指定时原地更新该条（改「问」不会新开一条）。
         original_question：改问前的旧问法，用于定位原条目。
         require_existing：为 True 时找不到原条目则报错，绝不新建。
+        dedup_facet：同一来源的不同侧面（如飞书文档的正文 vs 评论）。只在同侧面内
+            去重合并，避免评论覆盖正文记录；留空即历史行为。
         """
         q_in, a_in = question, answer
         scrub_meta: Dict[str, Any] = {}
@@ -669,6 +746,8 @@ class LongTermMemory:
             opt_meta.update(meta)
         if original_question and clean_text(original_question) != clean_text(q_in):
             opt_meta.setdefault("original_question", clean_text(original_question))
+        if dedup_facet:
+            opt_meta["facet"] = dedup_facet
         opt_meta.update(scrub_meta)
         new_tags = normalize_tags(tags)
         new_facts = normalize_facts(facts)
@@ -682,6 +761,11 @@ class LongTermMemory:
 
         # 去重：显式 id > 旧问法/别名 > 同飞书 token > 同答案 > 高相似问答
         fact_blob = facts_search_blob(new_facts)
+
+        def _facet_ok(rec: Optional[MemoryRecord]) -> bool:
+            """跨侧面不合并（评论不该盖掉正文），显式指定 id 时不受此限。"""
+            return rec is not None and self._record_facet(rec) == dedup_facet
+
         existing_id: Optional[str] = None
         rid = (record_id or "").strip()
         if rid:
@@ -695,17 +779,17 @@ class LongTermMemory:
             keyed = self._find_by_question_key(
                 original_question or "", opt.original, q_in, q
             )
-            existing_id = keyed.id if keyed else None
+            existing_id = keyed.id if _facet_ok(keyed) else None
         if existing_id is None:
             feishu_dup = self._find_by_feishu_tokens(
-                opt.original, q, a, fact_blob, " ".join(new_tags)
+                opt.original, q, a, fact_blob, " ".join(new_tags), facet=dedup_facet
             )
             existing_id = feishu_dup.id if feishu_dup else None
         # 同答案合并 / 软相似：仅在显式更新时启用（有 id / update_only）
         editing = bool(rid or require_existing)
         if existing_id is None and editing:
             same_ans = self._find_by_same_answer(a)
-            existing_id = same_ans.id if same_ans else None
+            existing_id = same_ans.id if _facet_ok(same_ans) else None
         if existing_id is None:
             existing = self.search_hits(opt.original, threshold=0.90, top_k=1)
             if not existing:
@@ -719,6 +803,7 @@ class LongTermMemory:
                     if clean_text(h.record.answer or "") == clean_text(a):
                         existing = [h]
                         break
+            existing = [h for h in existing if _facet_ok(h.record)]
             existing_id = existing[0].record.id if existing else None
 
         if require_existing and not existing_id:
@@ -746,19 +831,21 @@ class LongTermMemory:
                         hit = rec
                         break
             if hit is None:
-                hit = self._find_by_question_key(
+                keyed = self._find_by_question_key(
                     original_question or "", opt.original, q_in, q
                 )
+                hit = keyed if _facet_ok(keyed) else None
             if hit is None:
                 hit = self._find_by_feishu_tokens(
-                    opt.original, q, a, fact_blob, " ".join(new_tags)
+                    opt.original, q, a, fact_blob, " ".join(new_tags), facet=dedup_facet
                 )
             if hit is None and editing:
-                hit = self._find_by_same_answer(a)
+                same = self._find_by_same_answer(a)
+                hit = same if _facet_ok(same) else None
             if hit is None:
                 # 回退：同问题精确匹配
                 for rec in self.records:
-                    if rec.question == q:
+                    if rec.question == q and _facet_ok(rec):
                         hit = rec
                         break
 
@@ -840,23 +927,40 @@ class LongTermMemory:
         return self._mutate_declarative(_mut)
 
     def reoptimize_all(self) -> int:
-        """对已有记忆重新跑问题优化（补 aliases / 刷新向量），提升旧数据命中率。"""
+        """
+        对已有记忆重新跑问题优化（补 aliases / 刷新向量），提升旧数据命中率。
+
+        问法只在**看得出是被砍出来的前缀**时才用原文重算——老版本的
+        optimize_question 会把「…要改什么」削成「…要改」，这里正好能补回来。
+        其它情况一律沿用现有问法：飞书那类《标题》式问法是特意重写过的，
+        拿 original_question 覆盖等于把它退回成粗糙的原始输入。
+        """
 
         def _mut() -> int:
             n = 0
             for rec in self.records:
-                opt = optimize_question(rec.question)
                 original = (rec.meta or {}).get("original_question") or rec.question
-                opt2 = optimize_question(original)
-                aliases = list(dict.fromkeys(opt.aliases + opt2.aliases + [rec.question, original]))
-                rec.question = opt2.canonical or opt.canonical or rec.question
-                rec.keywords = list(dict.fromkeys(opt2.keywords + extract_keywords(rec.answer, top_k=8)))
-                rec.vector = self.embedder.embed(opt2.embed_text)
+                truncated = (
+                    original != rec.question
+                    and rec.question
+                    and original.startswith(rec.question)
+                )
+                source = original if truncated else rec.question
+                opt = optimize_question(source)
+                aliases = list(
+                    dict.fromkeys(opt.aliases + [rec.question, original, source])
+                )
+                rec.question = opt.canonical or rec.question
+                rec.keywords = list(
+                    dict.fromkeys(opt.keywords + extract_keywords(rec.answer, top_k=8))
+                )
+                rec.vector = self.embedder.embed(opt.embed_text)
                 rec.tags = normalize_tags(rec.tags)
                 rec.meta = {
                     **(rec.meta or {}),
-                    **opt2.as_meta(),
-                    "aliases": aliases[:32],
+                    **opt.as_meta(),
+                    "original_question": original,
+                    "aliases": [a for a in aliases if a][:32],
                 }
                 rec.updated_at = time.time()
                 n += 1

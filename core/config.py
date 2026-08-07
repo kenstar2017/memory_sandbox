@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field, fields
 from pathlib import Path
-from typing import Any, Dict, Optional, Type, TypeVar
+from typing import Any, Dict, List, Optional, Type, TypeVar
 
 import yaml
 
@@ -275,13 +275,42 @@ class FeishuConfig:
     # OAuth 回调，需与开放平台「重定向 URL」一致
     redirect_uri: str = "http://127.0.0.1:18765/feishu/callback"
     oauth_scope: str = (
-        "offline_access docs:document.content:read wiki:wiki:readonly wiki:node:read"
+        "offline_access docs:document.content:read wiki:wiki:readonly "
+        "wiki:node:read wiki:node:update docx:document:create "
+        "docx:document:readonly docx:document:write_only "
+        "docs:document.comment:read docs:document.comment:create "
+        "docs:event:subscribe board:whiteboard:node:read "
+        "board:whiteboard:node:create"
     )
+    # 文档域名（如 bytedance.larkoffice.com），用于把 document_id 拼成可点链接；
+    # api_base 是 open.feishu.cn，推不出企业实际域名，所以单独配
+    doc_host: str = ""
     # 开放平台 API 根；国内一般 https://open.feishu.cn
     api_base: str = "https://open.feishu.cn"
     timeout: float = 30.0
     # 注入 LLM 前的正文最大字符数
     max_chars: int = 80000
+    # 飞书机器人白名单（open_id）。留空 = 谁都不服务，只回自己的 open_id 方便配置：
+    # 机器人默认全公司可私聊，不设白名单等于把个人记忆库对全员开放
+    bot_allow_open_ids: List[str] = field(default_factory=list)
+    # 机器人回答时的模型超时上限（秒）。llm.timeout 默认 600s 是给批处理用的，
+    # 聊天里等十分钟没有意义，这里单独往下压
+    bot_llm_timeout: float = 150.0
+    # 文档评论机器人：默认关。回复对整篇文档的协作者可见，且署名是你本人
+    # （评论接口只能用 user token），必须显式打开
+    doc_bot_enabled: bool = False
+    # 评论正文里出现这个词才响应，避免把同事之间的讨论也接上
+    doc_bot_trigger: str = "@BloomBot"
+    # 慢任务超过这个秒数还没算完，先回一条「收到」，免得对方以为没人理
+    doc_bot_ack_after_seconds: float = 8.0
+    # 轮询兜底的间隔（秒）；<=0 关闭。自己发的评论飞书永远不推事件，只能靠拉。
+    # 范围是知识库里的文档，每篇每轮一次请求，改小之前先算一下请求量
+    doc_bot_poll_seconds: float = 30.0
+    # 一轮最多轮询多少篇，防止知识库涨到几百篇后把频控打满
+    doc_bot_poll_max_docs: int = 40
+    # 额外要盯的文档（docx token 或链接）。知识库是「关心哪些文档」的天然名单，
+    # 但有些文档不该进知识库又想让机器人在里面应答，走这里
+    doc_bot_poll_extra: List[str] = field(default_factory=list)
 
 
 @dataclass

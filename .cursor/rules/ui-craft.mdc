@@ -1,0 +1,76 @@
+---
+description: 本项目改 UI（BloomBox 桌面端与 Web UI）时的动效与视觉规范：统一走 .agents/skills 下的 emilkowalski/skills
+globs: desktop/src/**/*.tsx,desktop/src/**/*.ts,desktop/src/**/*.css,app_web.py
+alwaysApply: false
+---
+
+# UI 改动规范：用 emilkowalski/skills
+
+本仓库把 [emilkowalski/skills](https://github.com/emilkowalski/skills) 装进了 `.agents/skills/`（9 个 skill，
+真实文件、已进版本库）。**本项目所有 UI 改动都按这套方案做**，不要凭自己的审美即兴决定
+时长、曲线、边框和阴影。
+
+## 动手前先读（硬性）
+
+改下列文件之前，先 `Read` `.agents/skills/emil-design-eng/SKILL.md`，把它的判断框架用上：
+
+- `desktop/src/**/*.tsx`、`desktop/src/App.css`（BloomBox 桌面端，React 19 + 原生 CSS）
+- `app_web.py` 里的 `HTML_PAGE`（Web UI 的内联 HTML/CSS/JS，约在第 97 行起）
+
+其中 3 个 skill 标了 `disable-model-invocation: true`（`review-animations`、`prototype`、
+`pick-ui-library`），**不会自动触发**，但可以直接 `Read` 它们的 `SKILL.md` 并照着执行——
+本规则要求的就是这么做，别因为「没被自动挂上」就跳过。
+
+| 本轮要做什么 | 读哪个 skill |
+| --- | --- |
+| 任何 UI 调整、组件打磨、间距/边框/阴影取舍 | `emil-design-eng`（主 skill，先读它） |
+| 从零加一个动效（含 enter/exit、过渡、拖拽） | `animate`（+ 同目录 `RECIPES.md`） |
+| 改完动效自检、或用户要求评审动效 | `review-animations`（+ `STANDARDS.md`），默认从严 |
+| 全仓库动效体检、要一份改进路线 | `improve-animations`（+ `AUDIT.md`、`PLAN-TEMPLATE.md`） |
+| 问「哪里该加动效」 | `find-animation-opportunities`（只提方案不落地） |
+| 手势、弹簧、拖拽抽屉、材质与排版 | `apple-design` |
+| 要给某个动效找准确叫法 | `animation-vocabulary` |
+| 要引第三方前端库前 | `pick-ui-library`（别自己手搓 toast / 装弃维护的包） |
+| 一个 UI 想并排比几版 | `prototype` |
+
+评审 UI 代码时按主 skill 的要求输出 `| Before | After | Why |` 三列 Markdown 表格，
+不要写成「Before: / After:」的分行列表。
+
+## 本仓库的现状与落点
+
+读 skill 时注意它默认的技术栈跟我们不完全一样，按下面这些事实校正：
+
+- **没有 framer-motion / motion**：`desktop/package.json` 只有 `react`、`react-dom`、
+  `@tauri-apps/api`、`@tauri-apps/plugin-opener`。skill 里 `useSpring`、`motion.div`、
+  `useReducedMotion` 那部分**不能直接抄**；要加依赖先在对话里说清收益再问用户，
+  否则一律用 CSS transition / `@starting-style` / WAAPI 实现。
+- **`desktop/src/App.css` 目前一条 `transition` 都没有**，也没有 `:active` 反馈、
+  没有 `@keyframes`、没有 `prefers-reduced-motion`、没有 `@media (hover: hover)`。
+  所以第一次加动效时属于「从零建地基」：把 easing 变量加到 `App.css` 顶部的 `:root`，
+  和现有的 `--bg` / `--panel` / `--accent` 一类 token 放在一起，别散落在各个选择器里。
+- **主题变量是 `:root` + `[data-theme]` 两套**（深色在 `:root`、浅色在 `[data-theme='light']`，
+  见 `desktop/src/theme.ts`、`desktop/src/hooks/useTheme.ts`）。新增颜色必须两套都给，
+  只改一套会在另一个主题下瞎掉。
+- **`app_web.py` 是 Web UI 的源**；`desktop/src-tauri/resources/api/app_web.py` 与
+  `desktop/src-tauri/target/**` 下的是同步产物，改产物没用（同步脚本
+  `desktop/scripts/sync-api-resources.sh`）。
+- 桌面端是 Tauri，**外部链接必须走 `desktop/src/openExternal.ts`** 的
+  `openExternal` / `externalLinkProps`，裸 `<a href>` 在 webview 里点不开。
+
+## 不要手改 `.agents/skills/` 下的文件
+
+那是 vendored 的第三方内容，`skills-lock.json` 记着每个 skill 的来源与哈希，
+升级会整目录覆盖。要偏离原作者的建议（比如本仓库不用 framer-motion），
+把例外写进**本规则文件**，不要去改 skill 正文。
+
+升级 / 重装（本机内网环境有两个坑）：
+
+```bash
+# 内网镜像 bnpm.byted.org 对这个包返回 403，必须显式指定公共 registry
+npx --yes --registry=https://registry.npmjs.org skills@latest add emilkowalski/skills \
+  -s '*' -a cursor --copy -y
+```
+
+`--copy` 是必须的：默认是软链到 agent 目录，软链进不了版本库、别人拉下来是空的。
+另外这条命令要 clone 仓库到临时目录并写 `.git/hooks/`，在受限沙箱里会报
+`Operation not permitted`，需要在沙箱外执行。

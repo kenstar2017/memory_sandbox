@@ -100,6 +100,25 @@ src-tauri/target/release/bundle/dmg/BloomBox_0.1.0_*.dmg
 - 直接用：把 `BloomBox.app` 拖到「应用程序」
 - 或打开 `.dmg` 再拖进去安装
 
+### `tauri:build` 里那个 `CI=true` 别删
+
+打 DMG 的最后一步是卸载临时挂载卷，而卷会被前一步「Finder 美化」（`bundle_dmg.sh` 调
+AppleScript 摆图标位置）占住，卸载报「资源忙」，整个打包就以
+`error running bundle_dmg.sh` 失败——`.app` 其实已经打好了，只有 DMG 这步挂。
+
+脚本自带的卸载重试救不了：它只在 `hdiutil` 返回 16（EBUSY）时才重试，而这台 macOS 上
+「资源忙」返回的不是 16，于是一次就 `exit`。
+
+`CI=true` 会让 Tauri 给 `bundle_dmg.sh` 传 `--skip-jenkins`，跳过那段 AppleScript，
+Finder 不再碰这个卷，卸载就正常了（代价：DMG 里没有自定义图标位置，功能不受影响）。
+想反过来强行保留美化可设 `TAURI_BUNDLER_DMG_IGNORE_CI=1`，但在本机会复现上面的失败。
+
+失败过的话会**留下挂载卷**，堆着会影响下次打包，先清掉再重试：
+
+```bash
+for v in /Volumes/dmg.*; do hdiutil detach "$v"; done
+```
+
 ## AI 记忆门禁（装机后可用）
 
 别人装了这个包，首次启动会被问一次是否开启「AI 记忆门禁」（给 Cursor 装 hook，让所有项目里的

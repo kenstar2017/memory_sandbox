@@ -530,8 +530,19 @@ def handle_comment(
         # 自己的回复里带着「BloomBot」，不挡就会自己触发自己
         return "skip:self"
 
+    # 机器人真在这篇文档里说过话，就把整篇收进知识库。挂在 post() 这个唯一的回复出口
+    # 上，而不是在每个分支各调一次：分支以后还会加，漏掉一个就是静默不入库。它保持
+    # 沉默（不在白名单、没被 @、串里别人的讨论）时一次都不触发
+    ingested = False
+    force_kb = False  # 自己改过正文的那条路要重抓，否则库里留的是被它推翻的旧正文
+
     def post(body: str) -> bool:
-        return _post_comment(reply, cfg, ref, ev.comment_id, body, config_path)
+        nonlocal ingested
+        ok = _post_comment(reply, cfg, ref, ev.comment_id, body, config_path)
+        if ok and not ingested:
+            ingested = True
+            _ingest_doc_quietly(sandbox, ev.file_token, url=ref.url, force=force_kb)
+        return ok
 
     # 只在确认要干活的分支上 start()：贴到无关回复上等于替别人的讨论表态
     reaction = CommentReactionStatus(
@@ -545,6 +556,7 @@ def handle_comment(
             if plan is None:
                 return "skip:race"
             reaction.start()
+            force_kb = True  # 马上要动正文，知识库那份必须重抓
             got_status = _apply_plan(
                 plan,
                 cfg=cfg,
@@ -679,6 +691,19 @@ def _local_only_answer(references: List[dict]) -> str:
     if not answer:
         return ""
     return f"记忆库里最相关的一条（未接模型，仅供参考）——{question}\n{answer}"
+
+
+def _ingest_doc_quietly(sandbox, file_token: str, *, url: str = "", force: bool = False) -> None:
+    """把机器人回复过的那篇文档整篇收进知识库。
+
+    只入队，抓取在后台线程做：这里是评论回调线程，拉全文要好几秒。
+    附带效果是那篇文档进了知识库之后，下次启动会被按文件订阅、也进评论轮询范围
+    （见 `_subscribe_knowledge_docs` 与 `_start_comment_poller`），以后不必手工订阅。
+    """
+    try:
+        sandbox.queue_knowledge_doc(file_token, url=url, origin="doc-comment", force=force)
+    except Exception as e:  # noqa: BLE001 - 入库失败不能影响已经发出去的回复
+        print(f"知识库入库失败: {e}", file=sys.stderr)
 
 
 def _remember_quietly(sandbox, question: str, answer: str, doc_title: str) -> None:

@@ -179,7 +179,7 @@ Agent 会调用这些工具：
 所以它是与长时记忆平级的一层（`core/knowledge.py`），共用同一个 embedder，
 只在软召回阶段汇合。
 
-**三种入库方式：**
+**四种入库方式：**
 
 1. BloomBox 左侧「知识库」tab，粘贴飞书文档链接回车即可（同步抓取，长文要等几秒）
 2. 写记忆时正文里带了飞书链接，后台会自动把那篇抓进来——不必手动录一遍
@@ -187,6 +187,7 @@ Agent 会调用这些工具：
    用 `python3 main.py knowledge-backfill` 全量扫一遍长时记忆补齐（`--dry-run` 先看会抓哪些、
    `--refresh` 连已入库的也重抓）；界面上是知识库 tab 的「从记忆补录」按钮（走后台队列，
    抓完列表自动刷新），MCP 侧是 `memory_knowledge_backfill`
+4. **评论机器人在哪篇文档里回过话，那篇就自动进来**（见「文档评论里也能 @ 它」）
 
 去重认两种 token：wiki 链接的 token 和飞书解析出的 docx `document_id` 不是一回事，
 两个都会记在文档上，所以同一篇不会因为「这次是用 wiki 链接引的」而被重抓或存成两份。
@@ -993,8 +994,10 @@ feishu:
 
 接入（在上面 IM 机器人的基础上）：
 
-1. 重跑 `python3 scripts/feishu_login.py`，授权多出来的 `docs:event:subscribe`
-   （读评论的 `docs:document.comment:read`、发评论的 `docs:document.comment:create` 原本就在）
+1. 重跑 `python3 scripts/feishu_login.py`，授权多出来的 `docs:event:subscribe` 与
+   `drive:drive.metadata:readonly`（后者用来按 token 问文档的真实链接，见下面「自动进知识库」；
+   飞书要求 `drive:drive` 或它，取窄的这个。读评论的 `docs:document.comment:read`、
+   发评论的 `docs:document.comment:create` 原本就在）
 2. 「事件与回调 → 事件配置」→ 添加事件 `drive.notice.comment_add_v1`，
    **订阅身份选「用户身份订阅」**，订阅方式仍是长连接
 3. 打开开关并重启：
@@ -1015,6 +1018,24 @@ IM 的 `OnIt` / `DONE` 在云文档里不可用。
 **表情贴上了就不再发那条「收到」的文字回复**——评论串里每条回复整篇文档的协作者都看得见，
 表情安静得多；只有贴不上（权限没开、接口报错）才退回文字回执，`doc_bot_ack_after_seconds`
 就是这条退路的阈值。串里与机器人无关的讨论一个表情都不贴。
+
+**它在哪篇文档里说过话，那篇就自动进知识库。** 判断口径是「真的发出去了一条回复」——
+入库挂在 `handle_comment` 里 `post()` 这个唯一的回复出口上，而不是逐个分支各调一次
+（分支以后还会加，漏一个就是静默不入库）。所以没被 @、不在白名单、串里别人的讨论、
+回复发送失败，都不会入库；一条评论串里回了多条也只入一次。附带效果是那篇文档从此在
+知识库里，下次启动会被**按文件订阅**、也进评论轮询范围（`_subscribe_knowledge_docs`
+与 `_start_comment_poller` 都只认知识库里的文档），不必再手工逐篇订阅。
+
+这条路**按 token 入库，不按链接**：评论事件里只有 `file_token`，而 `docx_url()` 在
+`feishu.doc_host` 没配时返回空串，按链接走会静默什么都不做。可点链接另外跟飞书要一次
+（`drive/v1/metas/batch_query`，见 `core/feishu.py` 的 `fetch_doc_meta`）而不是按 `doc_host`
+拼——同一租户的文档可能分布在不同区域域名下（如 `bytedance.larkoffice.com` 与
+`bytedance.sg.larkoffice.com`），拿单个 host 去拼必然拼错一批，拼出个打不开的链接比留空更坏。
+取链接需要 `drive:drive.metadata:readonly`（**没重跑授权就取不到**，报 99991679，
+日志里会写「已入库，但没取到可点链接」）。要不到链接也照样入库：正文能被召回是主目的，
+点不开原文只是体验降级；那篇后来被别的方式（手动录入、记忆里的链接）带着链接再抓一次时，
+链接会补上，空链接也不会把已有的覆盖掉。
+机器人自己改过正文的那次会**强制重抓**，否则库里留着的正是它刚推翻的旧正文。
 
 启动时会自动调一次 `POST /drive/v1/user/subscription` 订阅（幂等）；失败只警告，
 IM 那半边照常工作。`python3 feishu_bot.py --check` 能看到评论机器人是开是关。

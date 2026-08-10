@@ -214,7 +214,7 @@ is no vector at all — it matches everything a little and nothing well — and 
 chunks would bury the "saved" list in the sidebar. So it sits alongside long-term memory
 (`core/knowledge.py`), shares the same embedder, and the two only meet during soft recall.
 
-**Three ways in:**
+**Four ways in:**
 
 1. The "知识库" tab in BloomBox: paste a Feishu doc link and press Enter (synchronous;
    a long doc takes a few seconds)
@@ -226,6 +226,8 @@ chunks would bury the "saved" list in the sidebar. So it sits alongside long-ter
    what it would fetch, `--refresh` to re-fetch stored ones too). In the UI it's the
    "从记忆补录" button in the knowledge tab (queued in the background, the list refreshes
    itself when each document lands); over MCP it's `memory_knowledge_backfill`.
+4. **Any document the comment bot has spoken in** gets pulled in whole (see "Mentioning it
+   in document comments")
 
 Deduplication recognises both kinds of token: a wiki link's token and the docx
 `document_id` Feishu resolves it to are different strings, and both are recorded on the
@@ -961,8 +963,11 @@ Boundaries hard-coded into the flow:
 Setup, on top of the bot above:
 
 1. Re-run `python3 scripts/feishu_login.py` to grant the added
-   `docs:event:subscribe` (`docs:document.comment:read` and
-   `docs:document.comment:create` were already in the scope list)
+   `docs:event:subscribe` and `drive:drive.metadata:readonly` (the latter is what asks Feishu
+   for a document's real link by token, see "pulled into the knowledge base" below; Feishu
+   accepts `drive:drive` or that one, and we take the narrow one).
+   `docs:document.comment:read` and `docs:document.comment:create` were already in the
+   scope list
 2. **Events & callbacks → Event config** → add `drive.notice.comment_add_v1`,
    subscribing **as a user**, still over the long connection
 3. Turn it on and restart:
@@ -986,6 +991,31 @@ a comment thread is visible to all collaborators, and an emoji is far quieter.
 `doc_bot_ack_after_seconds` is only the fallback threshold for when the reaction
 cannot be pinned. Discussion in the thread that is not aimed at the bot gets no
 reaction at all.
+
+**Any document it has spoken in is pulled into the knowledge base.** The rule is "a reply
+actually went out": the ingest hangs off `post()` in `handle_comment`, the single exit point
+for every reply, rather than being called from each branch (branches keep getting added, and
+missing one means silently not ingesting). So a comment it was not mentioned in, someone
+outside the allowlist, unrelated discussion in the thread, or a reply that failed to send all
+ingest nothing; several replies in one thread still ingest once. A side effect worth knowing:
+once the document is in the knowledge base, the next startup subscribes to it **per file** and
+the comment poller covers it too (`_subscribe_knowledge_docs` and `_start_comment_poller` only
+look at knowledge base documents), so you no longer have to subscribe each document by hand.
+
+This path ingests **by token, not by link**: a comment event only carries `file_token`, and
+`docx_url()` returns an empty string when `feishu.doc_host` is unset, so a link-driven ingest
+would silently do nothing. The clickable link is fetched from Feishu instead
+(`drive/v1/metas/batch_query`, see `fetch_doc_meta` in `core/feishu.py`) rather than assembled
+from `doc_host` — one tenant's documents can live under different regional hosts (say
+`bytedance.larkoffice.com` and `bytedance.sg.larkoffice.com`), so a single host is guaranteed
+to be wrong for some of them, and a link that looks fine but does not open is worse than none.
+Fetching the link needs `drive:drive.metadata:readonly` — **without re-running the login it
+fails** with 99991679 and the log says the document was ingested without a clickable link.
+If the link cannot be fetched the document is still ingested: having the body recallable is the
+point, a missing link is only a degraded experience, and if that document is later fetched again
+through a path that does carry a link (manual entry, a link inside a memory) the link is filled
+in — an empty one never overwrites a stored one. The turn where the bot edited the body
+**forces a re-fetch**, otherwise the stored copy is exactly the text it just overturned.
 
 Startup calls `POST /drive/v1/user/subscription` once (idempotent); a failure is
 a warning and the IM half keeps working. `python3 feishu_bot.py --check` shows

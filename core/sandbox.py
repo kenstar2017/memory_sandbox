@@ -836,6 +836,33 @@ class MemorySandbox:
         except Exception:  # noqa: BLE001 - 入库失败绝不能连累写记忆
             return []
 
+    def queue_knowledge_doc(
+        self,
+        token: str,
+        *,
+        url: str = "",
+        kind: str = "docx",
+        origin: str = "manual",
+        scene: str = "general",
+        force: bool = False,
+    ) -> bool:
+        """按 docx token 把一篇文档丢进后台抓取队列。
+
+        给只有 token、没有链接的调用方用（文档评论事件就是这样：`docx_url()` 在
+        `feishu.doc_host` 没配时返回空串）。链接会在入库时跟飞书补要。
+        和 `queue_knowledge_from_text` 一样吞掉所有异常——入库是附加能力。
+        """
+        try:
+            worker = self.knowledge_worker()
+            if worker is None or not (token or "").strip():
+                return False
+            from .feishu import FeishuDocRef
+
+            ref = FeishuDocRef(url=url or "", kind=kind or "docx", token=token.strip())
+            return worker.submit(ref=ref, origin=origin, scene=scene, force=force)
+        except Exception:  # noqa: BLE001 - 入库失败绝不能连累调用方
+            return False
+
     def scan_memory_links(self, *, refresh: bool = False, include_dead: bool = False) -> list:
         """
         全量扫一遍长时记忆，挑出还没进知识库的飞书文档。

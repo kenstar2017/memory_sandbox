@@ -10,7 +10,7 @@
     "sync-api": "bash scripts/sync-api-resources.sh",
     "tauri": "tauri",
     "tauri:dev": "tauri dev",
-    "tauri:build": "npm run sync-api && tauri build"
+    "tauri:build": "npm run sync-api && CI=true tauri build"
   },
   "dependencies": {
     "@tauri-apps/api": "^2.11.1",

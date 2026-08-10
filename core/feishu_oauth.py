@@ -44,6 +44,11 @@ DEFAULT_SCOPES = (
     # 订阅单篇文档的「评论更新」（等同文档里点「订阅文档动态」）。comment_add 事件只在
     # 授权用户收到飞书通知时才推，这项决定了这类通知会不会产生
     "docs:document.subscription "
+    # 按 token 问一篇文档的真实链接（drive/v1/metas/batch_query）。评论事件只给
+    # file_token，而 doc_host 推不出企业域名、同一租户还可能跨区域域名，所以链接只能
+    # 跟飞书要。飞书要求 drive:drive 或 drive:drive.metadata:readonly 之一，
+    # 这里取窄的那个——前者等于整个云空间
+    "drive:drive.metadata:readonly "
     # 读被引用的消息：应用身份拿别的应用发的卡片只有摘要外壳，换用户身份还有一次机会
     # （用户在客户端里本来就看得见）。后台要单独勾「获取与发送单聊、群组消息」的用户身份权限
     "im:message:readonly "

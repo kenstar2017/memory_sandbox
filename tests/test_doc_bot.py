@@ -284,6 +284,7 @@ class FakeDocApi:
         self.reactions: list = []
         self.reaction_error = ""
         self.locate_error = ""
+        self.reply_ok = True
 
     def get_comment(self, cfg, ref, comment_id, config_path=None):
         return FakeResult(
@@ -303,6 +304,8 @@ class FakeDocApi:
         self, cfg, ref, text, *, comment_id="", config_path=None, confirmed=False, as_app=False
     ):
         assert confirmed, "回评论必须显式 confirmed"
+        if not self.reply_ok:
+            return FakeResult(ok=False, error="没有评论权限")
         self.posted.append((comment_id, text))
         self.posted_as_app.append(as_app)
         return FakeResult(ok=True, comment_id="c_new", error="")
@@ -337,6 +340,7 @@ class FakeSandbox:
     def __init__(self, answer: str = "结论：口径以文档为准。"):
         self.llm = SimpleNamespace(generate=lambda prompt, context="", on_progress=None: answer)
         self.remembered: list = []
+        self.queued_docs: list = []
 
     def build_reference_pack(self, query, top_k=5):
         return {"references": [{"question": "旧问法", "answer": "旧答案"}]}
@@ -344,6 +348,10 @@ class FakeSandbox:
     def remember(self, question, answer, scene=None, tags=None, **kwargs):
         self.remembered.append((question, answer, scene, tags))
         return "已写入"
+
+    def queue_knowledge_doc(self, token, *, url="", origin="manual", scene="general", force=False):
+        self.queued_docs.append((token, url, origin, force))
+        return True
 
 
 class HandleCommentTests(unittest.TestCase):
@@ -499,6 +507,51 @@ class HandleCommentTests(unittest.TestCase):
         got = self._run("确认一下这个数对不对", payload=comment_event(reply_id="r_2"))
         self.assertEqual(got, "nudged")
         self.assertEqual(self.api.edits, [])
+
+    # ---- 知识库 ----
+
+    def test_replying_pulls_the_document_into_the_knowledge_base(self):
+        self.assertEqual(self._run("@BloomBot 这段的口径是什么"), "answered")
+        # 事件里只有 file_token，没有链接：入库按 token 走，链接由入库层跟飞书补要
+        self.assertEqual(self.sandbox.queued_docs, [("docx_token", "", "doc-comment", False)])
+
+    def test_staying_silent_pulls_nothing(self):
+        """没被 @ 就没说话，也就不该把别人的文档收进自己的知识库。"""
+        self.assertEqual(self._run("这段我也看不懂"), "skip:no-trigger")
+        self.assertEqual(self.sandbox.queued_docs, [])
+
+    def test_a_reply_that_never_landed_pulls_nothing(self):
+        self.api.reply_ok = False
+        self._run("@BloomBot 这段的口径是什么")
+        self.assertEqual(self.sandbox.queued_docs, [])
+
+    def test_two_replies_in_one_turn_still_pull_once(self):
+        # 表情贴不上时会多发一条「收到」，那也是一次 post，不能因此入库两次
+        self.api.reaction_error = "没开表情权限"
+
+        def slow(prompt, context="", on_progress=None):
+            time.sleep(0.15)
+            return "结论：口径以文档为准。"
+
+        self.sandbox.llm = SimpleNamespace(generate=slow)
+        self._run("@BloomBot 这段的口径是什么", ack_delay=0.01)
+        self.assertGreaterEqual(len(self.api.posted), 2)
+        self.assertEqual(len(self.sandbox.queued_docs), 1)
+
+    def test_applying_an_edit_forces_a_refetch(self):
+        """机器人自己刚改过正文，库里那份必须重抓，否则留的是被它推翻的旧正文。"""
+        self._run("@BloomBot 把「三天」改成「五天」")
+        self.sandbox.queued_docs.clear()
+        self.assertEqual(self._run("确认", payload=comment_event(reply_id="r_2")), "applied")
+        self.assertEqual([q[3] for q in self.sandbox.queued_docs], [True])
+
+    def test_a_broken_knowledge_layer_does_not_break_the_reply(self):
+        def boom(*a, **kw):
+            raise RuntimeError("知识库炸了")
+
+        self.sandbox.queue_knowledge_doc = boom
+        self.assertEqual(self._run("@BloomBot 这段的口径是什么"), "answered")
+        self.assertTrue(self.api.posted)
 
     def test_a_failed_write_is_reported(self):
         self._run("@BloomBot 把「三天」改成「五天」")

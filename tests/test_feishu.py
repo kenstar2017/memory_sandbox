@@ -541,7 +541,8 @@ class FeishuWriteScopeTests(unittest.TestCase):
                 "wiki:node:read wiki:node:update docx:document:create "
                 "docx:document:readonly "
                 "docs:document.comment:read docs:document.comment:create "
-                "docs:event:subscribe docs:document.subscription im:message:readonly "
+                "docs:event:subscribe docs:document.subscription "
+                "drive:drive.metadata:readonly im:message:readonly "
                 "board:whiteboard:node:read board:whiteboard:node:create"
             ),
         }

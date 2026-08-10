@@ -250,6 +250,32 @@ class IngestTests(unittest.TestCase):
         # 抓一次是为了拿 document_id（wiki 链接要解析），但没有重新入库
         self.assertEqual(len(self.kb.docs), 1)
 
+    def test_a_token_without_a_link_can_still_be_ingested(self):
+        """文档评论事件只给 file_token：doc_host 没配时 docx_url() 返回空串，
+        没有链接可解析。这条路断了就等于机器人回过话的文档一篇都进不来。"""
+        from core.feishu import FeishuDocRef
+
+        ref = FeishuDocRef(url="", kind="docx", token="OnlyTok123")
+        meta = lambda cfg, token, **kw: SimpleNamespace(  # noqa: E731
+            ok=True, url=f"https://bytedance.sg.larkoffice.com/docx/{token}", title=""
+        )
+        res = ingest_url(self.kb, self.cfg, "", ref=ref, fetcher=FakeFetch(), meta_fetcher=meta)
+        self.assertTrue(res.ok)
+        self.assertTrue(self.kb.has_document("OnlyTok123"))
+        # 链接是跟飞书要来的，不是按 doc_host 猜的——同一租户的文档可能在别的区域域名下
+        self.assertEqual(self.kb.docs[0].url, "https://bytedance.sg.larkoffice.com/docx/OnlyTok123")
+
+    def test_a_missing_link_does_not_block_the_ingest(self):
+        """要不到链接也要入库：正文能被召回是主目的，点不开原文只是体验降级。"""
+        from core.feishu import FeishuDocRef
+
+        ref = FeishuDocRef(url="", kind="docx", token="OnlyTok123")
+        meta = lambda cfg, token, **kw: SimpleNamespace(ok=False, url="", error="没权限")  # noqa: E731
+        res = ingest_url(self.kb, self.cfg, "", ref=ref, fetcher=FakeFetch(), meta_fetcher=meta)
+        self.assertTrue(res.ok)
+        self.assertEqual(self.kb.docs[0].url, "")
+        self.assertTrue(self.kb.search_chunks("权限管理"))
+
 
 class IngestWorkerTests(unittest.TestCase):
     def setUp(self):

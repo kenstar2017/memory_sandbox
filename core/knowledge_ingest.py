@@ -9,6 +9,7 @@
 from __future__ import annotations
 
 import queue
+import sys
 import threading
 from dataclasses import dataclass
 from typing import Any, Callable, List, Optional, Sequence
@@ -34,20 +35,27 @@ def ingest_url(
     feishu_cfg: Any,
     url: str,
     *,
+    ref: Optional[Any] = None,
     origin: str = "manual",
     scene: str = "general",
     tags: Optional[Sequence[str]] = None,
     config_path: Optional[str] = None,
     fresh_within: float = 0.0,
     fetcher: Optional[Callable[..., Any]] = None,
+    meta_fetcher: Optional[Callable[..., Any]] = None,
 ) -> IngestResult:
-    """抓一篇飞书文档并入库（同步）。`fetcher` 只为单测注入。"""
+    """抓一篇飞书文档并入库（同步）。
+
+    `ref` 给了就不再解析 `url`：文档评论事件只给 file_token，没有链接可解析
+    （`docx_url()` 在 doc_host 没配时返回空串）。`fetcher` / `meta_fetcher` 只为单测注入。
+    """
     from .feishu import extract_feishu_urls, fetch_feishu_document
 
-    refs = extract_feishu_urls(url or "")
-    if not refs:
-        return IngestResult(ok=False, url=url, error="不是可识别的飞书文档链接")
-    ref = refs[0]
+    if ref is None:
+        refs = extract_feishu_urls(url or "")
+        if not refs:
+            return IngestResult(ok=False, url=url, error="不是可识别的飞书文档链接")
+        ref = refs[0]
 
     fetch = fetcher or fetch_feishu_document
     try:
@@ -73,8 +81,28 @@ def ingest_url(
     if fresh_within > 0 and kb.has_document(document_id, fresh_within=fresh_within):
         return IngestResult(ok=True, url=ref.url, doc=kb.find_by_document_id(document_id), skipped=True)
 
+    # 链接可能一路都是空的（评论事件只给 token + 没配 doc_host），这时跟飞书要一次真实
+    # 链接。要不到也照样入库：正文能被召回才是主目的，点不开原文只是体验降级
+    doc_url = getattr(result, "url", "") or ref.url
+    if not doc_url:
+        from .feishu import fetch_doc_meta
+
+        meta = (meta_fetcher or fetch_doc_meta)(
+            feishu_cfg, document_id, config_path=config_path
+        )
+        if getattr(meta, "ok", False):
+            doc_url = getattr(meta, "url", "") or ""
+        else:
+            # 不能只静默留空：用户会看到知识库里多了一篇却点不开，也不知道差的是授权
+            name = getattr(result, "title", "") or document_id
+            print(
+                f"知识库：《{name}》已入库，但没取到可点链接"
+                f"（{str(getattr(meta, 'error', ''))[:120]}）",
+                file=sys.stderr,
+            )
+
     doc = kb.upsert(
-        url=getattr(result, "url", "") or ref.url,
+        url=doc_url,
         title=getattr(result, "title", "") or ref.url,
         content=getattr(result, "content", "") or "",
         document_id=document_id,
@@ -141,25 +169,38 @@ class KnowledgeIngestWorker:
 
     def submit(
         self,
-        url: str,
+        url: str = "",
         *,
+        ref: Optional[Any] = None,
         origin: str = "manual",
         scene: str = "general",
         force: bool = False,
     ) -> bool:
-        """入队一个链接。返回是否真的排上队。`force` 跳过刷新窗口，强制重抓。"""
+        """入队一篇文档。返回是否真的排上队。
+
+        `ref` 给了就不解析 `url`：文档评论事件只给 file_token，没有链接。
+        `force` 跳过刷新窗口强制重抓——机器人自己改过正文之后必须用它，
+        否则库里留着的是它刚推翻的旧正文。
+        """
         from .feishu import extract_feishu_urls
 
-        refs = extract_feishu_urls(url or "")
-        if not refs:
+        if ref is None:
+            refs = extract_feishu_urls(url or "")
+            if not refs:
+                return False
+            ref = refs[0]
+        token = getattr(ref, "token", "") or ""
+        if not token:
             return False
-        token = refs[0].token
+        # 已有且够新就别排队：排上去也要先把全文拉回来才发现该跳过，白打一次接口
+        if not force and self.kb.has_document(token, fresh_within=self.fresh_within):
+            return False
         with self._lock:
             if token in self._inflight:
                 return False
             self._inflight.add(token)
         try:
-            self._queue.put_nowait((refs[0].url, origin, scene, force))
+            self._queue.put_nowait((ref, origin, scene, force))
         except queue.Full:
             with self._lock:
                 self._inflight.discard(token)
@@ -173,9 +214,7 @@ class KnowledgeIngestWorker:
 
         queued: List[str] = []
         for ref in extract_feishu_urls(text or ""):
-            if self.kb.has_document(ref.token, fresh_within=self.fresh_within):
-                continue
-            if self.submit(ref.url, origin=origin, scene=scene):
+            if self.submit(ref=ref, origin=origin, scene=scene):
                 queued.append(ref.url)
         return queued
 
@@ -192,8 +231,6 @@ class KnowledgeIngestWorker:
             time.sleep(0.01)
 
     def _run(self) -> None:
-        from .feishu import extract_feishu_tokens
-
         while not self._stop.is_set():
             try:
                 item = self._queue.get(timeout=0.2)
@@ -202,12 +239,13 @@ class KnowledgeIngestWorker:
             if item is None:
                 self._queue.task_done()
                 break
-            url, origin, scene, force = item
+            ref, origin, scene, force = item
             try:
                 self._ingest(
                     self.kb,
                     self.feishu_cfg,
-                    url,
+                    getattr(ref, "url", "") or "",
+                    ref=ref,
                     origin=origin,
                     scene=scene,
                     config_path=self.config_path,
@@ -216,7 +254,6 @@ class KnowledgeIngestWorker:
             except Exception as exc:  # noqa: BLE001 - 后台线程炸了不能带走整个进程
                 self.last_error = str(exc)
             finally:
-                for token in extract_feishu_tokens(url):
-                    with self._lock:
-                        self._inflight.discard(token)
+                with self._lock:
+                    self._inflight.discard(getattr(ref, "token", "") or "")
                 self._queue.task_done()

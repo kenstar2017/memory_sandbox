@@ -62,7 +62,11 @@ export function KnowledgeDetail({ doc, busy, onClose, onRefresh, onDelete }: Pro
         <div className="detail-fact">
           <dt>原文</dt>
           <dd>
-            <a {...externalLinkProps(doc.url)}>{doc.url}</a>
+            {doc.url ? (
+              <a {...externalLinkProps(doc.url)}>{doc.url}</a>
+            ) : (
+              <span className="detail-dim">没取到可点链接，正文照样能被检索</span>
+            )}
           </dd>
         </div>
         {sections.length > 1 ? (

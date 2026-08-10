@@ -58,6 +58,22 @@ class FeishuCreateDocResult:
 
 
 @dataclass
+class FeishuDocMeta:
+    """一篇文档的元信息。只为拿那个**真实可点链接**存在。
+
+    `docx_url()` 是本地按 `feishu.doc_host` 拼的，没配就只能返回空串；而评论事件
+    里只有 file_token、连链接都没有。同一个租户的文档还可能分布在不同区域域名
+    （如 bytedance.larkoffice.com 与 bytedance.sg.larkoffice.com），拿单个
+    doc_host 去拼必然拼错一批。所以链接要跟飞书要，不要猜。
+    """
+
+    ok: bool
+    url: str = ""
+    title: str = ""
+    error: str = ""
+
+
+@dataclass
 class FeishuBodyPreview:
     """改正文前的只读预览，用来确认改的是哪一篇、会动多少内容。"""
 
@@ -1502,6 +1518,60 @@ _TEXT_BLOCK_TYPES = frozenset(_BLOCK_FIELD)
 def docx_url(cfg: FeishuConfig, document_id: str) -> str:
     """文档可点链接；没配 doc_host 时返回空串（api_base 推不出企业域名）。"""
     return _docx_url(cfg, document_id)
+
+
+def fetch_doc_meta(
+    cfg: FeishuConfig,
+    token: str,
+    *,
+    doc_type: str = "docx",
+    config_path: Optional[str] = None,
+) -> FeishuDocMeta:
+    """只读：按 token 问飞书要这篇文档的真实链接与标题。
+
+    用途是补 `docx_url()` 拼不出链接的场景（doc_host 没配、或文档在另一个区域
+    域名下）。拿不到就返回 ok=False，调用方该退回空链接而不是猜一个。
+    """
+    tok = (token or "").strip()
+    if not tok:
+        return FeishuDocMeta(ok=False, error="缺少 document token")
+    if not feishu_configured(cfg):
+        return FeishuDocMeta(ok=False, error="未配置飞书 app_id / app_secret")
+
+    timeout = float(cfg.timeout or 30)
+    _, _, _, api_base = _resolve_credentials(cfg)
+    url = f"{api_base}/open-apis/drive/v1/metas/batch_query"
+    body = {
+        "request_docs": [{"doc_token": tok, "doc_type": doc_type or "docx"}],
+        "with_url": True,
+    }
+
+    def _query(access_token: str) -> dict:
+        return _http_json(
+            "POST",
+            url,
+            headers={"Authorization": f"Bearer {access_token}"},
+            body=body,
+            timeout=timeout,
+        )
+
+    try:
+        _tok, data = _with_user_token(cfg, config_path, _query)
+    except Exception as e:  # noqa: BLE001 - 拿不到链接不算失败路径，调用方会退回空串
+        return FeishuDocMeta(ok=False, error=str(e))
+    if data.get("code") != 0:
+        return FeishuDocMeta(ok=False, error=str(data.get("msg") or data))
+
+    payload = data.get("data") or {}
+    for meta in payload.get("metas") or []:
+        return FeishuDocMeta(
+            ok=True,
+            url=str(meta.get("url") or ""),
+            title=str(meta.get("title") or ""),
+        )
+    failed = payload.get("failed_list") or []
+    hint = str(failed[0]) if failed else "文档元信息为空"
+    return FeishuDocMeta(ok=False, error=hint)
 
 
 def find_docx_block(

@@ -62,28 +62,47 @@ def _user_config_path(config_path: Optional[str] = None) -> Path:
     return path
 
 
-def persist_llm_agent_settings(
-    config_path: Optional[str],
-    agent_mode: str,
-    agent_force: bool,
-) -> str:
-    """
-    把 agent_mode / agent_force 合并写入用户配置（Application Support），
-    避免改仓库内 config.yaml。返回实际写入路径。
-    """
+def _persist_llm_settings(config_path: Optional[str], updates: Dict[str, Any]) -> str:
+    """把 llm.* 的若干字段合并写入用户配置（Application Support），
+    避免改仓库内 config.yaml。返回实际写入路径。"""
     path = _user_config_path(config_path)
     raw: Dict[str, Any] = {}
     if path.is_file():
         with open(path, "r", encoding="utf-8") as f:
             raw = yaml.safe_load(f) or {}
     llm = dict(raw.get("llm") or {})
-    llm["agent_mode"] = agent_mode
-    llm["agent_force"] = bool(agent_force)
+    llm.update(updates)
     raw["llm"] = llm
     path.parent.mkdir(parents=True, exist_ok=True)
     with open(path, "w", encoding="utf-8") as f:
         yaml.safe_dump(raw, f, allow_unicode=True, sort_keys=False)
     return str(path)
+
+
+def persist_llm_agent_settings(
+    config_path: Optional[str],
+    agent_mode: str,
+    agent_force: bool,
+) -> str:
+    return _persist_llm_settings(
+        config_path,
+        {"agent_mode": agent_mode, "agent_force": bool(agent_force)},
+    )
+
+
+def persist_llm_provider(
+    config_path: Optional[str],
+    provider: str,
+    model: Optional[str] = None,
+) -> str:
+    """切换回退模型接入方后写盘，下次启动仍是它。
+
+    传了 model 就一并写（切接入方时用空串清掉上一家的模型名）；不传则不动该字段。
+    """
+    updates: Dict[str, Any] = {"provider": provider}
+    if model is not None:
+        updates["model"] = model
+    return _persist_llm_settings(config_path, updates)
 
 
 # Web/CLI 可调的长时检索字段（含说明文案）
@@ -253,6 +272,8 @@ class LLMConfig:
     runtime: str = "local"
     # cursor local：agent 可执行文件；空则 PATH 查找 agent / cursor-agent
     agent_bin: str = ""
+    # trae：TraeCode CLI 可执行文件；空则 PATH 查找 coco / traecli / traex
+    trae_bin: str = ""
     # cursor local：ask=只读 | plan=只读规划 | 空=全工具（建议配合 agent_force）
     agent_mode: str = "ask"
     # cursor local：是否传 --force（可写/跑命令，慎用）

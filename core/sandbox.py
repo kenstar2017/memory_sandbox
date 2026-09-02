@@ -181,11 +181,15 @@ class MemorySandbox:
         input_text: str,
         stream_callback=None,
         on_progress: Optional[ProgressCallback] = None,
+        *,
+        persist_llm_answer: bool = True,
     ) -> ChatResult:
         """
         标准调用链路。stream_callback 预留流式适配（当前同步返回）。
         on_progress：阶段进度（CLI 交互模式等可打印到 stderr）。
         Web/CLI 等本地入口：本地记忆未命中时可回退沙箱内 LLM。
+        persist_llm_answer=False 时仍保留本轮工作记忆，但不把 Agent 回答自动写入长时记忆；
+        显式「记一下/记住」等指令仍由 ask_local 正常处理。
         """
         local = self.ask_local(input_text, on_progress=on_progress)
         # 指令 / 本地命中 / 感觉层拒绝：直接返回
@@ -208,16 +212,10 @@ class MemorySandbox:
                 stream_callback(result.answer)
             return result
 
-        provider = getattr(self.config.llm, "provider", "") or "llm"
-        runtime = getattr(self.config.llm, "runtime", "") or ""
         if on_progress:
-            hint = f"provider={provider}"
-            if str(provider).lower() in {"cursor", "cursor_cloud", "cursor-agent"}:
-                from .llm import describe_cursor_llm
+            from .llm import describe_llm_target
 
-                hint = describe_cursor_llm(self.config.llm)
-            elif runtime:
-                hint += f" runtime={runtime}"
+            hint = describe_llm_target(self.config.llm, include_runtime=True)
             on_progress(f"本地无解 → 回退沙箱 LLM（{hint}）…")
 
         # 飞书链接：在沙箱内用 OpenAPI 拉正文，注入 LLM 上下文（不依赖 Cursor MCP）
@@ -287,7 +285,7 @@ class MemorySandbox:
             keywords,
             vec,
             store_a,
-            persist_long=not await_confirm,
+            persist_long=persist_llm_answer and not await_confirm,
             tags=store_tags,
             facts=store_facts,
             meta=store_meta,
@@ -784,6 +782,75 @@ class MemorySandbox:
             "agent": "Agent 全工具（可改文件/执行命令，慎用）",
         }
         return f"已切换为 {labels.get(ui, ui)}{path_hint}"
+
+    def set_llm_provider(self, provider: str, persist: bool = True) -> str:
+        """
+        切换回退大模型的接入方：cursor（本机 Cursor Agent）| trae（本机 TraeCode CLI）
+        | mock（离线占位）| openai_compatible | cursor_cloud。
+
+        立即作用于后续 chat 回退。构建失败（如 OpenAI 网关缺 base_url、Cloud 缺 api_key）
+        会原样退回旧 provider 并抛 ValueError，不会把沙箱留在没有 LLM 的半残状态。
+
+        换接入方时会清掉 llm.model：两边的模型名互不通用（Cursor 认 gpt-5.6-sol-high，
+        Trae 认 GPT-5.6-Sol），而 build_llm 不校验模型名，留着上一家的名字要等真正回退
+        那一刻才炸（Trae 报 thread/start -32603，Cursor 报 Cannot use this model）。
+        """
+        from .config import persist_llm_provider
+        from .llm import (
+            build_llm,
+            normalize_llm_provider,
+            provider_label,
+            resolve_agent_bin,
+            resolve_trae_bin,
+        )
+
+        name = normalize_llm_provider(provider)
+        previous = self.config.llm.provider
+        previous_model = self.config.llm.model
+        try:
+            previous_name = normalize_llm_provider(previous)
+        except ValueError:
+            previous_name = ""
+        # 只在真的换了接入方时清；重复选同一个不该把用户挑的模型抹掉
+        cleared_model = bool(previous_model) and name != previous_name
+
+        self.config.llm.provider = name
+        if cleared_model:
+            self.config.llm.model = ""
+        try:
+            # 必须在清空 model 之后重建：实例是在构造时读走 model 的
+            self.llm = build_llm(self.config.llm)
+        except Exception as e:
+            self.config.llm.provider = previous
+            self.config.llm.model = previous_model
+            try:
+                self.llm = build_llm(self.config.llm)
+            except Exception:
+                self.llm = None
+            raise ValueError(f"切换到 {provider_label(name)} 失败：{e}") from e
+
+        warns = []
+        if cleared_model:
+            warns.append(
+                f"已清空 llm.model（原 {previous_model}），改用该接入方的默认模型"
+            )
+        if not self.config.llm.enabled:
+            warns.append("注意 llm.enabled=false，回退时仍不会调模型")
+        if name == "trae" and not resolve_trae_bin(self.config.llm):
+            warns.append("未找到本机 coco / traecli，装好 TraeCode CLI 再用")
+        elif name == "cursor" and not resolve_agent_bin(self.config.llm):
+            warns.append("未找到本机 agent / cursor-agent")
+
+        path_hint = ""
+        if persist:
+            path = persist_llm_provider(
+                getattr(self, "config_path", None),
+                name,
+                model="" if cleared_model else None,
+            )
+            path_hint = f"；已写入 {path}"
+        warn_hint = f"（{'；'.join(warns)}）" if warns else ""
+        return f"回退模型已切到 {provider_label(name)}{warn_hint}{path_hint}"
 
     def collect_references(
         self,

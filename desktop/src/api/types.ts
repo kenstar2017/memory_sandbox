@@ -23,6 +23,12 @@ export type ChatStreamError = {
 
 export type ChatStreamEvent = ChatStreamProgress | ChatStreamDone | ChatStreamError
 
+/** 回退大模型的接入方（cursor / trae / mock…），选项与标签都由后端给。 */
+export type LlmProviderOption = {
+  value: string
+  label: string
+}
+
 export type MemoryRecord = {
   id: string
   question: string

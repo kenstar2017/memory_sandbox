@@ -4,6 +4,7 @@ import type {
   KnowledgeDoc,
   KnowledgeDocDetail,
   KnowledgeStats,
+  LlmProviderOption,
   MemoryRecord,
   RememberPayload,
   RememberResult,
@@ -130,6 +131,25 @@ export async function setAgentMode(mode: string): Promise<{
   status_line?: string
 }> {
   return apiPost('/api/agent_mode', { mode, persist: true })
+}
+
+export async function getLlmProvider(): Promise<{
+  provider?: string
+  enabled?: boolean
+  options?: LlmProviderOption[]
+  status_line?: string
+}> {
+  return apiPost('/api/llm_provider', {})
+}
+
+export async function setLlmProvider(provider: string): Promise<{
+  message?: string
+  provider?: string
+  enabled?: boolean
+  options?: LlmProviderOption[]
+  status_line?: string
+}> {
+  return apiPost('/api/llm_provider', { provider, persist: true })
 }
 
 export async function clearWorking(): Promise<{ message?: string; status_line?: string }> {

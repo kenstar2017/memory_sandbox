@@ -385,8 +385,23 @@ See `config.yaml`:
 - `working.chunk_size`: working-memory window size
 - `long_term.similarity_threshold`: long-term hit threshold (suggest 0.65–0.75)
 - `long_term.persist_dir`: persistence dir (default `data/memory`)
-- `llm.provider`: `mock` (offline stub) | `cursor` | `openai_compatible`
+- `llm.provider`: `mock` (offline stub) | `cursor` | `trae` | `openai_compatible`
 - `llm.runtime` (cursor only): `local` (local `agent` CLI, can read disk) | `cloud` (no repo; cannot scan local source)
+- `llm.trae_bin` (trae only): TraeCode CLI path; empty falls back to `coco` / `traecli` / `traex` on PATH
+
+### Using Trae when Cursor quota runs out
+
+Set `llm.provider` to `trae`; `cwd` / `agent_mode` / `timeout` / `model` are shared with the cursor
+provider, so nothing else needs reconfiguring. Trae uses its own login — run `coco login` once.
+
+It shells out to `traecli exec`, which differs from the Cursor agent CLI in ways worth knowing
+(see the comments on `build_trae_cmd` in `core/llm.py`):
+
+- non-interactive mode is the `exec` subcommand; `-p` means `--profile` here, not the prompt
+- the working directory is `-C/--cd`; there is no `--workspace`
+- read-only vs writable comes from `-s/--sandbox`, and `agent_mode` ask/plan maps to `read-only`
+- the final answer is read from `-o/--output-last-message` instead of parsing the `--json` JSONL stream
+- local CLI only (no Cloud REST counterpart); a missing binary surfaces as an error rather than silently falling back to Cursor
 - `feishu.*`: Feishu wiki/docx read & write (see “Feishu / Lark documents” below)
 
 ## Feishu / Lark documents (read & write)

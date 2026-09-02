@@ -393,8 +393,22 @@ cd desktop && npm run tauri:dev
 - `working.chunk_size`：工作记忆窗口大小
 - `long_term.similarity_threshold`：长时命中阈值（建议 0.65~0.75）
 - `long_term.persist_dir`：持久化目录（默认 `data/memory`）
-- `llm.provider`：`mock`（离线占位）| `cursor` | `openai_compatible`
+- `llm.provider`：`mock`（离线占位）| `cursor` | `trae` | `openai_compatible`
 - `llm.runtime`（仅 cursor）：`local`（本机 `agent` CLI，可读盘）| `cloud`（Cloud 无仓库，不能扫本机源码）
+- `llm.trae_bin`（仅 trae）：TraeCode CLI 路径；空则 PATH 找 `coco` / `traecli` / `traex`
+
+### 用 Trae 顶掉 Cursor 额度
+
+Cursor 额度用完时，把 `llm.provider` 改成 `trae` 即可，`cwd` / `agent_mode` / `timeout` / `model`
+这些字段通用，不必重配。Trae 走自己的登录态，先在终端跑一次 `coco login`。
+
+实现上它调本机 `traecli exec`，几处和 Cursor 不一样，改动前先看 `core/llm.py:build_trae_cmd` 的注释：
+
+- 非交互是 `exec` 子命令；`-p` 在 traecli 里是 `--profile`（不是 prompt），照 Claude Code 的写法传会静默跑错
+- 工作目录用 `-C/--cd`，没有 `--workspace`
+- 只读/可写由 `-s/--sandbox`（`read-only` / `workspace-write`）控制，`agent_mode` 的 ask/plan 映射到 `read-only`
+- 终答用 `-o/--output-last-message` 落临时文件读取，不解析 `--json` 的 JSONL 事件流
+- 只有本机 CLI 一条路，没有 Cloud REST 对应物；找不到二进制时在回答里报错，不会静默回落到 Cursor
 - `feishu.*`：飞书 wiki/docx 读写（见下方「飞书文档读写」）
 
 ## 飞书文档读写

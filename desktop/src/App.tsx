@@ -16,6 +16,7 @@ import {
   getCursorHooksStatus,
   getFeishuBotStatus,
   getKnowledgeDoc,
+  getLlmProvider,
   gitCheck,
   getStatus,
   healthCheck,
@@ -28,11 +29,13 @@ import {
   remember,
   seedDev,
   setAgentMode,
+  setLlmProvider,
 } from './api/client'
 import type {
   ChatMessage,
   KnowledgeDoc,
   KnowledgeDocDetail,
+  LlmProviderOption,
   MemoryRecord,
 } from './api/types'
 import { AnswerModal, type ModalSeed } from './components/AnswerModal'
@@ -164,6 +167,8 @@ export default function App() {
   const [botRunning, setBotRunning] = useState<boolean | null>(null)
   const [configOpen, setConfigOpen] = useState(false)
   const [agentMode, setAgentModeState] = useState<AgentMode>('ask')
+  const [provider, setProviderState] = useState('')
+  const [providerOptions, setProviderOptions] = useState<LlmProviderOption[]>([])
   const { preference: theme, setPreference: setTheme } = useTheme()
 
   const persistPending = useCallback((next: string[]) => {
@@ -249,6 +254,38 @@ export default function App() {
         (lines.length > 5 ? `\n· 等共 ${total} 处` : ''),
     })
   }, [refreshSaved, push])
+
+  /** 顶栏那个下拉：沙箱无解时回退给谁（Cursor / Trae / 离线占位）。 */
+  const refreshProvider = useCallback(async () => {
+    try {
+      const data = await getLlmProvider()
+      if (data.options?.length) setProviderOptions(data.options)
+      if (data.provider) setProviderState(data.provider)
+      if (data.status_line) setStatusLine(data.status_line)
+    } catch {
+      // 接入方只是辅助信息，拉不到不该把整个界面判成断线
+    }
+  }, [])
+
+  const changeProvider = useCallback(
+    async (next: string) => {
+      const prev = provider
+      setProviderState(next)
+      try {
+        const data = await setLlmProvider(next)
+        if (data.provider) setProviderState(data.provider)
+        if (data.options?.length) setProviderOptions(data.options)
+        if (data.status_line) setStatusLine(data.status_line)
+        if (data.message) push({ id: uid(), role: 'sys', text: data.message })
+      } catch (e) {
+        // 缺密钥/网关时后端会退回旧 provider，下拉不能停在没生效的那一项上
+        setProviderState(prev)
+        void alertDialog(String(e))
+        void refreshProvider()
+      }
+    },
+    [provider, push, refreshProvider],
+  )
 
   const refreshDocs = useCallback(async () => {
     try {
@@ -344,6 +381,7 @@ export default function App() {
               setAgentModeState(am.agent_mode)
             }
             if (am.status_line) setStatusLine(am.status_line)
+            await refreshProvider()
             await refreshSaved()
             await refreshDocs()
             if (!cancelled) await maybeOfferHooks()
@@ -371,7 +409,7 @@ export default function App() {
     return () => {
       cancelled = true
     }
-  }, [refreshSaved, refreshDocs, push])
+  }, [refreshSaved, refreshDocs, refreshProvider, push])
 
   const openPending = (q: string, index: number) => {
     const hit = saved.find((r) => r.question === q)
@@ -917,6 +955,9 @@ export default function App() {
           onSetMode={setInputMode}
           theme={theme}
           onThemeChange={setTheme}
+          provider={provider}
+          providerOptions={providerOptions}
+          onProviderChange={(p) => void changeProvider(p)}
           agentMode={agentMode}
           onAgentMode={(m) => {
             setAgentModeState(m)

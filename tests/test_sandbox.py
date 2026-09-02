@@ -58,6 +58,26 @@ class MemorySandboxTests(unittest.TestCase):
         self.assertEqual(r.source, "llm")
         self.assertIn("MockLLM", r.answer)
 
+    def test_llm_fallback_can_skip_long_term_persistence(self):
+        """BloomBox 问 Agent 时只回答，不应把普通提问自动写进长时记忆。"""
+        before = len(self.sb.long_term.records)
+        r = self.sb.chat(
+            "一个不需要记住的临时问题 xyzzy-43",
+            persist_llm_answer=False,
+        )
+        self.assertEqual(r.source, "llm")
+        self.assertEqual(len(self.sb.long_term.records), before)
+
+    def test_explicit_remember_still_works_when_llm_persistence_disabled(self):
+        """关闭自动巩固不能禁掉用户主动发出的记忆指令。"""
+        before = len(self.sb.long_term.records)
+        r = self.sb.chat(
+            "记住：BloomBox 显式记忆测试 => 只有用户明确要求时才写入",
+            persist_llm_answer=False,
+        )
+        self.assertEqual(r.source, "command")
+        self.assertEqual(len(self.sb.long_term.records), before + 1)
+
     def test_forget_command(self):
         self.sb.remember("密钥口令", "不要外传")
         r = self.sb.chat("忘记：密钥")

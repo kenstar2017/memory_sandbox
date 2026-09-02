@@ -1,5 +1,5 @@
 import { useEffect, useRef, type ReactNode } from 'react'
-import type { ChatMessage } from '../api/types'
+import type { ChatMessage, LlmProviderOption } from '../api/types'
 import { THEME_OPTIONS, type ThemePreference } from '../theme'
 import { ToolBar } from './ToolBar'
 
@@ -26,6 +26,10 @@ type Props = {
   onSetMode: (m: InputMode) => void
   theme: ThemePreference
   onThemeChange: (t: ThemePreference) => void
+  /** 回退大模型的接入方；选项由后端给，空数组表示还没问到（API 未就绪） */
+  provider: string
+  providerOptions: LlmProviderOption[]
+  onProviderChange: (p: string) => void
   agentMode: AgentMode
   onAgentMode: (m: AgentMode) => void
   onToolAction: (id: string) => void
@@ -50,6 +54,9 @@ export function Chat({
   onSetMode,
   theme,
   onThemeChange,
+  provider,
+  providerOptions,
+  onProviderChange,
   agentMode,
   onAgentMode,
   onToolAction,
@@ -76,6 +83,24 @@ export function Chat({
       <header className="toolbar">
         <h1>BloomBox</h1>
         <div className="toolbar-actions">
+          <label
+            className="theme-label"
+            title="沙箱无解时回退给谁。Cursor 额度用完可切到 Trae（走 coco 自己的登录态）"
+          >
+            <select
+              className="theme-select"
+              value={provider}
+              aria-label="回退接入方"
+              disabled={!providerOptions.length}
+              onChange={(e) => onProviderChange(e.target.value)}
+            >
+              {providerOptions.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
           <label className="theme-label" title="外观主题">
             <select
               className="theme-select"

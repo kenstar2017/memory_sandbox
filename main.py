@@ -244,14 +244,9 @@ def interactive(sandbox: MemorySandbox, as_json: bool = False, local_only: bool 
     mode = "仅本地记忆" if local_only else "本地记忆 → 可选 LLM"
     llm_line = None
     if not local_only and sandbox.llm is not None:
-        from core.llm import describe_cursor_llm
+        from core.llm import describe_llm_target
 
-        llm_cfg = sandbox.config.llm
-        provider = (llm_cfg.provider or "").lower()
-        if provider in {"cursor", "cursor_cloud", "cursor-agent"}:
-            llm_line = describe_cursor_llm(llm_cfg)
-        else:
-            llm_line = f"provider={llm_cfg.provider}"
+        llm_line = describe_llm_target(sandbox.config.llm)
     if as_json:
         print(f"记忆沙箱 CLI（{mode}）JSON 模式", file=sys.stderr)
     else:

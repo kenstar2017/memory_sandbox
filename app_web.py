@@ -44,6 +44,7 @@ UI_FEATURES = (
     "feishu_bot",
     "config_edit",
     "knowledge_base",
+    "llm_provider",
     # 指纹比对本身要靠特性名兜底：更早的后端 health 里没有 code_stamp 字段，
     # 指纹判定会当「无意见」放过它，只有列成特性才认得出那是旧进程
     "code_stamp",
@@ -889,6 +890,10 @@ HTML_PAGE = r"""<!DOCTYPE html>
         <div class="sub">输入 / 选择指令 · 原有文字指令仍可用</div>
       </header>
       <div class="toolbar">
+        <label class="agent-mode-label" title="沙箱无解时回退给谁：Cursor 本机 Agent / Trae 本机 CLI / 离线占位">
+          接入方
+          <select id="llmProvider"></select>
+        </label>
         <label class="agent-mode-label" title="本地 Cursor LLM 回退权限：Ask 只读 / Plan 规划 / Agent 可写">
           Agent 模式
           <select id="agentMode">
@@ -2210,10 +2215,42 @@ if (agentModeSel) {
   };
 }
 
+const providerSel = document.getElementById('llmProvider');
+async function refreshProvider() {
+  if (!providerSel) return;
+  try {
+    const data = await api('/api/llm_provider', {});
+    providerSel.innerHTML = '';
+    (data.options || []).forEach((o) => {
+      const el = document.createElement('option');
+      el.value = o.value;
+      el.textContent = o.label;
+      providerSel.appendChild(el);
+    });
+    if (data.provider) providerSel.value = data.provider;
+    if (data.status_line) footer.textContent = data.status_line;
+  } catch (e) {}
+}
+if (providerSel) {
+  providerSel.onchange = async () => {
+    try {
+      const data = await api('/api/llm_provider', { provider: providerSel.value, persist: true });
+      append(data.message || ('已切换接入方：' + providerSel.value), 'sys');
+      if (data.status_line) footer.textContent = data.status_line;
+      // 切换可能被后端退回（缺密钥/网关），拉一次真实值，别让下拉停在没生效的选项上
+      await refreshProvider();
+    } catch (e) {
+      append('切换失败：' + (e.message || e), 'sys');
+      await refreshProvider();
+    }
+  };
+}
+
 append('优先检索本地三级记忆。\\n提问后会显示「思考中」过程（本地检索 → LLM）。\\n想记东西说人话就行：记一下 <内容> | 把 <内容> 存到记忆库 | <内容>，记下来；只说「记一下这个」则记上一轮对话。\\n要自己分问答：记住：问 => 答。也可输入 / 选择「记忆」→ 输入问 → 左侧点选 → 弹窗填答 → 确认。\\n其它指令：备份长时记忆 | 清空长时记忆（需确认）| 帮助\\n工具栏：Agent 模式 · 「检索设置」（向量/关键词/BM25 权重，每项有说明）。', 'sys');
 refreshSaved();
 renderQaList();
 refreshAgentMode();
+refreshProvider();
 (async function ensureStreamUi() {
   try {
     const r = await fetch('/api/health', { cache: 'no-store' });
@@ -2243,12 +2280,14 @@ class AppState:
     def status_line(self) -> str:
         st = self.sandbox.status()
         am = (st.get("llm") or {}).get("agent_mode") or "ask"
+        provider = (st.get("llm") or {}).get("provider") or "未设置"
         kb = st.get("knowledge") or {}
         return (
             f"工作记忆 {st['working']['size']}/{st['working']['max_size']} · "
             f"长时记忆 {st['long_term']['declarative_count']} 条 · "
             f"知识库 {kb.get('doc_count', 0)} 篇 · "
             f"场景 {st['working']['scene']} · "
+            f"接入 {provider} · "
             f"Agent {am} · "
             f"数据 {app_support_dir()}"
         )
@@ -2489,7 +2528,9 @@ class Handler(BaseHTTPRequestHandler):
                 return
             if path == "/api/chat":
                 text = (data.get("text") or "").strip()
-                result = STATE.sandbox.chat(text)
+                # BloomBox 普通提问只保留会话内工作记忆，不自动沉淀 Agent 回答。
+                # 用户显式说「记一下/记住」时仍会由指令链路写入长时记忆。
+                result = STATE.sandbox.chat(text, persist_llm_answer=False)
                 _json_response(
                     self,
                     200,
@@ -2533,7 +2574,11 @@ class Handler(BaseHTTPRequestHandler):
 
                 def worker() -> None:
                     try:
-                        result = STATE.sandbox.chat(text, on_progress=on_progress)
+                        result = STATE.sandbox.chat(
+                            text,
+                            on_progress=on_progress,
+                            persist_llm_answer=False,
+                        )
                         holder["result"] = result
                     except Exception as e:
                         holder["error"] = str(e)
@@ -2835,6 +2880,46 @@ class Handler(BaseHTTPRequestHandler):
                         "message": msg,
                         "agent_mode": (st.get("llm") or {}).get("agent_mode"),
                         "agent_force": (st.get("llm") or {}).get("agent_force"),
+                        "status_line": STATE.status_line(),
+                    },
+                )
+                return
+            if path == "/api/llm_provider":
+                from core.llm import llm_provider_options
+
+                provider = (data.get("provider") or data.get("llm_provider") or "").strip()
+                if not provider:
+                    llm_st = STATE.sandbox.status().get("llm") or {}
+                    current = llm_st.get("provider") or ""
+                    _json_response(
+                        self,
+                        200,
+                        {
+                            "provider": current,
+                            "enabled": llm_st.get("enabled"),
+                            "options": llm_provider_options(current),
+                            "status_line": STATE.status_line(),
+                        },
+                    )
+                    return
+                try:
+                    msg = STATE.sandbox.set_llm_provider(
+                        provider,
+                        persist=bool(data.get("persist", True)),
+                    )
+                except ValueError as e:
+                    _json_response(self, 400, {"error": str(e), "status_line": STATE.status_line()})
+                    return
+                llm_st = STATE.sandbox.status().get("llm") or {}
+                current = llm_st.get("provider") or ""
+                _json_response(
+                    self,
+                    200,
+                    {
+                        "message": msg,
+                        "provider": current,
+                        "enabled": llm_st.get("enabled"),
+                        "options": llm_provider_options(current),
                         "status_line": STATE.status_line(),
                     },
                 )

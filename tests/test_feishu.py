@@ -529,6 +529,17 @@ class FeishuWriteScopeTests(unittest.TestCase):
         self.assertNotIn("docx:document", merged)
         self.assertIn("docx:document:write_only", merged)
 
+    def test_retired_sheet_scope_is_dropped(self):
+        """后台只剩 sheets:spreadsheet:read。再请求 :readonly 会让整个授权页 20027。"""
+        from core.feishu_oauth import _merged_scopes
+
+        cfg = FeishuConfig(
+            app_id="cli_x", oauth_scope="offline_access sheets:spreadsheet:readonly"
+        )
+        merged = _merged_scopes(cfg).split()
+        self.assertNotIn("sheets:spreadsheet:readonly", merged)
+        self.assertIn("sheets:spreadsheet:read", merged)
+
     def test_missing_granted_scopes_detects_unapproved(self):
         """需审核权限没批下来时，换票响应的 scope 里就没有它，应能提前报出来。"""
         from core.feishu_oauth import missing_granted_scopes
@@ -544,7 +555,7 @@ class FeishuWriteScopeTests(unittest.TestCase):
                 "docs:event:subscribe docs:document.subscription "
                 "drive:drive.metadata:readonly im:message:readonly "
                 "board:whiteboard:node:read board:whiteboard:node:create "
-                "sheets:spreadsheet:readonly"
+                "sheets:spreadsheet:read"
             ),
         }
         self.assertEqual(

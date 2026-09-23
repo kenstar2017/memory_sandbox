@@ -42,7 +42,7 @@ _NOT_SUPPORTED = {
 }
 
 BOARD_SCOPE = "board:whiteboard:node:read"
-SHEET_SCOPE = "sheets:spreadsheet:readonly"
+SHEET_SCOPE = "sheets:spreadsheet:read"
 
 # 单个画板最多列这么多图形。画板可以有上千节点，全塞进正文会挤爆上下文
 MAX_NODES_PER_BOARD = 200
@@ -408,7 +408,7 @@ def _sheet_error_hint(err: str) -> str:
         )
     if "99991672" in err or "20027" in err or "permission" in low or "scope" in low:
         return (
-            f"应用缺少电子表格读权限：请在开放平台开通「查看、评论和导出电子表格（{SHEET_SCOPE}）」，"
+            f"应用缺少电子表格读权限：请在开放平台开通「查看电子表格（{SHEET_SCOPE}）」，"
             "再运行 python3 scripts/feishu_login.py 重新授权"
         )
     if "forbidden" in low or "1310213" in err or "1310202" in err or "131006" in err:

@@ -301,7 +301,7 @@ class FeishuConfig:
         "docx:document:readonly docx:document:write_only "
         "docs:document.comment:read docs:document.comment:create "
         "docs:event:subscribe board:whiteboard:node:read "
-        "board:whiteboard:node:create sheets:spreadsheet:readonly"
+        "board:whiteboard:node:create sheets:spreadsheet:read"
     )
     # 文档域名（如 bytedance.larkoffice.com），用于把 document_id 拼成可点链接；
     # api_base 是 open.feishu.cn，推不出企业实际域名，所以单独配

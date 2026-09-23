@@ -607,7 +607,7 @@ docx 的 `raw_content` 只收文字块，但**并非所有非文字内容都会�
 
 `memory_feishu_read` 的 `include_widgets` 默认 `true`；只要正文、且确认没有画板或表格时设 `false`，可省掉额外请求。CLI 对应 `python3 main.py feishu-read <链接> [--no-widgets]`。
 
-读画板需要开放平台开通「查看画板节点（`board:whiteboard:node:read`）」**并重新授权**（scope 固定在 token 里）。读内嵌电子表格需要「查看、评论和导出电子表格（`sheets:spreadsheet:readonly`）」，同样要重新授权。没开时附录里会直接提示开哪一项。
+读画板需要开放平台开通「查看画板节点（`board:whiteboard:node:read`）」**并重新授权**（scope 固定在 token 里）。读内嵌电子表格需要「查看电子表格（`sheets:spreadsheet:read`）」，同样要重新授权。接口文档里的旧名 `sheets:spreadsheet:readonly` 后台已经勾不到，请求它会让整个授权页报 20027。没开时附录里会直接提示开哪一项。
 
 > 加权限的顺序不能反：先在开放平台开通，再 `python3 scripts/feishu_login.py`。反过来会让授权页整体报 20027 —— 请求了应用没开通的 scope，整次授权都失败，不只是那一项拿不到。
 

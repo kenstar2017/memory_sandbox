@@ -590,7 +590,7 @@ silently. Set `include_widgets=false` (CLI: `python3 main.py feishu-read <URL> -
 the extra requests when you only want the body.
 
 Reading boards requires the `board:whiteboard:node:read` scope. Reading an embedded spreadsheet
-requires `sheets:spreadsheet:readonly`. Enable each scope in the Open Platform console **before**
+requires `sheets:spreadsheet:read` (the console name; the older `sheets:spreadsheet:readonly` can no longer be enabled and requesting it fails the whole consent screen with 20027). Enable each scope in the Open Platform console **before**
 re-running `scripts/feishu_login.py` — requesting a scope the app has not enabled fails the whole
 authorization with 20027, not just that one scope.
 

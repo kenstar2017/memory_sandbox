@@ -543,7 +543,8 @@ class FeishuWriteScopeTests(unittest.TestCase):
                 "docs:document.comment:read docs:document.comment:create "
                 "docs:event:subscribe docs:document.subscription "
                 "drive:drive.metadata:readonly im:message:readonly "
-                "board:whiteboard:node:read board:whiteboard:node:create"
+                "board:whiteboard:node:read board:whiteboard:node:create "
+                "sheets:spreadsheet:readonly"
             ),
         }
         self.assertEqual(

@@ -23,7 +23,7 @@ from core.utils import assemble_long_term_query
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-sandbox"
-SERVER_VERSION = "0.1.13"
+SERVER_VERSION = "0.1.14"
 
 # 通过 MCP initialize.instructions 下发给「任何」接入本服务的 AI 工具（Cursor / Trae /
 # Claude / 自研 agent 等）的强制工作流。MCP 没有服务端主动推送系统提示词的通道，
@@ -61,6 +61,39 @@ def _sandbox() -> MemorySandbox:
     if _SANDBOX is None:
         _SANDBOX = _build_sandbox()
     return _SANDBOX
+
+
+# ---- 落库门禁（进程内软状态）----------------------------------------------------
+# Trae 等宿主不回灌 MCP initialize.instructions、也没有 Cursor 那样的 stop hook，
+# 服务端没有主动推送通道；「上一轮问答没写进长时记忆」之后，唯一还能触达模型的
+# 机会是下一轮 memory_prepare 的返回内容。于是在这里记账：
+# prepare +1，memory_remember / memory_update / memory_delete 成功后清零；
+# 下一轮 prepare 时若计数 >=1，就在返回里带 sop_gate 告警（等价 Cursor 的落库兜底）。
+# 注意：状态是进程级（一个客户端窗口一个 MCP 进程），同窗口多会话共享计数，
+# 进程重启清零；模型若整轮完全不调记忆工具，服务端无法强制，只能靠宿主侧规则。
+_PREPARES_SINCE_WRITE = 0
+
+
+def _sop_gate_on_prepare() -> str:
+    """memory_prepare 记账；若之前有 prepare 未伴随落库，返回门禁提醒文案。"""
+    global _PREPARES_SINCE_WRITE
+    missed = _PREPARES_SINCE_WRITE
+    _PREPARES_SINCE_WRITE = missed + 1
+    if missed <= 0:
+        return ""
+    return (
+        f"⚠️【记忆沙箱·落库门禁】检测到之前已有 {missed} 轮对话调过 memory_prepare，"
+        "但结束时没有 memory_remember / memory_update，问答未写入长时记忆。"
+        "本轮收尾前必须落库：有可复用结论（启动命令、环境坑、路径、配置、约定、决策）"
+        "→ memory_remember；旧记忆说法被现状推翻 → memory_update（不要另写新条目）；"
+        "只有确认本轮无任何可沉淀内容才可跳过。"
+    )
+
+
+def _sop_gate_on_write() -> None:
+    """memory_remember / memory_update / memory_delete 成功后清零记账。"""
+    global _PREPARES_SINCE_WRITE
+    _PREPARES_SINCE_WRITE = 0
 
 
 def _fresh_feishu_cfg(sb: MemorySandbox) -> Any:
@@ -437,9 +470,9 @@ TOOLS: List[Dict[str, Any]] = [
                 "include_widgets": {
                     "type": "boolean",
                     "description": (
-                        "默认 true：额外把画板（流程图/架构图）读成文字附在正文后。"
-                        "画板内容不在正文里，关掉就完全看不到它存在。"
-                        "只想快速取正文、且确认文档没有画板时可设 false，省两次请求。"
+                        "默认 true：额外把画板（流程图/架构图）和内嵌电子表格读成文字附在正文后。"
+                        "这些内容不在正文里，关掉就完全看不到它们存在。"
+                        "只想快速取正文、且确认文档没有画板或表格时可设 false，省掉额外请求。"
                     ),
                     "default": True,
                 },
@@ -1387,6 +1420,8 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             original = (args.get("query") or "").strip()
             if not original:
                 return _tool_result("query 不能为空", is_error=True)
+            # 落库门禁：若上一轮 prepare 后没有 remember/update/delete，这里返回告警
+            sop_gate = _sop_gate_on_prepare()
             tags = args.get("tags")
             if isinstance(tags, str):
                 tags = [tags]
@@ -1435,6 +1470,8 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 has_refs=bool(refs),
                 assembled=assembled,
             )
+            if sop_gate:
+                hint = sop_gate + "\n" + hint
             payload = {
                 "original": original,
                 "assembled": assembled,
@@ -1446,6 +1483,7 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "references": refs,
                 "context_pack": context_pack,
                 "ref_threshold": ask.get("ref_threshold"),
+                "sop_gate": sop_gate,
                 "hint": hint,
             }
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1473,6 +1511,7 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             if not q or not a:
                 return _tool_result("question/answer 不能为空", is_error=True)
             msg = sb.remember(q, a, scene=scene, tags=tags, kind=kind, facts=facts)
+            _sop_gate_on_write()
             return _tool_result(msg)
 
         if name == "memory_extract":
@@ -1713,6 +1752,7 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             failed = msg.startswith(("未找到", "answer 不能为空"))
             if failed:
                 return _tool_result(msg, is_error=True)
+            _sop_gate_on_write()
             reason = (args.get("reason") or "").strip()
             # 回执带上旧答案摘要：用户能直接看出改掉了什么
             old = (before.answer or "").strip() if before else ""
@@ -1728,7 +1768,10 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 memory_id=(args.get("memory_id") or "").strip(),
                 question=(args.get("question") or "").strip(),
             )
-            return _tool_result(msg, is_error=msg.startswith(("未找到", "请提供")))
+            failed = msg.startswith(("未找到", "请提供"))
+            if not failed:
+                _sop_gate_on_write()
+            return _tool_result(msg, is_error=failed)
 
         if name == "memory_status":
             st = sb.status()

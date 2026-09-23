@@ -56,7 +56,10 @@ DEFAULT_SCOPES = (
     # 不开这项就完全读不到画板里写了什么；create 是往画板里画东西用的，
     # 建画板本身走 docx 创建块接口，不吃这项权限
     "board:whiteboard:node:read "
-    "board:whiteboard:node:create"
+    "board:whiteboard:node:create "
+    # 文档里的电子表格是独立资源，正文里只有 spreadsheetToken_sheetId。
+    # 只申请只读：查看、评论和导出电子表格。写表格不在这条链路上
+    "sheets:spreadsheet:readonly"
 )
 
 # 已被开放平台拆分、后台再也勾不到的聚合权限。请求它会让整个授权页报

@@ -12,8 +12,14 @@ from unittest import mock
 
 from core.feishu_widgets import (
     BOARD_SCOPE,
+    MAX_SHEET_COLS,
+    MAX_SHEET_ROWS,
+    SHEET_SCOPE,
     collect_widgets,
     render_board,
+    render_sheet,
+    sheet_read_bounds,
+    split_sheet_token,
     widget_appendix,
 )
 
@@ -70,10 +76,15 @@ class CollectWidgetTests(unittest.TestCase):
     def test_image_and_sheet_are_collected_for_visibility(self):
         blocks = [
             {"block_type": 27, "image": {"token": "img_1"}},
-            {"block_type": 30, "sheet": {"token": "sh_1"}},
+            {
+                "block_type": 30,
+                "sheet": {"token": "sht_1", "row_size": 12, "column_size": 4},
+            },
         ]
-        kinds = [w.kind for w in collect_widgets(blocks)]
-        self.assertEqual(kinds, ["image", "sheet"])
+        widgets = collect_widgets(blocks)
+        self.assertEqual([w.kind for w in widgets], ["image", "sheet"])
+        self.assertEqual(widgets[1].row_size, 12)
+        self.assertEqual(widgets[1].column_size, 4)
 
     def test_keeps_document_order(self):
         blocks = [
@@ -240,10 +251,56 @@ class WidgetAppendixTests(unittest.TestCase):
         self.assertEqual(out.count("同一张"), 2)
 
     def test_unsupported_widget_says_what_is_missing(self):
-        blocks = [{"block_type": 30, "sheet": {"token": "sh_1"}}]
+        blocks = [{"block_type": 18, "bitable": {"token": "bt_1"}}]
         out = widget_appendix("https://x", "tok", blocks, 3.0)
-        self.assertIn("电子表格", out)
-        self.assertIn("sheets:spreadsheet:readonly", out)
+        self.assertIn("多维表格", out)
+        self.assertIn("bitable:app:readonly", out)
+
+    def test_sheet_content_lands_in_appendix(self):
+        values = [["事件名", "参数"], ["page_show", "page_name"]]
+        blocks = [{"block_type": 30, "sheet": {"token": "sht_abc", "row_size": 2, "column_size": 2}}]
+        with mock.patch(
+            "core.feishu_widgets.read_sheet_values", return_value=(values, False)
+        ) as read:
+            out = widget_appendix("https://x", "tok", blocks, 3.0)
+        read.assert_called_once()
+        self.assertEqual(read.call_args.kwargs["row_size"], 2)
+        self.assertEqual(read.call_args.kwargs["column_size"], 2)
+        self.assertIn("1 个电子表格", out)
+        self.assertIn("| 事件名 | 参数 |", out)
+        self.assertIn("| page_show | page_name |", out)
+
+    def test_missing_sheet_scope_tells_user_what_to_enable(self):
+        err = RuntimeError("读电子表格失败: 99991672 Access denied. scope required")
+        blocks = [{"block_type": 30, "sheet": {"token": "sht_abc"}}]
+        with mock.patch("core.feishu_widgets.read_sheet_values", side_effect=err):
+            out = widget_appendix("https://x", "tok", blocks, 3.0)
+        self.assertIn(SHEET_SCOPE, out)
+        self.assertIn("开放平台", out)
+        self.assertIn("feishu_login.py", out)
+
+    def test_stale_sheet_token_says_reauthorize(self):
+        """99991679 是 token 里没有这项 scope，不是后台没勾。"""
+        err = RuntimeError('HTTP 400: {"code":99991679,"msg":"Unauthorized"}')
+        blocks = [{"block_type": 30, "sheet": {"token": "sht_abc"}}]
+        with mock.patch("core.feishu_widgets.read_sheet_values", side_effect=err):
+            out = widget_appendix("https://x", "tok", blocks, 3.0)
+        self.assertIn(SHEET_SCOPE, out)
+        self.assertIn("feishu_login.py", out)
+        self.assertNotIn("开放平台开通", out)
+
+    def test_same_sheet_read_once(self):
+        values = [["只有一次"]]
+        blocks = [
+            {"block_id": "b1", "block_type": 30, "sheet": {"token": "sht_abc"}},
+            {"block_id": "b2", "block_type": 30, "sheet": {"token": "sht_abc"}},
+        ]
+        with mock.patch(
+            "core.feishu_widgets.read_sheet_values", return_value=(values, False)
+        ) as read:
+            out = widget_appendix("https://x", "tok", blocks, 3.0)
+        self.assertEqual(read.call_count, 1)
+        self.assertEqual(out.count("只有一次"), 2)
 
     def test_appendix_is_truncated(self):
         nodes = [_shape(f"n{i}", "长" * 50, y=i) for i in range(100)]
@@ -300,6 +357,45 @@ class FetchIntegrationTests(unittest.TestCase):
         self.assertIn("列块炸了", res.content)
 
 
+class RenderSheetTests(unittest.TestCase):
+    def test_renders_pipe_table_and_drops_trailing_blanks(self):
+        out = render_sheet([["事件", "参数", ""], ["click", "id", None], [None, None, None]])
+        self.assertIn("| 事件 | 参数 |", out)
+        self.assertIn("| click | id |", out)
+        self.assertNotIn("|  |  |  |", out)
+
+    def test_flattens_rich_text_and_mentions(self):
+        cell = [{"text": "埋点"}, {"type": "mention", "text": "@张三", "name": "张三"}]
+        out = render_sheet([[cell]])
+        self.assertIn("埋点@张三", out)
+
+    def test_escapes_pipes_and_newlines(self):
+        out = render_sheet([["a|b", "两\n行"]])
+        self.assertIn(r"a\|b", out)
+        self.assertIn("两 行", out)
+        for line in out.splitlines():
+            self.assertNotIn("\n", line)
+
+    def test_empty_sheet(self):
+        self.assertEqual(render_sheet([]), "（空表格）")
+        self.assertEqual(render_sheet([[None, ""]]), "（空表格）")
+
+    def test_truncation_note(self):
+        self.assertIn("表格过大", render_sheet([["还有"]], truncated=True))
+
+    def test_split_token_uses_the_last_underscore(self):
+        self.assertEqual(split_sheet_token("sht_cn_abc_Q7PlXT"), ("sht_cn_abc", "Q7PlXT"))
+
+    def test_split_token_rejects_a_bare_token(self):
+        with self.assertRaises(ValueError):
+            split_sheet_token("shtcnOnly")
+
+    def test_bounds_cap_declared_size_and_default_when_missing(self):
+        self.assertEqual(sheet_read_bounds(0, 0), (MAX_SHEET_ROWS, MAX_SHEET_COLS))
+        self.assertEqual(sheet_read_bounds(12, 3), (12, 3))
+        self.assertEqual(sheet_read_bounds(9999, 80), (MAX_SHEET_ROWS, MAX_SHEET_COLS))
+
+
 class ScopeTests(unittest.TestCase):
     def test_board_scope_is_requested(self):
         from core.config import FeishuConfig
@@ -307,6 +403,13 @@ class ScopeTests(unittest.TestCase):
 
         merged = _merged_scopes(FeishuConfig(app_id="x", oauth_scope="wiki:node:read")).split()
         self.assertIn(BOARD_SCOPE, merged)
+
+    def test_sheet_scope_reaches_stale_configs(self):
+        from core.config import FeishuConfig
+        from core.feishu_oauth import _merged_scopes
+
+        merged = _merged_scopes(FeishuConfig(app_id="x", oauth_scope="wiki:node:read")).split()
+        self.assertIn(SHEET_SCOPE, merged)
 
 
 if __name__ == "__main__":

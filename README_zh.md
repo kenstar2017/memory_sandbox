@@ -600,13 +600,14 @@ docx 的 `raw_content` 只收文字块，但**并非所有非文字内容都会�
 | 文档小组件 add_ons（mermaid 时序图、流程图） | 40 | 源码**本来就在正文里**，直接能读到，无需额外权限 |
 | 画板 | 43 | 独立资源，正文里只有一个 token；`memory_feishu_read` 默认调画板接口读成文字附在末尾 |
 | 图片 | 27 | 只有 token，未接入 |
-| 电子表格 / 多维表格 / 思维笔记 | 30 / 18 / 29 | 只有 token，未接入 |
+| 电子表格 | 30 | 独立资源，正文里只有 `spreadsheetToken_sheetId`；读成管道表格附在末尾 |
+| 多维表格 / 思维笔记 | 18 / 29 | 只有 token，未接入 |
 
-画板会渲染成缩进的图形列表 + 连线列表（`A --是--> B`），足以还原流程走向。读不到的组件会在附录里显式写出「未读取 + 缺什么」，不会静默消失。
+画板会渲染成缩进的图形列表 + 连线列表（`A --是--> B`），足以还原流程走向。电子表格渲染成管道表格，超过 200 行或 40 列时只取前一段并注明截断。读不到的组件会在附录里显式写出「未读取 + 缺什么」，不会静默消失。
 
-`memory_feishu_read` 的 `include_widgets` 默认 `true`；只要正文、且确认没有画板时设 `false`，可省两次请求。CLI 对应 `python3 main.py feishu-read <链接> [--no-widgets]`。
+`memory_feishu_read` 的 `include_widgets` 默认 `true`；只要正文、且确认没有画板或表格时设 `false`，可省掉额外请求。CLI 对应 `python3 main.py feishu-read <链接> [--no-widgets]`。
 
-读画板需要开放平台开通「查看画板节点（`board:whiteboard:node:read`）」**并重新授权**（scope 固定在 token 里）。没开时附录里会直接提示开哪一项。
+读画板需要开放平台开通「查看画板节点（`board:whiteboard:node:read`）」**并重新授权**（scope 固定在 token 里）。读内嵌电子表格需要「查看、评论和导出电子表格（`sheets:spreadsheet:readonly`）」，同样要重新授权。没开时附录里会直接提示开哪一项。
 
 > 加权限的顺序不能反：先在开放平台开通，再 `python3 scripts/feishu_login.py`。反过来会让授权页整体报 20027 —— 请求了应用没开通的 scope，整次授权都失败，不只是那一项拿不到。
 

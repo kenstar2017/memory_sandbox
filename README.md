@@ -582,15 +582,17 @@ Not everything outside the text blocks is lost. Measured on a real 828-block des
 of `add_ons` widgets (block type 40 — mermaid sequence diagrams and the like) **already rides along
 in `raw_content`**, so it needs no extra call. Whiteboards (43), images (27), spreadsheets (30),
 bitables (18) and mindnotes (29) are separate resources whose block only carries a token. Of those,
-whiteboards are now read: `memory_feishu_read` defaults to `include_widgets=true` and appends an
-appendix rendering each board as an indented shape list plus its connectors (`A --yes--> B`). The
-rest are listed with an explicit "not read, here is what's missing" line rather than vanishing
+whiteboards and embedded spreadsheets are now read: `memory_feishu_read` defaults to
+`include_widgets=true` and appends an appendix. A board becomes an indented shape list plus its
+connectors (`A --yes--> B`); a spreadsheet becomes a pipe table. Images, bitables and mindnotes are
+still listed with an explicit "not read, here is what's missing" line rather than vanishing
 silently. Set `include_widgets=false` (CLI: `python3 main.py feishu-read <URL> --no-widgets`) to skip
-the two extra requests when you only want the body.
+the extra requests when you only want the body.
 
-Reading boards requires the `board:whiteboard:node:read` scope. Enable it in the Open Platform
-console **before** re-running `scripts/feishu_login.py` — requesting a scope the app has not enabled
-fails the whole authorization with 20027, not just that one scope.
+Reading boards requires the `board:whiteboard:node:read` scope. Reading an embedded spreadsheet
+requires `sheets:spreadsheet:readonly`. Enable each scope in the Open Platform console **before**
+re-running `scripts/feishu_login.py` — requesting a scope the app has not enabled fails the whole
+authorization with 20027, not just that one scope.
 
 On every write tool `confirmed` is **required and must be `true`** —
 omitting it or passing `false` fails immediately without issuing a single request, the same gate the

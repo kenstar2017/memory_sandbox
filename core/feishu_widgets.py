@@ -5,8 +5,8 @@ docx 的 raw_content 只收文字块。实测（828 块的真实技术方案文�
 - 画板 board、图片 image、电子表格 sheet 这些块在正文里没有任何痕迹，
   载荷里只留一个 token，内容是另一份独立资源。
 
-这里负责把「另一份资源」捞回来拼成文字附录。目前只有画板真读，其余给出显式
-占位——让调用方知道「这里有东西没读到」，比静默丢掉强得多。
+这里负责把「另一份资源」捞回来拼成文字附录。画板和电子表格会真读，其余给出
+显式占位——让调用方知道「这里有东西没读到」，比静默丢掉强得多。
 """
 
 from __future__ import annotations
@@ -36,16 +36,20 @@ _WIDGET_KINDS: Dict[int, Tuple[str, str]] = {
 
 # 读不到内容时的说明。写清「缺什么」，用户才知道下一步该开什么权限
 _NOT_SUPPORTED = {
-    "sheet": "内容需调用电子表格接口（sheets:spreadsheet:readonly），暂未接入",
     "bitable": "内容需调用多维表格接口（bitable:app:readonly），暂未接入",
     "mindnote": "思维笔记暂无开放读取接口",
     "image": "图片内容需下载媒体文件后做 OCR，暂未接入",
 }
 
 BOARD_SCOPE = "board:whiteboard:node:read"
+SHEET_SCOPE = "sheets:spreadsheet:read"
 
 # 单个画板最多列这么多图形。画板可以有上千节点，全塞进正文会挤爆上下文
 MAX_NODES_PER_BOARD = 200
+# 电子表格按单元格范围读取。开放平台对 sheetId!A1:Z9 这种范围最多 100 列，
+# 这里再收一档，避免一张大表把附录撑爆
+MAX_SHEET_ROWS = 200
+MAX_SHEET_COLS = 40
 
 
 @dataclass
@@ -57,6 +61,17 @@ class WidgetRef:
     kind: str
     label: str
     token: str
+    # 电子表格块自带行列数；0 表示载荷里没有，读取时用上限兜底
+    row_size: int = 0
+    column_size: int = 0
+
+
+def _as_int(value: object) -> int:
+    try:
+        n = int(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return 0
+    return n if n > 0 else 0
 
 
 def collect_widgets(blocks: Sequence[dict]) -> List[WidgetRef]:
@@ -75,7 +90,12 @@ def collect_widgets(blocks: Sequence[dict]) -> List[WidgetRef]:
             for k, v in b.items():
                 if isinstance(v, dict) and v.get("token"):
                     token = str(v["token"])
+                    payload = v
                     break
+        row_size = column_size = 0
+        if kind == "sheet" and isinstance(payload, dict):
+            row_size = _as_int(payload.get("row_size"))
+            column_size = _as_int(payload.get("column_size"))
         out.append(
             WidgetRef(
                 block_id=str(b.get("block_id") or ""),
@@ -83,6 +103,8 @@ def collect_widgets(blocks: Sequence[dict]) -> List[WidgetRef]:
                 kind=kind,
                 label=label,
                 token=token,
+                row_size=row_size,
+                column_size=column_size,
             )
         )
     return out
@@ -240,6 +262,160 @@ def read_board_nodes(
     return list((data.get("data") or {}).get("nodes") or [])
 
 
+def _col_letter(n: int) -> str:
+    """1 -> A，26 -> Z，27 -> AA。"""
+    if n <= 0:
+        raise ValueError(f"列号必须从 1 开始: {n}")
+    letters = ""
+    while n:
+        n, rem = divmod(n - 1, 26)
+        letters = chr(65 + rem) + letters
+    return letters
+
+
+def split_sheet_token(token: str) -> Tuple[str, str]:
+    """块载荷里的 token 是 spreadsheetToken_sheetId，sheetId 在最后一个下划线后。"""
+    raw = (token or "").strip()
+    spreadsheet_token, sep, sheet_id = raw.rpartition("_")
+    if not sep or not spreadsheet_token or not sheet_id:
+        raise ValueError("电子表格 token 不是 spreadsheetToken_sheetId")
+    return spreadsheet_token, sheet_id
+
+
+def sheet_read_bounds(row_size: int, column_size: int) -> Tuple[int, int]:
+    """没给行列数时按上限读；给了就读到表的边界，但不超过上限。"""
+    rows = row_size if row_size > 0 else MAX_SHEET_ROWS
+    cols = column_size if column_size > 0 else MAX_SHEET_COLS
+    return min(rows, MAX_SHEET_ROWS), min(cols, MAX_SHEET_COLS)
+
+
+def sheet_was_truncated(
+    values: Sequence[Sequence[object]],
+    row_size: int,
+    column_size: int,
+) -> bool:
+    """声明的表比上限大，或未知尺寸时结果顶满了上限，都算没读全。"""
+    if row_size > MAX_SHEET_ROWS or column_size > MAX_SHEET_COLS:
+        return True
+    if row_size <= 0 and len(values or []) >= MAX_SHEET_ROWS:
+        return True
+    if column_size <= 0 and any(len(row or []) >= MAX_SHEET_COLS for row in values or []):
+        return True
+    return False
+
+
+def _cell_text(value: object) -> str:
+    """单元格收成一行。ToString 之后多数已是字符串，富文本和 @人 仍可能是结构。"""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "TRUE" if value else "FALSE"
+    if isinstance(value, int):
+        return str(value)
+    if isinstance(value, float):
+        return str(int(value)) if value.is_integer() else str(value)
+    if isinstance(value, str):
+        return _one_line(value)
+    if isinstance(value, dict):
+        for key in ("text", "name", "link"):
+            if value.get(key):
+                return _one_line(str(value[key]))
+        return _one_line(str(value))
+    if isinstance(value, list):
+        return _one_line("".join(_cell_text(item) for item in value))
+    return _one_line(str(value))
+
+
+def render_sheet(
+    values: Sequence[Sequence[object]],
+    *,
+    truncated: bool = False,
+) -> str:
+    """把二维单元格渲染成管道表格，丢掉尾部空行空列。"""
+    rows: List[List[str]] = []
+    for row in values or []:
+        rows.append([_cell_text(cell) for cell in (row or [])])
+    while rows and not any(rows[-1]):
+        rows.pop()
+    if not rows:
+        return "（空表格）"
+    width = max(len(row) for row in rows)
+    while width > 0 and all(len(row) < width or not row[width - 1] for row in rows):
+        width -= 1
+    if width <= 0:
+        return "（空表格）"
+
+    def line(row: Sequence[str]) -> str:
+        padded = list(row[:width]) + [""] * (width - len(row))
+        cells = [cell.replace("|", "\\|") for cell in padded]
+        return "| " + " | ".join(cells) + " |"
+
+    out = [line(rows[0]), "| " + " | ".join("---" for _ in range(width)) + " |"]
+    out.extend(line(row) for row in rows[1:])
+    if truncated:
+        out.append(f"（表格过大，只读取前 {MAX_SHEET_ROWS} 行、{MAX_SHEET_COLS} 列）")
+    return "\n".join(out)
+
+
+def read_sheet_values(
+    api_base: str,
+    access_token: str,
+    token: str,
+    timeout: float,
+    *,
+    row_size: int = 0,
+    column_size: int = 0,
+) -> Tuple[List[list], bool]:
+    """读一张内嵌电子表格。返回 (单元格二维数组, 是否因上限截断)。"""
+    from .feishu import _http_json
+
+    spreadsheet_token, sheet_id = split_sheet_token(token)
+    rows, cols = sheet_read_bounds(row_size, column_size)
+    cell_range = f"{sheet_id}!A1:{_col_letter(cols)}{rows}"
+    path_token = urllib.parse.quote(spreadsheet_token, safe="")
+    path_range = urllib.parse.quote(cell_range, safe="")
+    query = urllib.parse.urlencode(
+        {
+            "valueRenderOption": "ToString",
+            "dateTimeRenderOption": "FormattedString",
+        }
+    )
+    url = (
+        f"{api_base}/open-apis/sheets/v2/spreadsheets/"
+        f"{path_token}/values/{path_range}?{query}"
+    )
+    data = _http_json(
+        "GET",
+        url,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=timeout,
+    )
+    if data.get("code") != 0:
+        raise RuntimeError(f"读电子表格失败: {data.get('code')} {data.get('msg') or data}")
+    values = list(((data.get("data") or {}).get("valueRange") or {}).get("values") or [])
+    return values, sheet_was_truncated(values, row_size, column_size)
+
+
+def _sheet_error_hint(err: str) -> str:
+    """把电子表格读取的报错翻译成「下一步做什么」。"""
+    low = err.lower()
+    if "99991679" in err:
+        # 实测原话是 Unauthorized：后台往往已经勾了，缺的是重新授权。
+        # scope 在授权那一刻固定进 token，之后勾多少项都不会追加，refresh 也只沿用旧的
+        return (
+            f"当前 token 里没有「{SHEET_SCOPE}」，"
+            "scope 是授权时固定在 token 里的：重跑 python3 scripts/feishu_login.py 重新授权即可"
+        )
+    if "99991672" in err or "20027" in err or "permission" in low or "scope" in low:
+        return (
+            f"应用缺少电子表格读权限：请在开放平台开通「查看电子表格（{SHEET_SCOPE}）」，"
+            "再运行 python3 scripts/feishu_login.py 重新授权"
+        )
+    if "forbidden" in low or "1310213" in err or "1310202" in err or "131006" in err:
+        return "当前身份没有这个电子表格的阅读权限，或表格 token 无效"
+    return err
+
+
 def _board_error_hint(err: str) -> str:
     """把画板读取的报错翻译成「下一步做什么」。"""
     low = err.lower()
@@ -282,22 +458,36 @@ def widget_appendix(
     for w in widgets:
         seq[w.kind] = seq.get(w.kind, 0) + 1
         head = f"── {w.label} {seq[w.kind]} ──"
-        if w.kind != "board":
+        if w.kind not in ("board", "sheet"):
             chunks.append(f"{head}\n（未读取：{_NOT_SUPPORTED.get(w.kind, '暂不支持')}）")
             continue
         if not w.token:
-            chunks.append(f"{head}\n（未读取：块里没有画板 token）")
+            missing = "画板" if w.kind == "board" else "电子表格"
+            chunks.append(f"{head}\n（未读取：块里没有{missing} token）")
             continue
-        if w.token in cache:  # 同一画板被插入多次时不重复请求
-            chunks.append(f"{head}\n{cache[w.token]}")
+        cache_key = f"{w.kind}:{w.token}"
+        if cache_key in cache:  # 同一组件被插入多次时不重复请求
+            chunks.append(f"{head}\n{cache[cache_key]}")
             continue
         try:
-            body = render_board(
-                read_board_nodes(api_base, access_token, w.token, timeout)
-            )
+            if w.kind == "board":
+                body = render_board(
+                    read_board_nodes(api_base, access_token, w.token, timeout)
+                )
+            else:
+                values, truncated = read_sheet_values(
+                    api_base,
+                    access_token,
+                    w.token,
+                    timeout,
+                    row_size=w.row_size,
+                    column_size=w.column_size,
+                )
+                body = render_sheet(values, truncated=truncated)
         except Exception as e:  # noqa: BLE001
-            body = f"（读取失败：{_board_error_hint(str(e))}）"
-        cache[w.token] = body
+            hint = _board_error_hint if w.kind == "board" else _sheet_error_hint
+            body = f"（读取失败：{hint(str(e))}）"
+        cache[cache_key] = body
         chunks.append(f"{head}\n{body}")
 
     text = "\n\n".join(chunks)

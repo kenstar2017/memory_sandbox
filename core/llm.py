@@ -6,6 +6,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 import time
 import urllib.error
 import urllib.request
@@ -15,6 +16,96 @@ from typing import Any, Callable, Dict, List, Optional
 from .config import LLMConfig
 
 ProgressCallback = Callable[[str], None]
+
+# provider 别名：build_llm 与各处 describe 共用，避免多处硬编码字符串集合
+CURSOR_PROVIDERS = {"cursor", "cursor_cloud", "cursor-agent"}
+TRAE_PROVIDERS = {"trae", "trae_cli", "trae-cli", "traecli", "coco"}
+
+# 规范名 → 界面标签。界面下拉直接渲染这里的内容，避免前端再写一份标签跟着漂。
+# 顶栏那个下拉挤在主题和几个按钮中间，标签一律短写，语义靠 title 提示补
+PROVIDER_LABELS = {
+    "cursor": "Cursor Agent",
+    "trae": "Trae CLI",
+    "cursor_cloud": "Cursor Cloud",
+    "openai_compatible": "OpenAI 网关",
+    "mock": "离线占位",
+}
+
+# 界面下拉里给出的切换项；cursor_cloud / openai_compatible 需要额外配密钥或网关，
+# 不摆在导航里，但仍可在 config 里写、也仍能通过接口切
+PROVIDER_CHOICES = ("cursor", "trae", "mock")
+
+
+def normalize_llm_provider(value: str) -> str:
+    """把别名规范成 build_llm 认的名字；未知名字当场报错，别等回退那一刻才炸。"""
+    v = (value or "").strip().lower()
+    if not v:
+        raise ValueError("provider 不能为空")
+    if v in TRAE_PROVIDERS:
+        return "trae"
+    if v == "cursor_cloud":
+        return "cursor_cloud"
+    if v in CURSOR_PROVIDERS:
+        return "cursor"
+    if v in {"openai", "openai_compatible"}:
+        return "openai_compatible"
+    if v == "mock":
+        return "mock"
+    raise ValueError(f"未知 llm.provider: {value}")
+
+
+def provider_label(value: str) -> str:
+    try:
+        name = normalize_llm_provider(value)
+    except ValueError:
+        return value or "未设置"
+    return PROVIDER_LABELS.get(name, name)
+
+
+def llm_provider_options(current: str = "") -> List[Dict[str, str]]:
+    """界面下拉选项。当前 provider 不在常规选项里（如配了 OpenAI 网关）时补进去，
+    否则下拉会显示成别的值，让人以为已经切走了。"""
+    options = [{"value": v, "label": PROVIDER_LABELS[v]} for v in PROVIDER_CHOICES]
+    try:
+        name = normalize_llm_provider(current)
+    except ValueError:
+        return options
+    if name not in PROVIDER_CHOICES:
+        options.insert(0, {"value": name, "label": PROVIDER_LABELS.get(name, name)})
+    return options
+
+# 记忆沙箱回退 Agent：禁止推远程；推送由用户本机自行决定
+_GIT_BAN = (
+    "【硬性约束】禁止执行任何 git push / git push --force / gh pr create 等推送或发布远程操作；"
+    "禁止要求用户登录 GitHub 来替你完成推送。"
+    "若只需同步远程，用一句话提示用户自行在本机终端 push，不要代为执行。"
+    "本地 git status / diff / log 只读查询可以。"
+)
+
+
+def is_read_only_agent_mode(agent_mode: str) -> bool:
+    return (agent_mode or "").strip().lower() in {"ask", "plan"}
+
+
+def build_local_agent_prompt(agent_mode: str, prompt: str, context: str = "") -> str:
+    """本机 Agent CLI（Cursor / Trae）共用的提示词。"""
+    if is_read_only_agent_mode(agent_mode):
+        text = (
+            "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
+            "简洁、可落地。当前为只读/规划模式：不要修改文件、不要开 PR、不要 commit。\n"
+            f"{_GIT_BAN}\n\n"
+        )
+    else:
+        text = (
+            "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
+            "简洁、可落地。当前为 Agent 全工具模式：可按需改本地文件；"
+            "不要自动 git commit，除非用户明确要求提交。\n"
+            f"{_GIT_BAN}\n\n"
+        )
+    if context:
+        text += f"近期上下文:\n{context}\n\n"
+    text += f"用户问题:\n{prompt}"
+    return text
 
 
 def _emit(on_progress: Optional[ProgressCallback], message: str) -> None:
@@ -367,29 +458,7 @@ class CursorLocalAgentLLM(BaseLLM):
         if not os.path.isdir(self.cwd):
             return f"[LLM Error] workspace 目录不存在: {self.cwd}"
 
-        # 记忆沙箱回退 Agent：禁止推远程；推送由用户本机自行决定
-        git_ban = (
-            "【硬性约束】禁止执行任何 git push / git push --force / gh pr create 等推送或发布远程操作；"
-            "禁止要求用户登录 GitHub 来替你完成推送。"
-            "若只需同步远程，用一句话提示用户自行在本机终端 push，不要代为执行。"
-            "本地 git status / diff / log 只读查询可以。"
-        )
-        if agent_mode in {"ask", "plan"}:
-            text = (
-                "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
-                "简洁、可落地。当前为只读/规划模式：不要修改文件、不要开 PR、不要 commit。\n"
-                f"{git_ban}\n\n"
-            )
-        else:
-            text = (
-                "你是开发助手。请基于当前工作区磁盘上的真实文件回答；"
-                "简洁、可落地。当前为 Agent 全工具模式：可按需改本地文件；"
-                "不要自动 git commit，除非用户明确要求提交。\n"
-                f"{git_ban}\n\n"
-            )
-        if context:
-            text += f"近期上下文:\n{context}\n\n"
-        text += f"用户问题:\n{prompt}"
+        text = build_local_agent_prompt(agent_mode, prompt, context)
 
         cmd: List[str] = [
             self.agent_bin,
@@ -525,6 +594,262 @@ class CursorLocalAgentLLM(BaseLLM):
         return out
 
 
+TRAE_BIN_NAMES = ("coco", "traecli", "traex")
+
+
+def resolve_trae_bin(config: LLMConfig) -> Optional[str]:
+    """解析本机 Trae CLI 路径（coco 通常是 traex 的软链）。
+
+    与 resolve_agent_bin 同理：GUI 启动时 ~/.local/bin 常不在 PATH 里，需要显式探测。
+    """
+    explicit = (config.trae_bin or "").strip()
+    if explicit:
+        return explicit
+    for name in TRAE_BIN_NAMES:
+        found = shutil.which(name)
+        if found:
+            return found
+    home = os.path.expanduser("~")
+    prefixes = (
+        os.path.join(home, ".local", "bin"),
+        "/usr/local/bin",
+        "/opt/homebrew/bin",
+    )
+    for prefix in prefixes:
+        for name in TRAE_BIN_NAMES:
+            path = os.path.join(prefix, name)
+            if os.path.isfile(path) and os.access(path, os.X_OK):
+                return path
+    return None
+
+
+def describe_trae_llm(config: LLMConfig) -> str:
+    """供 CLI 启动时展示回退目标。"""
+    from .config import agent_ui_mode_from_config
+
+    cwd = resolve_llm_cwd(config)
+    mode = agent_ui_mode_from_config(config)
+    bin_path = resolve_trae_bin(config)
+    bin_hint = os.path.basename(bin_path) if bin_path else "未找到"
+    return f"trae/local workspace={cwd} mode={mode} bin={bin_hint}"
+
+
+def build_trae_cmd(
+    bin_path: str,
+    prompt_text: str,
+    cwd: str,
+    agent_mode: str,
+    model: str = "",
+    last_message_file: str = "",
+) -> List[str]:
+    """拼 `traecli exec` 命令行。
+
+    注意 Trae CLI 与 Cursor agent 的差异（照抄 Cursor 那套会静默跑错）：
+    - 非交互是 `exec` 子命令；`-p` 在 traecli 里是 `--profile`，不是 prompt
+    - 工作目录用 `-C/--cd`，没有 `--workspace`
+    - 只读/可写由 `-s/--sandbox` 控制，而不是 `--mode` + `--force`
+    - prompt 是位置参数，必须放在所有选项之后
+    """
+    cmd = [
+        bin_path,
+        "exec",
+        "--color",
+        "never",
+        # 回退问答的 cwd 常是 ~/Documents 这类非 git 目录，不跳过检查会直接退出
+        "--skip-git-repo-check",
+        # 一次性问答，不必留会话文件
+        "--ephemeral",
+        "-C",
+        cwd,
+        "-s",
+        "read-only" if is_read_only_agent_mode(agent_mode) else "workspace-write",
+    ]
+    if model:
+        cmd.extend(["-m", model])
+    if last_message_file:
+        # stdout 混着进度与工具日志，终答单独落文件最干净（也不必解析 --json 的 JSONL）
+        cmd.extend(["-o", last_message_file])
+    cmd.append(prompt_text)
+    return cmd
+
+
+class TraeLocalAgentLLM(BaseLLM):
+    """
+    通过本机 Trae CLI（coco / traecli）的 exec 子命令读本地盘。
+    Cursor 额度用完时的替代回退：Trae 走自己的登录态（coco login），不吃 Cursor 配额。
+    """
+
+    def __init__(self, config: LLMConfig):
+        self.config = config
+        self.model = (config.model or os.getenv("TRAE_MODEL", "")).strip()
+        self.cwd = resolve_llm_cwd(config)
+        self.timeout = int(config.timeout or 600)
+        self.trae_bin = resolve_trae_bin(config)
+
+    def generate(
+        self,
+        prompt: str,
+        context: str = "",
+        on_progress: Optional[ProgressCallback] = None,
+    ) -> str:
+        # 每次从 config 读，支持运行时切 ask/agent 与工作目录
+        agent_mode = (self.config.agent_mode or "").strip().lower()
+        self.cwd = resolve_llm_cwd(self.config)
+        self.trae_bin = resolve_trae_bin(self.config) or self.trae_bin
+        self.timeout = int(self.config.timeout or self.timeout or 600)
+        self.model = (self.config.model or self.model or "").strip()
+
+        if not self.trae_bin:
+            return (
+                "[LLM Error] 未找到本机 Trae CLI（coco / traecli / traex）。\n"
+                "请安装 TraeCode CLI 并确保在 PATH 中，或在 config 设置 llm.trae_bin。"
+            )
+        if not os.path.isdir(self.cwd):
+            return f"[LLM Error] workspace 目录不存在: {self.cwd}"
+
+        text = build_local_agent_prompt(agent_mode, prompt, context)
+        mode_hint = "read-only" if is_read_only_agent_mode(agent_mode) else "workspace-write"
+        _emit(
+            on_progress,
+            f"Trae Local Agent：workspace={self.cwd} sandbox={mode_hint}"
+            f" model={self.model or '默认'} timeout={self.timeout}s…",
+        )
+
+        fd, last_msg_path = tempfile.mkstemp(prefix="memory-sandbox-trae-", suffix=".txt")
+        os.close(fd)
+        cmd = build_trae_cmd(
+            self.trae_bin,
+            text,
+            self.cwd,
+            agent_mode,
+            model=self.model,
+            last_message_file=last_msg_path,
+        )
+        env = os.environ.copy()
+        # 同 Cursor 分支：告诉用户级 hook 这是沙箱自己拉起的嵌套 agent，两侧门禁都别管它
+        env["MEMORY_SANDBOX_NESTED"] = "1"
+
+        t0 = time.time()
+        try:
+            code, out, err, timed_out = _run_cli_capture(cmd, self.cwd, env, self.timeout)
+        except FileNotFoundError:
+            os.unlink(last_msg_path)
+            return f"[LLM Error] 无法执行 Trae CLI：{self.trae_bin}"
+        except Exception as e:
+            os.unlink(last_msg_path)
+            return (
+                f"[LLM Error] Trae Local Agent 启动失败: {type(e).__name__}: {e}\n"
+                f"trae_bin={self.trae_bin}\nworkspace={self.cwd}"
+            )
+
+        elapsed = time.time() - t0
+        try:
+            with open(last_msg_path, "r", encoding="utf-8") as f:
+                answer = f.read().strip()
+        except Exception:
+            answer = ""
+        finally:
+            try:
+                os.unlink(last_msg_path)
+            except Exception:
+                pass
+
+        if timed_out:
+            _emit(on_progress, "Trae Local Agent：已超时并暴露诊断信息")
+            lines = [
+                f"[LLM Error] Trae Local Agent 超时（>{self.timeout}s，实际约 {elapsed:.0f}s）",
+                f"workspace={self.cwd}",
+                f"trae_bin={self.trae_bin}",
+                f"sandbox={mode_hint}",
+                "说明：Agent 在时限内未结束。常见原因：任务过重、外网/登录很慢、timeout 过短。",
+                "处理：在用户 config 提高 llm.timeout（如 900）；llm.cwd 设为项目目录。",
+            ]
+            if answer:
+                lines.append("—— 已写出的部分终答 ——\n" + answer[:2000])
+            if err:
+                lines.append("—— stderr ——\n" + err[:2000])
+            return "\n".join(lines)
+
+        if code != 0:
+            detail = (err or out or "（无输出）")[:2000]
+            return (
+                f"[LLM Error] Trae Local Agent 失败（{elapsed:.0f}s）\n"
+                f"returncode={code}\n"
+                f"workspace={self.cwd}\n"
+                f"trae_bin={self.trae_bin}\n"
+                f"sandbox={mode_hint}\n"
+                "若提示未登录/鉴权失败，先在终端跑一次 coco login。\n"
+                f"—— stderr/stdout ——\n{detail}"
+            )
+
+        if not answer:
+            # 极少数情况下 -o 没落盘（如模型只调工具没给终答），退回 stdout
+            answer = (out or "").strip()
+        if not answer:
+            return (
+                f"[LLM Error] Trae Local Agent 无输出（{elapsed:.0f}s）\n"
+                f"returncode={code}\n"
+                f"workspace={self.cwd}\n"
+                f"—— stderr ——\n{(err or '（空）')[:1500]}"
+            )
+        _emit(on_progress, f"Trae Local Agent：完成（{elapsed:.0f}s）")
+        return answer
+
+
+def _run_cli_capture(
+    cmd: List[str],
+    cwd: str,
+    env: Dict[str, str],
+    timeout: int,
+) -> "tuple[int, str, str, bool]":
+    """跑子进程并捕获输出；超时则 kill 并尽量取回已缓冲的内容。
+
+    返回 (returncode, stdout, stderr, timed_out)。
+    """
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        cwd=cwd,
+        env=env,
+    )
+    try:
+        out, err = proc.communicate(timeout=max(30, timeout))
+        return proc.returncode, (out or "").strip(), (err or "").strip(), False
+    except subprocess.TimeoutExpired as e:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            out2, err2 = proc.communicate(timeout=5)
+        except Exception:
+            out2, err2 = "", ""
+        partial_out = e.stdout if isinstance(getattr(e, "stdout", None), str) else ""
+        partial_err = e.stderr if isinstance(getattr(e, "stderr", None), str) else ""
+        return (
+            proc.returncode,
+            (partial_out or out2 or "").strip(),
+            (partial_err or err2 or "").strip(),
+            True,
+        )
+
+
+def describe_llm_target(config: LLMConfig, include_runtime: bool = False) -> str:
+    """各 provider 的统一展示口径，供 CLI banner 与沙箱进度提示共用。"""
+    provider = (config.provider or "").lower().strip()
+    if provider in CURSOR_PROVIDERS:
+        return describe_cursor_llm(config)
+    if provider in TRAE_PROVIDERS:
+        return describe_trae_llm(config)
+    hint = f"provider={config.provider or 'llm'}"
+    runtime = (config.runtime or "").strip()
+    if include_runtime and runtime:
+        hint += f" runtime={runtime}"
+    return hint
+
+
 def build_llm(config: LLMConfig) -> Optional[BaseLLM]:
     if not config.enabled:
         return None
@@ -533,7 +858,10 @@ def build_llm(config: LLMConfig) -> Optional[BaseLLM]:
         return MockLLM()
     if provider in {"openai", "openai_compatible"}:
         return OpenAICompatibleLLM(config)
-    if provider in {"cursor", "cursor_cloud", "cursor-agent"}:
+    if provider in TRAE_PROVIDERS:
+        # Trae 只有本机 CLI 这一条路（无 Cloud REST），找不到二进制时在 generate 报错
+        return TraeLocalAgentLLM(config)
+    if provider in CURSOR_PROVIDERS:
         runtime = (config.runtime or "local").lower().strip()
         # 显式 cloud provider 名或 runtime=cloud → 无仓库 Cloud REST
         if provider == "cursor_cloud" or runtime == "cloud":

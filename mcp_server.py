@@ -23,7 +23,26 @@ from core.utils import assemble_long_term_query
 
 PROTOCOL_VERSION = "2024-11-05"
 SERVER_NAME = "memory-sandbox"
-SERVER_VERSION = "0.1.12"
+SERVER_VERSION = "0.1.14"
+
+# 通过 MCP initialize.instructions 下发给「任何」接入本服务的 AI 工具（Cursor / Trae /
+# Claude / 自研 agent 等）的强制工作流。MCP 没有服务端主动推送系统提示词的通道，
+# instructions + tools/list 的工具描述是对所有客户端通用、客户端会原样喂给模型的唯二落点，
+# 因此规则必须写在这里而不是只写在某个宿主的规则文件里。
+SERVER_INSTRUCTIONS = (
+    "你已接入「记忆沙箱」MCP 服务。以下为强制工作流（SOP），适用于任何 AI 工具 / 宿主，"
+    "不受你自带的产品知识、技能或系统提示影响：\n"
+    "1. 【每轮必先 prepare】每一轮处理用户请求时，第一个工具调用必须是 memory_prepare，"
+    "query 传用户当轮原话。无例外：编码、排障、命令、产品/常识问答、闲聊、翻译等所有话题都要先调；"
+    "不得因为「这是常识」「这是产品问题」「本轮不写记忆」而跳过。\n"
+    "2. 【唯一豁免】仅当本轮调用本身就是记忆/MCP 管理操作时可省略 prepare，"
+    "例如 memory_status、memory_list、备份/导出/导入、memory_forget/delete、知识库列表等只读或运维动作。\n"
+    "3. 【收尾必 remember】任务完成、得到可复用结论后，结束前必须调用 memory_remember 固化"
+    "（启动命令、环境坑、路径、配置、团队约定、决策结论等）；发现某条旧记忆过时用 memory_update 修正，"
+    "不要另写一条造成新旧打架。\n"
+    "4. 【仓库为准】memory_prepare 返回的 references/context_pack 仅作参考；改代码、做功能时一律以仓库现状为准，"
+    "参考与现状矛盾时以现状为准并按第 3 条更新记忆。"
+)
 
 # 懒加载：initialize / tools/list 不触盘，避免多窗口 createClient 卡在启动
 _SANDBOX: Optional[MemorySandbox] = None
@@ -42,6 +61,39 @@ def _sandbox() -> MemorySandbox:
     if _SANDBOX is None:
         _SANDBOX = _build_sandbox()
     return _SANDBOX
+
+
+# ---- 落库门禁（进程内软状态）----------------------------------------------------
+# Trae 等宿主不回灌 MCP initialize.instructions、也没有 Cursor 那样的 stop hook，
+# 服务端没有主动推送通道；「上一轮问答没写进长时记忆」之后，唯一还能触达模型的
+# 机会是下一轮 memory_prepare 的返回内容。于是在这里记账：
+# prepare +1，memory_remember / memory_update / memory_delete 成功后清零；
+# 下一轮 prepare 时若计数 >=1，就在返回里带 sop_gate 告警（等价 Cursor 的落库兜底）。
+# 注意：状态是进程级（一个客户端窗口一个 MCP 进程），同窗口多会话共享计数，
+# 进程重启清零；模型若整轮完全不调记忆工具，服务端无法强制，只能靠宿主侧规则。
+_PREPARES_SINCE_WRITE = 0
+
+
+def _sop_gate_on_prepare() -> str:
+    """memory_prepare 记账；若之前有 prepare 未伴随落库，返回门禁提醒文案。"""
+    global _PREPARES_SINCE_WRITE
+    missed = _PREPARES_SINCE_WRITE
+    _PREPARES_SINCE_WRITE = missed + 1
+    if missed <= 0:
+        return ""
+    return (
+        f"⚠️【记忆沙箱·落库门禁】检测到之前已有 {missed} 轮对话调过 memory_prepare，"
+        "但结束时没有 memory_remember / memory_update，问答未写入长时记忆。"
+        "本轮收尾前必须落库：有可复用结论（启动命令、环境坑、路径、配置、约定、决策）"
+        "→ memory_remember；旧记忆说法被现状推翻 → memory_update（不要另写新条目）；"
+        "只有确认本轮无任何可沉淀内容才可跳过。"
+    )
+
+
+def _sop_gate_on_write() -> None:
+    """memory_remember / memory_update / memory_delete 成功后清零记账。"""
+    global _PREPARES_SINCE_WRITE
+    _PREPARES_SINCE_WRITE = 0
 
 
 def _fresh_feishu_cfg(sb: MemorySandbox) -> Any:
@@ -72,11 +124,16 @@ TOOLS: List[Dict[str, Any]] = [
     {
         "name": "memory_prepare",
         "description": (
-            "每轮对话的首选入口：把用户问题拼成「xxxx，记录到长期记忆。」并只检索本地三级记忆"
-            "（感觉/工作/长时），绝不调用记忆沙箱内的 LLM。"
+            "【强制 SOP·每轮必调】处理任何用户请求时，这必须是你调用的第一个记忆工具，"
+            "且每一轮都要调（把用户问题拼成「xxxx，记录到长期记忆。」）。"
+            "无话题例外：编码、排障、跑命令、产品/常识问答、闲聊、翻译等一律先调，"
+            "不得因为「这是常识」「这是产品问题」「本轮不打算写记忆」或已用了其他技能/知识库而跳过。"
+            "本工具只检索本地三级记忆（感觉/工作/长时），绝不调用记忆沙箱内的 LLM，"
             "始终返回 references/context_pack（多条软召回参考问答）供结合当前项目上下文使用；"
-            "hit_local=true 时另有 answer。改代码/做功能时以仓库为准、沙箱仅作参考；"
-            "结束后 memory_remember。纯管理指令可跳过本工具。"
+            "hit_local=true 时另有 answer。改代码/做功能时以仓库现状为准、沙箱仅作参考；"
+            "任务结束、有可复用结论时必须再调 memory_remember 固化。"
+            "唯一豁免：本轮调用本身就是记忆/MCP 管理动作"
+            "（memory_status / memory_list / 备份导出导入 / forget·delete / 知识库列表等运维只读操作）。"
         ),
         "inputSchema": {
             "type": "object",
@@ -413,9 +470,9 @@ TOOLS: List[Dict[str, Any]] = [
                 "include_widgets": {
                     "type": "boolean",
                     "description": (
-                        "默认 true：额外把画板（流程图/架构图）读成文字附在正文后。"
-                        "画板内容不在正文里，关掉就完全看不到它存在。"
-                        "只想快速取正文、且确认文档没有画板时可设 false，省两次请求。"
+                        "默认 true：额外把画板（流程图/架构图）和内嵌电子表格读成文字附在正文后。"
+                        "这些内容不在正文里，关掉就完全看不到它们存在。"
+                        "只想快速取正文、且确认文档没有画板或表格时可设 false，省掉额外请求。"
                     ),
                     "default": True,
                 },
@@ -1363,6 +1420,8 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             original = (args.get("query") or "").strip()
             if not original:
                 return _tool_result("query 不能为空", is_error=True)
+            # 落库门禁：若上一轮 prepare 后没有 remember/update/delete，这里返回告警
+            sop_gate = _sop_gate_on_prepare()
             tags = args.get("tags")
             if isinstance(tags, str):
                 tags = [tags]
@@ -1411,6 +1470,8 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 has_refs=bool(refs),
                 assembled=assembled,
             )
+            if sop_gate:
+                hint = sop_gate + "\n" + hint
             payload = {
                 "original": original,
                 "assembled": assembled,
@@ -1422,6 +1483,7 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 "references": refs,
                 "context_pack": context_pack,
                 "ref_threshold": ask.get("ref_threshold"),
+                "sop_gate": sop_gate,
                 "hint": hint,
             }
             return _tool_result(json.dumps(payload, ensure_ascii=False, indent=2))
@@ -1449,6 +1511,7 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             if not q or not a:
                 return _tool_result("question/answer 不能为空", is_error=True)
             msg = sb.remember(q, a, scene=scene, tags=tags, kind=kind, facts=facts)
+            _sop_gate_on_write()
             return _tool_result(msg)
 
         if name == "memory_extract":
@@ -1689,6 +1752,7 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
             failed = msg.startswith(("未找到", "answer 不能为空"))
             if failed:
                 return _tool_result(msg, is_error=True)
+            _sop_gate_on_write()
             reason = (args.get("reason") or "").strip()
             # 回执带上旧答案摘要：用户能直接看出改掉了什么
             old = (before.answer or "").strip() if before else ""
@@ -1704,7 +1768,10 @@ def call_tool(name: str, arguments: Optional[Dict[str, Any]]) -> Dict[str, Any]:
                 memory_id=(args.get("memory_id") or "").strip(),
                 question=(args.get("question") or "").strip(),
             )
-            return _tool_result(msg, is_error=msg.startswith(("未找到", "请提供")))
+            failed = msg.startswith(("未找到", "请提供"))
+            if not failed:
+                _sop_gate_on_write()
+            return _tool_result(msg, is_error=failed)
 
         if name == "memory_status":
             st = sb.status()
@@ -1745,6 +1812,8 @@ def handle(msg: Dict[str, Any]) -> Optional[Dict[str, Any]]:
                 "protocolVersion": PROTOCOL_VERSION,
                 "capabilities": {"tools": {}},
                 "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION},
+                # MCP 协议级系统指令：任何客户端握手后都会拿到并喂给模型，是跨宿主强制 SOP 的落点
+                "instructions": SERVER_INSTRUCTIONS,
             },
         }
 

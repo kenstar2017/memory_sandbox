@@ -56,12 +56,16 @@ DEFAULT_SCOPES = (
     # 不开这项就完全读不到画板里写了什么；create 是往画板里画东西用的，
     # 建画板本身走 docx 创建块接口，不吃这项权限
     "board:whiteboard:node:read "
-    "board:whiteboard:node:create"
+    "board:whiteboard:node:create "
+    # 文档里的电子表格是独立资源，正文里只有 spreadsheetToken_sheetId。
+    # 后台权限名是「查看电子表格」。旧名 sheets:spreadsheet:readonly 已经勾不到，
+    # 写进授权链接会让整个授权页 20027
+    "sheets:spreadsheet:read"
 )
 
 # 已被开放平台拆分、后台再也勾不到的聚合权限。请求它会让整个授权页报
 # 20027「当前应用权限不足」，所以必须从旧配置里剔掉，而不是跟着并进去。
-_RETIRED_SCOPES = {"docx:document"}
+_RETIRED_SCOPES = {"docx:document", "sheets:spreadsheet:readonly"}
 
 
 def _merged_scopes(cfg: FeishuConfig) -> str:

@@ -126,6 +126,27 @@ class ApiErrorResponseTests(unittest.TestCase):
         self.assertEqual(code, 400)
         self.assertFalse(body["ok"])
 
+    def test_bloombox_chat_disables_automatic_long_term_persistence(self):
+        calls = []
+
+        def _chat(text, **kwargs):
+            calls.append((text, kwargs))
+            return SimpleNamespace(answer="临时回答", source="llm")
+
+        old = getattr(app_web, "STATE", None)
+        app_web.STATE = SimpleNamespace(
+            sandbox=SimpleNamespace(chat=_chat),
+            status_line=lambda: "ok",
+        )
+        try:
+            code, _, body = self._post("/api/chat", {"text": "临时问题"})
+        finally:
+            app_web.STATE = old
+
+        self.assertEqual(code, 200)
+        self.assertEqual(body["answer"], "临时回答")
+        self.assertEqual(calls, [("临时问题", {"persist_llm_answer": False})])
+
     def test_revision_endpoint_returns_stamp(self):
         """轮询接口：只回变更标记，不回记忆内容。"""
         stub = SimpleNamespace(
@@ -244,6 +265,41 @@ class ApiErrorResponseTests(unittest.TestCase):
         """Tauri 靠特性名认旧后端，不报的话新 UI 会连上没有这些路由的旧进程。"""
         _, _, body = self._get("/api/health")
         self.assertIn("knowledge_base", body["features"])
+
+    # ---------- 回退接入方 ----------
+    def _with_provider(self, payload, setter=None):
+        sandbox = SimpleNamespace(
+            status=lambda: {"llm": {"provider": "cursor", "enabled": True}},
+            set_llm_provider=setter or (lambda p, persist=True: f"回退模型已切到 {p}"),
+        )
+        old = getattr(app_web, "STATE", None)
+        app_web.STATE = SimpleNamespace(sandbox=sandbox, status_line=lambda: "ok")
+        try:
+            return self._post("/api/llm_provider", payload)
+        finally:
+            app_web.STATE = old
+
+    def test_provider_query_returns_current_and_options(self):
+        """不带 provider 就是查询：顶栏下拉靠它渲染选项。"""
+        code, _, body = self._with_provider({})
+        self.assertEqual(code, 200)
+        self.assertEqual(body["provider"], "cursor")
+        self.assertIn("trae", [o["value"] for o in body["options"]])
+
+    def test_provider_switch_returns_message(self):
+        code, _, body = self._with_provider({"provider": "trae"})
+        self.assertEqual(code, 200)
+        self.assertIn("trae", body["message"])
+
+    def test_provider_switch_failure_is_400_with_reason(self):
+        """缺密钥/网关时后端已退回旧 provider，界面要能拿到原因照着改配置。"""
+
+        def boom(provider, persist=True):
+            raise ValueError("切换到 OpenAI 兼容网关 失败：需要配置 llm.base_url")
+
+        code, _, body = self._with_provider({"provider": "openai_compatible"}, setter=boom)
+        self.assertEqual(code, 400)
+        self.assertIn("base_url", body["error"])
 
 
 class MissingFeatureTests(unittest.TestCase):

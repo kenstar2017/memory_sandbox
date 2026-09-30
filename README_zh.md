@@ -393,8 +393,22 @@ cd desktop && npm run tauri:dev
 - `working.chunk_size`：工作记忆窗口大小
 - `long_term.similarity_threshold`：长时命中阈值（建议 0.65~0.75）
 - `long_term.persist_dir`：持久化目录（默认 `data/memory`）
-- `llm.provider`：`mock`（离线占位）| `cursor` | `openai_compatible`
+- `llm.provider`：`mock`（离线占位）| `cursor` | `trae` | `openai_compatible`
 - `llm.runtime`（仅 cursor）：`local`（本机 `agent` CLI，可读盘）| `cloud`（Cloud 无仓库，不能扫本机源码）
+- `llm.trae_bin`（仅 trae）：TraeCode CLI 路径；空则 PATH 找 `coco` / `traecli` / `traex`
+
+### 用 Trae 顶掉 Cursor 额度
+
+Cursor 额度用完时，把 `llm.provider` 改成 `trae` 即可，`cwd` / `agent_mode` / `timeout` / `model`
+这些字段通用，不必重配。Trae 走自己的登录态，先在终端跑一次 `coco login`。
+
+实现上它调本机 `traecli exec`，几处和 Cursor 不一样，改动前先看 `core/llm.py:build_trae_cmd` 的注释：
+
+- 非交互是 `exec` 子命令；`-p` 在 traecli 里是 `--profile`（不是 prompt），照 Claude Code 的写法传会静默跑错
+- 工作目录用 `-C/--cd`，没有 `--workspace`
+- 只读/可写由 `-s/--sandbox`（`read-only` / `workspace-write`）控制，`agent_mode` 的 ask/plan 映射到 `read-only`
+- 终答用 `-o/--output-last-message` 落临时文件读取，不解析 `--json` 的 JSONL 事件流
+- 只有本机 CLI 一条路，没有 Cloud REST 对应物；找不到二进制时在回答里报错，不会静默回落到 Cursor
 - `feishu.*`：飞书 wiki/docx 读写（见下方「飞书文档读写」）
 
 ## 飞书文档读写
@@ -586,13 +600,14 @@ docx 的 `raw_content` 只收文字块，但**并非所有非文字内容都会�
 | 文档小组件 add_ons（mermaid 时序图、流程图） | 40 | 源码**本来就在正文里**，直接能读到，无需额外权限 |
 | 画板 | 43 | 独立资源，正文里只有一个 token；`memory_feishu_read` 默认调画板接口读成文字附在末尾 |
 | 图片 | 27 | 只有 token，未接入 |
-| 电子表格 / 多维表格 / 思维笔记 | 30 / 18 / 29 | 只有 token，未接入 |
+| 电子表格 | 30 | 独立资源，正文里只有 `spreadsheetToken_sheetId`；读成管道表格附在末尾 |
+| 多维表格 / 思维笔记 | 18 / 29 | 只有 token，未接入 |
 
-画板会渲染成缩进的图形列表 + 连线列表（`A --是--> B`），足以还原流程走向。读不到的组件会在附录里显式写出「未读取 + 缺什么」，不会静默消失。
+画板会渲染成缩进的图形列表 + 连线列表（`A --是--> B`），足以还原流程走向。电子表格渲染成管道表格，超过 200 行或 40 列时只取前一段并注明截断。读不到的组件会在附录里显式写出「未读取 + 缺什么」，不会静默消失。
 
-`memory_feishu_read` 的 `include_widgets` 默认 `true`；只要正文、且确认没有画板时设 `false`，可省两次请求。CLI 对应 `python3 main.py feishu-read <链接> [--no-widgets]`。
+`memory_feishu_read` 的 `include_widgets` 默认 `true`；只要正文、且确认没有画板或表格时设 `false`，可省掉额外请求。CLI 对应 `python3 main.py feishu-read <链接> [--no-widgets]`。
 
-读画板需要开放平台开通「查看画板节点（`board:whiteboard:node:read`）」**并重新授权**（scope 固定在 token 里）。没开时附录里会直接提示开哪一项。
+读画板需要开放平台开通「查看画板节点（`board:whiteboard:node:read`）」**并重新授权**（scope 固定在 token 里）。读内嵌电子表格需要「查看电子表格（`sheets:spreadsheet:read`）」，同样要重新授权。接口文档里的旧名 `sheets:spreadsheet:readonly` 后台已经勾不到，请求它会让整个授权页报 20027。没开时附录里会直接提示开哪一项。
 
 > 加权限的顺序不能反：先在开放平台开通，再 `python3 scripts/feishu_login.py`。反过来会让授权页整体报 20027 —— 请求了应用没开通的 scope，整次授权都失败，不只是那一项拿不到。
 
